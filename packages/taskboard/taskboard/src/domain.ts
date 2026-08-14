@@ -99,6 +99,14 @@ export function buildReviewPrompt(ticket: TicketView): string {
     '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
     '2. Run the relevant tests and builds where the ticket concerns code.',
     '3. Check edge cases and error paths named in the description, not just the happy path.',
+    ...(ticket.type === 'merge' ? [
+      '',
+      'Merge ticket specifics — also verify:',
+      '- The branch merges cleanly: check for merge conflicts and unresolved conflict markers in the working tree.',
+      '- CI results for the change (build and test runs) are green.',
+      '- The diff size is proportionate to the description: no unrelated, oversized, or missing changes.',
+      "- The target branch was confirmed by the master (the confirmed branch is recorded in the ticket's targetBranch field or devNotes); flag any mismatch.",
+    ] : []),
     '',
     'Finish with EXACTLY ONE tool call, nothing else:',
     '- taskboard_approve with ticketId "' + ticket.id + '" and a short summary of what you verified, or',
@@ -137,6 +145,14 @@ export function buildReviewReportPrompt(ticket: TicketView): string {
     '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
     '2. Run the relevant tests and builds where the ticket concerns code.',
     '3. Check edge cases and error paths named in the description, not just the happy path.',
+    ...(ticket.type === 'merge' ? [
+      '',
+      'Merge ticket specifics — also verify:',
+      '- The branch merges cleanly: check for merge conflicts and unresolved conflict markers in the working tree.',
+      '- CI results for the change (build and test runs) are green.',
+      '- The diff size is proportionate to the description: no unrelated, oversized, or missing changes.',
+      "- The target branch was confirmed by the master (the confirmed branch is recorded in the ticket's targetBranch field or devNotes); flag any mismatch.",
+    ] : []),
     '',
     'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool.',
     'Finish by calling the structured_output tool exactly once with:',
@@ -203,4 +219,25 @@ export const WORKFLOW_SECTION = [
   '- When a worker fails or its session terminates without reporting, the card stays In progress with status "blocked" and a failure record. Use taskboard_reassign with action "retry" to spawn a new worker, or action "backlog" to return the card to Not started.',
   '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
   "- Never move cards on the user's behalf: dragging cards between columns — in particular Backlog to Not started — is the user's \"start this\" signal in the web UI.",
+].join('\n')
+
+/**
+ * The master-role section injected into every session's system prompt ahead
+ * of the workflow section (order 149). Teaches the master seat: dispatch and
+ * review adjudication belong to the master, context pressure is solved by
+ * compaction rather than handoff, a real handover first records handover
+ * notes (board state and per-card worker identities) on the board so the
+ * successor can continue after taskboard_claim_master, and dispatched
+ * workers finish their current card without cross-session followup.
+ */
+export const MASTER_SECTION = [
+  '# Taskboard master',
+  '',
+  'You are the board\'s master: you dispatch tickets to workers, adjudicate review results, and discuss the plan with the user. The master seat is per board — claim it with taskboard_claim_master (boardId defaults to "default") before assigning or resolving work.',
+  '',
+  '- Solve context pressure with compaction first: when the conversation is long or context is running low, compact instead of handing off.',
+  '- When a handover is genuinely needed, first record handover notes on the board: the board state, every card\'s status, and each in-flight worker\'s identity (workerAgentId/workerSessionId). The successor claims the seat with taskboard_claim_master, reads the board (taskboard_view per card), and continues from those notes.',
+  '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
+  '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
+  '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
 ].join('\n')

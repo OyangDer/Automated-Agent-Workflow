@@ -37,7 +37,7 @@ import type {
 } from './types.ts'
 import {
   agentLabel, appendHistory, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
-  reviewerLabel, TaskboardError, WORKFLOW_SECTION,
+  MASTER_SECTION, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
@@ -85,6 +85,7 @@ const ticketSchema = zod.object({
     zod.null(),
   ]).default(null),
   devNotes: zod.string(),
+  targetBranch: zod.string().default(''),
   dependsOn: zod.array(zod.string()),
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
 })
@@ -324,6 +325,7 @@ export class TaskboardService extends TypertRemoteService {
         void pending.then((domain) => { void domain.close() }).catch(() => {})
       }
     }, 'taskboard: domain lifetime')
+    ctx.systemPrompt.section({ name: 'taskboard:master', order: 149, text: MASTER_SECTION })
     ctx.systemPrompt.section({ name: 'taskboard:workflow', order: 150, text: WORKFLOW_SECTION })
     this.registerTools()
   }
@@ -434,6 +436,43 @@ export class TaskboardService extends TypertRemoteService {
         'TASKBOARD_NOT_MASTER',
       )
     }
+  }
+
+  /** Require the caller to be the current master of one board (by id). */
+  private async assertMasterOfBoard(boardId: string, agent: Agent): Promise<void> {
+    await this.ensureBoard(boardId)
+    const table = await this.boards()
+    const board = table.get(boardId)
+    if (board === undefined || board.masterAgentId !== agent.id) {
+      throw new TaskboardError(
+        'only the master of board "' + boardId + '" may perform this action',
+        'TASKBOARD_NOT_MASTER',
+      )
+    }
+  }
+
+  /**
+   * Compute the position of an index inside a column following the same
+   * halving semantics as {@link positionBetween}: the target slot sits
+   * between the (index-1)-th and the index-th neighbors of the column.
+   */
+  private positionAtIndex(
+    table: KvTable<string, TicketView>,
+    column: ColumnId,
+    selfId: string,
+    index: number,
+  ): number {
+    const rows = [...table.entries()]
+      .map(([, ticket]) => ticket)
+      .filter(ticket => ticket.column === column && ticket.id !== selfId)
+      .sort((a, b) => a.position - b.position)
+    const target = Math.min(index, rows.length)
+    const before = target > 0 ? rows[target - 1] : undefined
+    const after = target < rows.length ? rows[target] : undefined
+    if (before !== undefined && after !== undefined) return (before.position + after.position) / 2
+    if (before !== undefined) return before.position + 1
+    if (after !== undefined) return after.position - 1
+    return 0
   }
 
   /** Compute the position between two anchors inside a column. */
@@ -553,7 +592,6 @@ export class TaskboardService extends TypertRemoteService {
    */
   private trackReviewerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
     const result: Promise<SubagentResult> | undefined = run.result
-    // oxlint-disable-next-line typescript/no-unnecessary-condition -- typed required, but seam stubs may omit result.
     if (result === undefined) return
     void result.then(
       (outcome) => { void this.recordReviewOutcome(ticketId, sessionId, outcome).catch(() => {}) },
@@ -671,7 +709,6 @@ export class TaskboardService extends TypertRemoteService {
    */
   private trackWorkerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
     const result: Promise<SubagentResult> | undefined = run.result
-    // oxlint-disable-next-line typescript/no-unnecessary-condition -- typed required, but seam stubs may omit result.
     if (result === undefined) return
     void result.then(
       (outcome) => { void this.reclaimTerminatedWorker(ticketId, sessionId, outcome.stopReason).catch(() => {}) },
@@ -830,8 +867,20 @@ export class TaskboardService extends TypertRemoteService {
    */
   @Remote('create')
   createRemote(request: CreateTicketRequest): Promise<TicketView> {
+    return this.createRecordForBoard(request)
+  }
+
+  /**
+   * Shared Backlog creation used by the Remote surface and the master-only
+   * taskboard_create tool. The Remote surface leaves type/targetBranch at
+   * their defaults; the master tool supplies them explicitly.
+   */
+  private createRecordForBoard(
+    request: CreateTicketRequest & { type?: TicketType; targetBranch?: string },
+  ): Promise<TicketView> {
     const title = resolveTitle(request.title)
     const priority = TASKBOARD_PRIORITIES.includes(request.priority) ? request.priority : 'normal'
+    const type = request.type !== undefined && TASKBOARD_TYPES.includes(request.type) ? request.type : 'feature'
     const now = Date.now()
     const record = {
       id: 'ticket-' + randomUUID(),
@@ -840,7 +889,7 @@ export class TaskboardService extends TypertRemoteService {
       column: 'backlog' as ColumnId,
       priority,
       boardId: request.boardId ?? 'default',
-      type: 'feature' as TicketType,
+      type,
       status: 'ready' as TicketWorkerStatus,
       failure: null,
       createdAt: now,
@@ -851,7 +900,8 @@ export class TaskboardService extends TypertRemoteService {
       lastReview: null,
       reviewOutcome: null,
       devNotes: '',
-      dependsOn: request.dependsOn,
+      targetBranch: typeof request.targetBranch === 'string' ? request.targetBranch : '',
+      dependsOn: Array.isArray(request.dependsOn) ? request.dependsOn : [],
       history: [] as TicketView['history'],
     }
     return this.createRecord(record, now)
@@ -908,6 +958,7 @@ export class TaskboardService extends TypertRemoteService {
         description: typeof request.description === 'string' ? request.description : edited.description,
         priority,
         dependsOn: request.dependsOn,
+        targetBranch: typeof request.targetBranch === 'string' ? request.targetBranch : edited.targetBranch,
         updatedAt: Date.now(),
       },
       'edit',
@@ -1229,6 +1280,96 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Master records a new ticket on a board's Backlog (the discussion
+   * whiteboard: the plan the master agreed with the user is written down).
+   * Unlike the Remote create surface, the master tool also sets the ticket
+   * type and may target any board the caller masters.
+   * @param agent - the master session agent.
+   * @param request - title, description, type, priority, dependencies, boardId and optional targetBranch.
+   * @returns the created Backlog ticket.
+   */
+  async createAsMaster(
+    agent: Agent,
+    request: CreateTicketRequest & { type?: TicketType; targetBranch?: string },
+  ): Promise<TicketView> {
+    const boardId = request.boardId ?? 'default'
+    await this.assertMasterOfBoard(boardId, agent)
+    return this.createRecordForBoard({ ...request, boardId })
+  }
+
+  /**
+   * Master schedules a ticket to another column, optionally next to an
+   * anchor; entering In testing still auto-assigns a fresh reviewer. The
+   * caller must hold the master seat of the ticket's board.
+   * @param agent - the master session agent.
+   * @param request - target column and optional position anchors.
+   * @returns the moved ticket.
+   */
+  async moveAsMaster(agent: Agent, request: MoveTicketRequest): Promise<TicketView> {
+    const table = await this.tickets()
+    const current = table.get(request.ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    // The master tool carries no boardId: resolve it from the ticket itself
+    // so any board the caller masters can be scheduled. An explicit
+    // boardId in the request is still honored and validated.
+    const boardId = request.boardId ?? current.boardId
+    return this.moveWithReviewer(agent, { ...request, boardId })
+  }
+
+  /**
+   * Master adjusts the planning attributes of one ticket: dependency edges,
+   * priority, and ordering position inside the ticket's column. Dependencies
+   * are validated against the live board; position is an index in the column
+   * ordering (halving semantics, like an anchor move).
+   * @param agent - the master session agent.
+   * @param ticketId - the ticket to plan.
+   * @param dependsOn - replacement dependency edges, or undefined to keep them.
+   * @param priority - replacement priority, or undefined to keep it.
+   * @param position - the desired index in the ticket's column, or undefined to keep it.
+   * @returns the planned ticket.
+   */
+  async planAsMaster(
+    agent: Agent,
+    ticketId: string,
+    dependsOn: string[] | undefined,
+    priority: Priority | undefined,
+    position: number | undefined,
+  ): Promise<TicketView> {
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    const nextDependsOn = dependsOn === undefined ? current.dependsOn : dependsOn
+    this.validateDependencies(table, ticketId, nextDependsOn)
+    if (priority !== undefined && !TASKBOARD_PRIORITIES.includes(priority)) {
+      throw new TaskboardError('unknown priority "' + String(priority) + '"', 'TASKBOARD_INVALID_INPUT')
+    }
+    let nextPosition = current.position
+    if (position !== undefined) {
+      if (!Number.isSafeInteger(position) || position < 0) {
+        throw new TaskboardError('plan position must be a non-negative safe integer', 'TASKBOARD_INVALID_INPUT')
+      }
+      nextPosition = this.positionAtIndex(table, current.column, ticketId, position)
+    }
+    return this.mutate(ticketId, 'edit', planned => appendHistory(
+      {
+        ...planned,
+        priority: priority === undefined ? planned.priority : priority,
+        dependsOn: nextDependsOn,
+        position: nextPosition,
+        updatedAt: Date.now(),
+      },
+      'edit',
+      'planned by master',
+    ))
+  }
+
+  /**
    * Agent claims a Not started ticket and becomes its owner (v1 path, kept
    * for boards without a master seat).
    * @param agent - the claiming agent.
@@ -1465,6 +1606,14 @@ export class TaskboardService extends TypertRemoteService {
     const attempt = current.reviewAttempts + 1
 
     if (verdict === 'approve') {
+      // Merge tickets land only against a master-confirmed target branch
+      // (recorded in the ticket's targetBranch field or devNotes).
+      if (current.type === 'merge' && current.targetBranch.trim() === '') {
+        throw new TaskboardError(
+          'merge ticket "' + ticketId + '" has no confirmed target branch; record it in targetBranch before approving',
+          'TASKBOARD_INVALID_INPUT',
+        )
+      }
       const approved = await this.mutate(ticketId, 'approve', (ticket) => {
         if (ticket.column !== 'in_testing') {
           throw new TaskboardError('ticket "' + ticket.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
@@ -1785,6 +1934,7 @@ export class TaskboardService extends TypertRemoteService {
               ] as const, required: true,
             },
             devNotes: { type: 'string', required: true },
+            targetBranch: { type: 'string', required: true },
             dependsOn: { type: 'array', required: true, items: { type: 'string' } },
             history: {
               type: 'array', required: true,
@@ -1823,6 +1973,7 @@ export class TaskboardService extends TypertRemoteService {
           lastReview: ticket.lastReview,
           reviewOutcome: ticket.reviewOutcome,
           devNotes: ticket.devNotes,
+          targetBranch: ticket.targetBranch,
           dependsOn: ticket.dependsOn,
           history: ticket.history,
         }
@@ -2245,6 +2396,163 @@ export class TaskboardService extends TypertRemoteService {
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Resolve taskboard review', kind: 'other' as const, rawInput: args.ticketId }),
     }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_create',
+      description: 'Create a taskboard ticket on a board\'s Backlog (master only): the plan you agreed with the user is written down as a card. The ticket lands in Backlog with the given type, priority and dependencies.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to create the ticket on. Omit for the default board.',
+        },
+        title: { type: 'string' as const, required: true, description: 'Ticket title.' },
+        description: { type: 'string' as const, required: true, description: 'Ticket description / acceptance criteria.' },
+        type: {
+          type: 'string' as const,
+          enum: [...TASKBOARD_TYPES],
+          description: 'Ticket kind badge. Omit for "feature".',
+        },
+        priority: {
+          type: 'string' as const,
+          enum: [...TASKBOARD_PRIORITIES],
+          description: 'Ticket priority. Omit for "normal".',
+        },
+        dependsOn: {
+          type: 'array' as const,
+          items: { type: 'string' as const },
+          description: 'Ticket ids this ticket waits for; all must exist and be open to completion.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            type: { type: 'string', required: true, enum: [...TASKBOARD_TYPES] },
+            boardId: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value: { id: string; title: string; column: ColumnId }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' ("' + value.title + '") created in ' + value.column }],
+      },
+      execute: async (args: {
+        boardId?: string
+        title: string
+        description: string
+        type?: TicketType
+        priority?: Priority
+        dependsOn?: string[]
+      }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        const ticket = await this.createAsMaster(agent, {
+          title: args.title,
+          description: args.description,
+          priority: args.priority ?? 'normal',
+          dependsOn: args.dependsOn ?? [],
+          ...(args.boardId === undefined ? {} : { boardId: args.boardId }),
+          ...(args.type === undefined ? {} : { type: args.type }),
+        })
+        return { id: ticket.id, title: ticket.title, column: ticket.column, type: ticket.type, boardId: ticket.boardId }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Create taskboard ticket', kind: 'other' as const, rawInput: args.title }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_move',
+      description: 'Move a taskboard ticket between columns (master only): schedules the card, optionally next to an anchor ticket. Moving into In testing keeps the automatic reviewer assignment.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The ticket to move.' },
+        column: {
+          type: 'string' as const, required: true, enum: [...TASKBOARD_COLUMNS],
+          description: 'The target column.',
+        },
+        beforeTicketId: {
+          type: 'string' as const,
+          description: 'Insert immediately before this ticket in the target column.',
+        },
+        afterTicketId: {
+          type: 'string' as const,
+          description: 'Insert immediately after this ticket in the target column (used when before is omitted).',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            reviewer: TaskboardService.ticketRowSchema().properties.reviewer,
+          },
+        },
+        render: (_args, value: { id: string; title: string; column: ColumnId }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' ("' + value.title + '") moved to ' + value.column }],
+      },
+      execute: async (args: { ticketId: string; column: ColumnId; beforeTicketId?: string; afterTicketId?: string }, exec) => {
+        const ticket = await this.moveAsMaster(TaskboardService.agentOf(exec), {
+          ticketId: args.ticketId,
+          column: args.column,
+          beforeTicketId: args.beforeTicketId ?? null,
+          afterTicketId: args.afterTicketId ?? null,
+        })
+        return { id: ticket.id, title: ticket.title, column: ticket.column, reviewer: ticket.reviewer }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Move taskboard ticket', kind: 'other' as const, rawInput: args.ticketId + ' -> ' + args.column }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_plan',
+      description: 'Plan a taskboard ticket (master only): adjust dependency edges, priority, and the card\'s ordering position inside its column. Dependency changes take effect immediately on claim gates; position is an index in the column ordering (0 = first).',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The ticket to plan.' },
+        dependsOn: {
+          type: 'array' as const,
+          items: { type: 'string' as const },
+          description: 'Replacement dependency edges (tickets that must be Done first). Omit to keep the current edges.',
+        },
+        priority: {
+          type: 'string' as const,
+          enum: [...TASKBOARD_PRIORITIES],
+          description: 'Replacement priority. Omit to keep the current priority.',
+        },
+        position: {
+          type: 'number' as const,
+          description: 'Desired index in the ticket\'s column ordering (0 = first). Omit to keep the current position.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            priority: { type: 'string', required: true, enum: [...TASKBOARD_PRIORITIES] },
+            dependsOn: { type: 'array', required: true, items: { type: 'string' } },
+            position: { type: 'number', required: true },
+          },
+        },
+        render: (_args, value: { id: string; title: string; position: number }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' ("' + value.title + '") planned at position ' + String(value.position) }],
+      },
+      execute: async (args: { ticketId: string; dependsOn?: string[]; priority?: Priority; position?: number }, exec) => {
+        const ticket = await this.planAsMaster(
+          TaskboardService.agentOf(exec),
+          args.ticketId,
+          args.dependsOn,
+          args.priority,
+          args.position,
+        )
+        return {
+          id: ticket.id,
+          title: ticket.title,
+          column: ticket.column,
+          priority: ticket.priority,
+          dependsOn: ticket.dependsOn,
+          position: ticket.position,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Plan taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
   }
 }
 
@@ -2253,12 +2561,15 @@ export class TaskboardService extends TypertRemoteService {
  * reports (taskboard_report) or fails (taskboard_fail); everything else on
  * the board belongs to the master. Only names registered in the global tool
  * registry may be denied — tools.restrict() rejects unknown names loudly, so
- * future administrative tools must be appended here when they land.
+ * future administrative tools must be appended here when they land. The
+ * master-only whiteboard tools (create/move/plan) are registered before this
+ * list is consulted, so denying them here is safe.
  */
 const WORKER_DENIED_TOOLS = [
   'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
   'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
+  'taskboard_create', 'taskboard_move', 'taskboard_plan',
 ] as const
 
 /**

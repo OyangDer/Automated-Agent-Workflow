@@ -526,6 +526,8 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   RequestReviewRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   CompleteTicketResult: 'taskboard completion receipt is owned by packages/taskboard/taskboard/src/service.ts',
   TicketRow: 'taskboard list row is owned by packages/taskboard/taskboard/src/service.ts',
+  Priority: 'taskboard priority enum is owned by packages/taskboard/taskboard/src/types.ts',
+  TicketType: 'taskboard ticket type enum is owned by packages/taskboard/taskboard/src/types.ts',
   BeginCommandRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   InsertReferenceRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   ConsumeTokenRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',

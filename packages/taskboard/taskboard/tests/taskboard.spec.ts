@@ -696,6 +696,125 @@ describe('TaskboardService workflow', () => {
     expect(result.ticket.lastReview?.outcome).toBe('rejected')
   })
 
+  it('reserves create/move/plan for the master of the board', async () => {
+    const { service, devA, devB } = await harness()
+    await service.claimMaster('default', devA)
+    // create: non-master rejected, master lands a Backlog card.
+    await expect(service.createAsMaster(devB, { title: 'no', description: '', priority: 'normal', dependsOn: [] }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    const ticket = await service.createAsMaster(devA, { title: 'master card', description: 'planned', priority: 'high', dependsOn: [] })
+    expect(ticket.column).toBe('backlog')
+    expect(ticket.type).toBe('feature')
+    // move: non-master rejected, master schedules between columns.
+    await expect(service.moveAsMaster(devB, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    const moved = await service.moveAsMaster(devA, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    expect(moved.column).toBe('not_started')
+    // plan: non-master rejected, master adjusts priority/dependencies/position.
+    await expect(service.planAsMaster(devB, ticket.id, [], undefined, undefined))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    const planned = await service.planAsMaster(devA, ticket.id, [], 'low', 0)
+    expect(planned.priority).toBe('low')
+    expect(planned.dependsOn).toEqual([])
+    expect(planned.position).toBe(0)
+  })
+
+  it('plan rewires dependencies and the claim gate follows', async () => {
+    const { service, devA, reviewerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const base = await service.createAsMaster(devA, { title: 'base', description: '', priority: 'normal', dependsOn: [] })
+    const dependent = await service.createAsMaster(devA, { title: 'dependent', description: '', priority: 'normal', dependsOn: [] })
+    // The master adds the dependency edge through plan.
+    const planned = await service.planAsMaster(devA, dependent.id, [base.id], undefined, undefined)
+    expect(planned.dependsOn).toEqual([base.id])
+    await service.moveAsMaster(devA, { ticketId: base.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await service.moveAsMaster(devA, { ticketId: dependent.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await expect(service.claim(devA, dependent.id)).rejects.toMatchObject({ code: 'TASKBOARD_DEPENDENCY_BLOCKED' })
+    const claimedBase = await service.claim(devA, base.id)
+    const inTesting = await completeTicket(service, devA, claimedBase)
+    await service.approve(reviewerChild, inTesting.id, 'verified')
+    // Once the dependency is Done the gate opens.
+    const claimedDependent = await service.claim(devA, dependent.id)
+    expect(claimedDependent.column).toBe('in_progress')
+    // Removing the edge re-opens the gate even while the dependency is open.
+    const second = await service.createAsMaster(devA, { title: 'second', description: '', priority: 'normal', dependsOn: [] })
+    await service.planAsMaster(devA, second.id, [dependent.id], undefined, undefined)
+    await service.moveAsMaster(devA, { ticketId: second.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await expect(service.claim(devA, second.id)).rejects.toMatchObject({ code: 'TASKBOARD_DEPENDENCY_BLOCKED' })
+    await service.planAsMaster(devA, second.id, [], undefined, undefined)
+    const claimedSecond = await service.claim(devA, second.id)
+    expect(claimedSecond.column).toBe('in_progress')
+  })
+
+  it('requires a master-confirmed target branch before approving a merge ticket', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const merge = await service.createAsMaster(devA, { title: 'merge the branch', description: '', priority: 'normal', dependsOn: [], type: 'merge' })
+    expect(merge.type).toBe('merge')
+    expect(merge.targetBranch).toBe('')
+    await service.moveAsMaster(devA, { ticketId: merge.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await service.assign(devA, merge.id)
+    const reported = await service.report(workerChild, merge.id, 'merged cleanly')
+    // Approve without a confirmed target branch is refused.
+    await expect(service.resolveReview(devA, reported.ticket.id, 'approve', 'verified', []))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
+    // Record the master-confirmed target branch, then the approve lands.
+    await service.editRemote({ ticketId: merge.id, title: 'merge the branch', description: '', priority: 'normal', dependsOn: [], targetBranch: 'main' })
+    const result = await service.resolveReview(devA, reported.ticket.id, 'approve', 'verified', [])
+    expect(result.action).toBe('approved')
+    expect(result.ticket.column).toBe('done')
+    expect(result.ticket.targetBranch).toBe('main')
+  })
+
+  it('merge review prompts demand conflict, CI and target-branch checks', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const merge = await service.createAsMaster(devA, { title: 'merge me', description: '', priority: 'normal', dependsOn: [], type: 'merge' })
+    await service.moveAsMaster(devA, { ticketId: merge.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await service.assign(devA, merge.id)
+    await service.report(workerChild, merge.id, 'done')
+    // Report mode: the reviewer prompt carries the merge specifics.
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    const prompt = (reviewCall[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('merge conflicts')
+    expect(prompt).toContain('CI results')
+    expect(prompt).toContain('target branch')
+    // A non-merge ticket gets no merge specifics.
+    const feature = await service.createAsMaster(devA, { title: 'feature', description: '', priority: 'normal', dependsOn: [] })
+    await service.moveAsMaster(devA, { ticketId: feature.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await service.assign(devA, feature.id)
+    await service.report(workerChild, feature.id, 'done')
+    const featureCall = subagentsStart.mock.calls[3] as [string, SubagentStartRequest]
+    const featurePrompt = (featureCall[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(featurePrompt).not.toContain('Merge ticket specifics')
+    // Direct mode keeps the same merge checks.
+    const direct = await harness({ reviewMode: 'direct' })
+    await direct.service.claimMaster('default', direct.devA)
+    const directMerge = await direct.service.createAsMaster(direct.devA, { title: 'direct merge', description: '', priority: 'normal', dependsOn: [], type: 'merge' })
+    await direct.service.moveAsMaster(direct.devA, { ticketId: directMerge.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await direct.service.assign(direct.devA, directMerge.id)
+    await direct.service.report(direct.workerChild, directMerge.id, 'done')
+    const directCall = direct.subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    const directPrompt = (directCall[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(directPrompt).toContain('merge conflicts')
+    expect(directPrompt).toContain('CI results')
+    expect(directPrompt).toContain('target branch')
+  })
+
+  it('records handover notes on transfer and reads them back', async () => {
+    const { service, devA, devB } = await harness()
+    await service.claimMaster('default', devA)
+    await service.transferMaster('default', devA, devB.id, 'board state: 3 cards; worker w1 on card A, worker w2 on card B; review pending on card C')
+    const boards = await service.listBoards()
+    const board = boards.find(candidate => candidate.boardId === 'default')!
+    expect(board.masterAgentId).toBe(devB.id)
+    expect(board.handoverNotes).toContain('worker w1 on card A')
+    // The new master transfers onward, overwriting the notes.
+    const again = await service.transferMaster('default', devB, devA.id, 'round two')
+    expect(again.masterAgentId).toBe(devA.id)
+    expect(again.handoverNotes).toBe('round two')
+  })
+
   it('loads v1-shaped records from a seeded storage root with zod defaults', async () => {
     const root = await mkdtemp(join(tmpdir(), 'taskboard-v1-'))
     const now = Date.now()

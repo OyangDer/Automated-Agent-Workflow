@@ -114,6 +114,8 @@ export interface TicketView {
   reviewOutcome: TicketReviewOutcome | null
   /** Developer's completion notes, filled when the ticket enters testing. */
   devNotes: string
+  /** Master-confirmed target branch for merge tickets; empty for other types. */
+  targetBranch: string
   /** Hard ordering constraints: every listed ticket must be in Done before claim. */
   dependsOn: string[]
   history: TicketHistoryEntry[]
@@ -166,6 +168,8 @@ export interface CreateTicketRequest {
   dependsOn: string[]
   /** Target board; defaults to "default" for v1 compatibility. */
   boardId?: string
+  /** Master-confirmed target branch for a merge ticket. */
+  targetBranch?: string
 }
 
 /** User drags a ticket to another column, optionally next to an anchor. */
@@ -189,6 +193,8 @@ export interface EditTicketRequest {
   dependsOn: string[]
   /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
   boardId?: string
+  /** Master-confirmed target branch for a merge ticket. */
+  targetBranch?: string
 }
 
 /** User deletes a ticket from the board. */

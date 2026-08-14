@@ -228,6 +228,41 @@ async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView>
 async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult>
 
 /**
+ * Master records a new ticket on a board's Backlog (the discussion
+ * whiteboard: the plan the master agreed with the user is written down).
+ * Unlike the Remote create surface, the master tool also sets the ticket
+ * type and may target any board the caller masters.
+ * @param agent - the master session agent.
+ * @param request - title, description, type, priority, dependencies, boardId and optional targetBranch.
+ * @returns the created Backlog ticket.
+ */
+async createAsMaster( agent: Agent, request: CreateTicketRequest & { type?: TicketType; targetBranch?: string }, ): Promise<TicketView>
+
+/**
+ * Master schedules a ticket to another column, optionally next to an
+ * anchor; entering In testing still auto-assigns a fresh reviewer. The
+ * caller must hold the master seat of the ticket's board.
+ * @param agent - the master session agent.
+ * @param request - target column and optional position anchors.
+ * @returns the moved ticket.
+ */
+async moveAsMaster(agent: Agent, request: MoveTicketRequest): Promise<TicketView>
+
+/**
+ * Master adjusts the planning attributes of one ticket: dependency edges,
+ * priority, and ordering position inside the ticket's column. Dependencies
+ * are validated against the live board; position is an index in the column
+ * ordering (halving semantics, like an anchor move).
+ * @param agent - the master session agent.
+ * @param ticketId - the ticket to plan.
+ * @param dependsOn - replacement dependency edges, or undefined to keep them.
+ * @param priority - replacement priority, or undefined to keep it.
+ * @param position - the desired index in the ticket's column, or undefined to keep it.
+ * @returns the planned ticket.
+ */
+async planAsMaster( agent: Agent, ticketId: string, dependsOn: string[] | undefined, priority: Priority | undefined, position: number | undefined, ): Promise<TicketView>
+
+/**
  * Agent claims a Not started ticket and becomes its owner (v1 path, kept
  * for boards without a master seat).
  * @param agent - the claiming agent.
@@ -318,7 +353,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:286`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:287`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -341,5 +376,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:233`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:239`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

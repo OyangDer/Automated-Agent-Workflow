@@ -1838,6 +1838,24 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the re-dispatched card plus the worker-spawn outcome.',
       },
       {
+        signature: 'async createAsMaster( agent: Agent, request: CreateTicketRequest & { type?: TicketType; targetBranch?: string }, ): Promise<TicketView>',
+        description: 'Master records a new ticket on a board\'s Backlog (the discussion whiteboard: the plan the master agreed with the user is written down). Unlike the Remote create surface, the master tool also sets the ticket type and may target any board the caller masters.',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'request', description: 'title, description, type, priority, dependencies, boardId and optional targetBranch.' }],
+        returns: 'the created Backlog ticket.',
+      },
+      {
+        signature: 'async moveAsMaster(agent: Agent, request: MoveTicketRequest): Promise<TicketView>',
+        description: 'Master schedules a ticket to another column, optionally next to an anchor; entering In testing still auto-assigns a fresh reviewer. The caller must hold the master seat of the ticket\'s board.',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'request', description: 'target column and optional position anchors.' }],
+        returns: 'the moved ticket.',
+      },
+      {
+        signature: 'async planAsMaster( agent: Agent, ticketId: string, dependsOn: string[] | undefined, priority: Priority | undefined, position: number | undefined, ): Promise<TicketView>',
+        description: 'Master adjusts the planning attributes of one ticket: dependency edges, priority, and ordering position inside the ticket\'s column. Dependencies are validated against the live board; position is an index in the column ordering (halving semantics, like an anchor move).',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the ticket to plan.' }, { name: 'dependsOn', description: 'replacement dependency edges, or undefined to keep them.' }, { name: 'priority', description: 'replacement priority, or undefined to keep it.' }, { name: 'position', description: 'the desired index in the ticket\'s column, or undefined to keep it.' }],
+        returns: 'the planned ticket.',
+      },
+      {
         signature: 'async claim(agent: Agent, ticketId: string): Promise<TicketView>',
         description: 'Agent claims a Not started ticket and becomes its owner (v1 path, kept for boards without a master seat).',
         parameters: [{ name: 'agent', description: 'the claiming agent.' }, { name: 'ticketId', description: 'the Not started ticket to claim.' }],
@@ -3108,7 +3126,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CreateTicketRequest',
-    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n}',
+    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n}',
   },
   {
     name: 'CredentialInfo',
@@ -3224,7 +3242,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'EditTicketRequest',
-    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n}',
+    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n}',
   },
   {
     name: 'EpochHeader',
@@ -4588,7 +4606,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketView',
-    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TicketWorkerStatus',

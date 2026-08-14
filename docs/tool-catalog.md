@@ -27,7 +27,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`, `grep` | `ctx.tools`, `ctx.subprocess`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | glob and grep are unconditional discovery tools that spawn the packaged ripgrep binary (`@vscode/ripgrep`) through ctx.subprocess as ordinary foreground calls (never background jobs) — no host `rg` install and no shell layer. The catalog uses `sampleOverCapGlobResults: true`; deployments must choose that behavior explicitly. Capped results save the complete formatted list through the optional ctx.spillStore backend; returned locators are follow-up-readable/searchable when the backend exposes local paths in co-located deployments. |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`, `terminal_list`, `terminal_open`, `terminal_read`, `terminal_send`, `terminal_signal` | `ctx.tools`, `ctx.terminals`, `ctx.systemPrompt`, `ctx.jobs at call time for run_in_background` | `tool/call`, `tool/result` | - | The six terminal tools are opt-in and complement one-shot shell/filesystem tools. `terminal_send(run_in_background: true)` registers with `ctx.jobs`; TUI, named key sequences, BEL, resize, auto-start, and cross-agent sharing are absent from the schema. |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`, `get_goal`, `update_goal` | `ctx.tools`, `ctx.agents`, `ctx.goals`, `ctx.systemPrompt`, `a calling Agent in an authorized open turn` | `tool/call`, `goal/change for mutations`, `tool/result` | - | create, edit, pause, and resume require direct-human root authority; complete and blocked also accept the exact current goal round. The default blocked lower bound is three admitted rounds. |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_fail`, `taskboard_list`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_list`, `taskboard_move`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`, `schedule_delete`, `schedule_list` | `ctx.tools`, `ctx.sessions`, `Session persistence`, `a future live root Agent` | `tool/call`, `schedule/change create or delete`, `tool/result` | - | Registered only inside live root Agent scopes created after the opt-in Schedule plugin loads. Version 1 accepts after_seconds, explicit absolute at, and bounded fixed-rate every_seconds, and discloses session-local delivery; management reads and mutations require the shared Session persistence barrier. |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`, `ctx.lsp`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | The lsp tool keeps provider selection and language-server subprocesses behind ctx.lsp, so its model-visible schema stays stable across providers. Requires a registered provider (e.g. `@deepseek-ai/dsh-lsp-stdio`) at runtime; without one, a query returns the structured `LSP_UNAVAILABLE` error rather than changing the schema. |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`, `ctx.workflowEngine`, `ctx.subagents`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents every fresh round)` | `tool/call`, `tool/result`, `workflow and child session events during execution` | - | A fixed foreground workflow starts one fresh structured child per round; the model selects only the immutable objective and an optional round cap. |
@@ -1174,6 +1174,67 @@ Mark an owned In progress ticket as development-complete: the card moves to In t
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_create`
+
+Create a taskboard ticket on a board's Backlog (master only): the plan you agreed with the user is written down as a card. The ticket lands in Backlog with the given type, priority and dependencies.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to create the ticket on. Omit for the default board."
+    },
+    "title": {
+      "type": "string",
+      "description": "Ticket title."
+    },
+    "description": {
+      "type": "string",
+      "description": "Ticket description / acceptance criteria."
+    },
+    "type": {
+      "type": "string",
+      "description": "Ticket kind badge. Omit for \"feature\".",
+      "enum": [
+        "feature",
+        "bugfix",
+        "refactor",
+        "docs",
+        "test",
+        "merge",
+        "infra",
+        "chore",
+        "spike"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "description": "Ticket priority. Omit for \"normal\".",
+      "enum": [
+        "low",
+        "normal",
+        "high"
+      ]
+    },
+    "dependsOn": {
+      "type": "array",
+      "description": "Ticket ids this ticket waits for; all must exist and be open to completion.",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "title",
+    "description"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_fail`
 
 Report a taskboard ticket as failed (assigned worker only): the card stays In progress but is marked blocked with your failure reason so the master can re-dispatch it.
@@ -1224,6 +1285,88 @@ List taskboard tickets. Tickets come back sorted by implementation order (positi
       "description": "When true, only tickets assigned to the calling agent."
     }
   }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_move`
+
+Move a taskboard ticket between columns (master only): schedules the card, optionally next to an anchor ticket. Moving into In testing keeps the automatic reviewer assignment.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket to move."
+    },
+    "column": {
+      "type": "string",
+      "description": "The target column.",
+      "enum": [
+        "backlog",
+        "not_started",
+        "in_progress",
+        "in_testing",
+        "done"
+      ]
+    },
+    "beforeTicketId": {
+      "type": "string",
+      "description": "Insert immediately before this ticket in the target column."
+    },
+    "afterTicketId": {
+      "type": "string",
+      "description": "Insert immediately after this ticket in the target column (used when before is omitted)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "column"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_plan`
+
+Plan a taskboard ticket (master only): adjust dependency edges, priority, and the card's ordering position inside its column. Dependency changes take effect immediately on claim gates; position is an index in the column ordering (0 = first).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket to plan."
+    },
+    "dependsOn": {
+      "type": "array",
+      "description": "Replacement dependency edges (tickets that must be Done first). Omit to keep the current edges.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "priority": {
+      "type": "string",
+      "description": "Replacement priority. Omit to keep the current priority.",
+      "enum": [
+        "low",
+        "normal",
+        "high"
+      ]
+    },
+    "position": {
+      "type": "number",
+      "description": "Desired index in the ticket's column ordering (0 = first). Omit to keep the current position."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
 }
 ```
 
