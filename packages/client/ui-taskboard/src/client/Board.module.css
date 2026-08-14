@@ -30,6 +30,97 @@
 
 .headerActions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.boardSelector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  max-width: 340px;
+}
+
+.boardSelect {
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+  max-width: 180px;
+}
+
+.archiveButton,
+.createButton,
+.confirmButton,
+.cancelButton,
+.secondaryButton {
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.archiveButton,
+.createButton,
+.confirmButton,
+.secondaryButton {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.archiveButton:hover,
+.createButton:hover,
+.confirmButton:hover,
+.secondaryButton:hover {
+  border-color: var(--dsw-alias-interactive-bg-hover-solid);
+}
+
+.cancelButton {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.confirmButton {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+.archiveConfirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.archiveConfirmText {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.newBoardForm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+}
+
+.boardNameInput {
+  flex: 1;
+  min-width: 160px;
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
 }
 
 .newButton {

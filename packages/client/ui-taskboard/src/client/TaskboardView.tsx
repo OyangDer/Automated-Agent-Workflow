@@ -32,11 +32,16 @@ interface DropTarget {
 }
 
 export function TaskboardView({
-  useBoard, useStore, actions, create, move, edit, remove, requestReview, t,
+  useBoard, useStore, actions, create, move, edit, remove, requestReview,
+  selectBoard, createBoard, archiveBoard, t,
 }: TaskboardViewProps) {
-  const board = useBoard(board => board)
+  const boardState = useBoard(state => state)
+  const board = boardState.snapshot
   const selectedId = useStore(state => state.selectedId)
   const [formOpen, setFormOpen] = useState(false)
+  const [newBoardOpen, setNewBoardOpen] = useState(false)
+  const [boardName, setBoardName] = useState('')
+  const [confirmArchive, setConfirmArchive] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -54,6 +59,34 @@ export function TaskboardView({
 
   const selected = board === null ? null : board.tickets.find(ticket => ticket.id === selectedId) ?? null
   const ticketCount = board?.tickets.length ?? 0
+
+  /** Active boards for the selector; archived ones collapse into a group. */
+  const activeBoards = boardState.boards.filter(item => item.archivedAt === null)
+  const archivedBoards = boardState.boards.filter(item => item.archivedAt !== null)
+
+  /** Create one board from the inline name field and open it. */
+  const handleCreateBoard = async (): Promise<void> => {
+    const name = boardName.trim()
+    if (name === '') return
+    try {
+      await createBoard(name)
+      setNewBoardOpen(false)
+      setBoardName('')
+      setError(null)
+    } catch {
+      setError(t('error.generic'))
+    }
+  }
+
+  /** Archive the active board after the inline confirmation. */
+  const handleArchive = async (): Promise<void> => {
+    try {
+      await archiveBoard(boardState.boardId)
+      setError(null)
+    } catch {
+      setError(t('error.generic'))
+    }
+  }
 
   /** Commit one drag-drop move and surface failures in the banner. */
   const handleDrop = async (column: ColumnId): Promise<void> => {
@@ -82,12 +115,73 @@ export function TaskboardView({
       <header className={css.header}>
         <h1 className={css.title}>{t('view.taskboard')}</h1>
         <span className={css.count}>{String(ticketCount)}</span>
+        <div className={css.boardSelector}>
+          <select
+            className={css.boardSelect}
+            aria-label={t('board.select')}
+            value={boardState.boardId}
+            onChange={(event) => { void selectBoard(event.target.value) }}
+          >
+            {activeBoards.map(boardRow => (
+              <option key={boardRow.boardId} value={boardRow.boardId}>
+                {boardRow.name || boardRow.boardId}
+              </option>
+            ))}
+            {archivedBoards.length > 0 && (
+              <optgroup label={t('board.archived')}>
+                {archivedBoards.map(boardRow => (
+                  <option key={boardRow.boardId} value={boardRow.boardId} disabled>
+                    {boardRow.name || boardRow.boardId}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+          {!confirmArchive ? (
+            <button type="button" className={css.archiveButton} onClick={() => setConfirmArchive(true)}>
+              {t('board.archive')}
+            </button>
+          ) : (
+            <span className={css.archiveConfirm}>
+              <span className={css.archiveConfirmText}>{t('board.archiveConfirm')}</span>
+              <button type="button" className={css.confirmButton} onClick={() => { setConfirmArchive(false); void handleArchive() }}>
+                {t('board.confirm')}
+              </button>
+              <button type="button" className={css.cancelButton} onClick={() => setConfirmArchive(false)}>
+                {t('action.cancel')}
+              </button>
+            </span>
+          )}
+        </div>
         <div className={css.headerActions}>
+          <button type="button" className={css.secondaryButton} onClick={() => setNewBoardOpen(open => !open)}>
+            {t('board.new')}
+          </button>
           <button type="button" className={css.newButton} onClick={() => setFormOpen(true)}>
             {t('action.new')}
           </button>
         </div>
       </header>
+      {newBoardOpen && (
+        <form
+          className={css.newBoardForm}
+          onSubmit={(event) => { event.preventDefault(); void handleCreateBoard() }}
+        >
+          <input
+            className={css.boardNameInput}
+            value={boardName}
+            onChange={event => setBoardName(event.target.value)}
+            placeholder={t('board.newName')}
+            aria-label={t('board.newName')}
+          />
+          <button type="submit" className={css.createButton} disabled={boardName.trim() === ''}>
+            {t('board.create')}
+          </button>
+          <button type="button" className={css.cancelButton} onClick={() => { setNewBoardOpen(false); setBoardName('') }}>
+            {t('action.cancel')}
+          </button>
+        </form>
+      )}
       {error !== null && (
         <div className={css.errorBanner} role="alert">
           <span>{error}</span>

@@ -30,10 +30,26 @@
   gap: 8px;
 }
 
+.cardTopLeft {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .priority {
   font-size: 11px;
   line-height: 16px;
   color: var(--taskboard-card-accent, var(--dsw-alias-label-secondary));
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.typeBadge {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--taskboard-card-type-accent, var(--dsw-alias-label-secondary));
   border: 1px solid currentColor;
   border-radius: 4px;
   padding: 0 4px;

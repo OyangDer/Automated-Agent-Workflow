@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
-import type { TicketView } from '@deepseek-ai/dsh-taskboard/client'
+import type { BoardView, TicketView } from '@deepseek-ai/dsh-taskboard/client'
 import { TaskboardView, type TaskboardViewProps } from '../src/client/TaskboardView.tsx'
 import { zh } from '../src/client/locales.ts'
 
@@ -24,6 +24,10 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     description: '把登录页拆成组件',
     column: 'backlog',
     priority: 'normal',
+    boardId: 'default',
+    type: 'feature',
+    status: 'claimed',
+    failure: null,
     createdAt: 1,
     updatedAt: 1,
     position: 0,
@@ -31,6 +35,7 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     reviewer: null,
     reviewAttempts: 0,
     lastReview: null,
+    reviewOutcome: null,
     devNotes: '',
     dependsOn: [],
     history: [],
@@ -40,17 +45,33 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
 
 interface StubProps {
   board: TicketView[]
+  boards?: BoardView[]
+  boardId?: string
   selectedId?: string | null
   create?: (request: unknown) => Promise<TicketView>
   move?: (request: unknown) => Promise<TicketView>
+  selectBoard?: (boardId: string) => Promise<void>
+  createBoard?: (name: string) => Promise<BoardView>
+  archiveBoard?: (boardId: string) => Promise<BoardView>
+}
+
+/** One board row fixture. */
+function boardRow(boardId: string, name: string): BoardView {
+  return {
+    boardId, name, workspaceId: '',
+    masterAgentId: null, masterClaimedAt: null, handoverNotes: '', archivedAt: null,
+  }
 }
 
 /** Assemble the four shares the component destructures. */
-function propsOf({ board, selectedId = null, create, move }: StubProps): TaskboardViewProps {
-  const snapshot = { tickets: board }
+function propsOf({
+  board, boards = [], boardId = 'default', selectedId = null,
+  create, move, selectBoard, createBoard, archiveBoard,
+}: StubProps): TaskboardViewProps {
+  const state = { boardId, boards, snapshot: { boardId, name: boardId, tickets: board } }
   const storeState = { selectedId }
   return {
-    useBoard: (selector: (value: { tickets: TicketView[] }) => { tickets: TicketView[] }) => selector(snapshot),
+    useBoard: (selector: (value: typeof state) => typeof state) => selector(state),
     useStore: (selector: (value: { selectedId: string | null }) => string | null) => selector(storeState),
     actions: { select: vi.fn() },
     create: create ?? (async () => ticket()),
@@ -59,7 +80,10 @@ function propsOf({ board, selectedId = null, create, move }: StubProps): Taskboa
     remove: async () => ({ removedId: 'ticket-0001' }),
     requestReview: async () => ticket(),
     refresh: () => {},
-    hooks: { board: { getSnapshot: () => snapshot, subscribe: () => () => {} } },
+    selectBoard: selectBoard ?? (async () => {}),
+    createBoard: createBoard ?? (async () => boardRow('board-new', 'new')),
+    archiveBoard: archiveBoard ?? (async () => boardRow('default', 'default')),
+    hooks: { board: { getSnapshot: () => state, subscribe: () => () => {} } },
     t,
   } as unknown as TaskboardViewProps
 }
@@ -171,5 +195,59 @@ describe('TaskboardView', () => {
     } as unknown as TaskboardViewProps))
     fireEvent.click(screen.getByText('重新送审'))
     expect(requestReview).toHaveBeenCalledWith({ ticketId: 'ticket-0300' })
+  })
+
+  it('renders the board selector with active and archived boards', () => {
+    const boards: BoardView[] = [
+      boardRow('default', 'default'),
+      boardRow('board-1', '迭代一'),
+      { ...boardRow('board-2', '迭代二'), archivedAt: 2 },
+    ]
+    render(createElement(TaskboardView, propsOf({ board: [], boards, boardId: 'board-1' })))
+    const select = screen.getByLabelText('选择看板') as HTMLSelectElement
+    expect(select.value).toBe('board-1')
+    const values = Array.from(select.options).map(option => option.value)
+    expect(values).toEqual(['default', 'board-1', 'board-2'])
+    expect(select.querySelector('optgroup')?.getAttribute('label')).toBe('已归档')
+  })
+
+  it('switches boards through the selector, calling selectBoard', () => {
+    const selectBoard = vi.fn(async () => {})
+    const boards = [boardRow('default', 'default'), boardRow('board-1', '迭代一')]
+    render(createElement(TaskboardView, propsOf({ board: [], boards, selectBoard })))
+    const select = screen.getByLabelText('选择看板') as HTMLSelectElement
+    fireEvent.change(select, { target: { value: 'board-1' } })
+    expect(selectBoard).toHaveBeenCalledWith('board-1')
+  })
+
+  it('creates a board through the inline form', async () => {
+    const createBoard = vi.fn(async (name: string) => boardRow('board-9', name))
+    render(createElement(TaskboardView, propsOf({ board: [], createBoard })))
+    fireEvent.click(screen.getByText('新建板'))
+    const input = screen.getByLabelText('看板名称') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '新看板' } })
+    fireEvent.click(screen.getByText('创建'))
+    await vi.waitFor(() => {
+      expect(createBoard).toHaveBeenCalledWith('新看板')
+    })
+  })
+
+  it('shows the type badge on cards', () => {
+    const bugfix = ticket({ id: 'ticket-0004', title: '缺陷卡片', type: 'bugfix' })
+    const spike = ticket({ id: 'ticket-0005', title: '探索卡片', type: 'spike' })
+    render(createElement(TaskboardView, propsOf({ board: [bugfix, spike] })))
+    expect(screen.getByText('缺陷修复')).toBeTruthy()
+    expect(screen.getByText('探索')).toBeTruthy()
+  })
+
+  it('archives the active board after inline confirmation', async () => {
+    const archiveBoard = vi.fn(async (boardId: string) => ({ ...boardRow(boardId, boardId), archivedAt: 3 }))
+    const boards = [boardRow('default', 'default'), boardRow('board-1', '迭代一')]
+    render(createElement(TaskboardView, propsOf({ board: [], boards, boardId: 'board-1', archiveBoard })))
+    fireEvent.click(screen.getByText('归档'))
+    fireEvent.click(screen.getByText('确认'))
+    await vi.waitFor(() => {
+      expect(archiveBoard).toHaveBeenCalledWith('board-1')
+    })
   })
 })

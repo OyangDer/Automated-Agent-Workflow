@@ -28,6 +28,19 @@ const PRIORITY_ACCENT = {
   high: 'var(--dsw-alias-state-error-primary)',
 } as const satisfies Record<TicketView['priority'], string>
 
+/** Ticket type → accent token for the kind badge (remaining kinds fall back). */
+const TYPE_ACCENT: Partial<Record<TicketView['type'], string>> = {
+  feature: 'var(--dsw-alias-state-business-primary)',
+  bugfix: 'var(--dsw-alias-state-error-primary)',
+  test: 'var(--dsw-alias-state-warn-primary)',
+  merge: 'var(--dsw-alias-state-success-primary)',
+}
+
+/** The type accent with a neutral fallback for the remaining kinds. */
+function typeAccent(type: TicketView['type']): string {
+  return TYPE_ACCENT[type] ?? 'var(--dsw-alias-label-tertiary)'
+}
+
 export function TicketCard({
   ticket, selected, dragging, t,
   onSelect, onDragStart, onDragEnd, onDragOverCard,
@@ -39,7 +52,10 @@ export function TicketCard({
     <article
       className={css.card + (selected ? ' ' + css.cardSelected : '') + (dragging ? ' ' + css.cardDragging : '')}
       draggable
-      style={{ '--taskboard-card-accent': PRIORITY_ACCENT[ticket.priority] } as Record<string, string>}
+      style={{
+        '--taskboard-card-accent': PRIORITY_ACCENT[ticket.priority],
+        '--taskboard-card-type-accent': typeAccent(ticket.type),
+      } as Record<string, string>}
       onClick={onSelect}
       onDragStart={(event: DragEvent) => {
         event.dataTransfer.setData('text/plain', ticket.id)
@@ -56,8 +72,13 @@ export function TicketCard({
       }}
     >
       <div className={css.cardTop}>
-        <span className={css.priority} title={t(('priority.' + ticket.priority) as never)}>
-          {t(('priority.' + ticket.priority) as never)}
+        <span className={css.cardTopLeft}>
+          <span className={css.priority} title={t(('priority.' + ticket.priority) as never)}>
+            {t(('priority.' + ticket.priority) as never)}
+          </span>
+          <span className={css.typeBadge} title={t(('type.' + ticket.type) as never)}>
+            {t(('type.' + ticket.type) as never)}
+          </span>
         </span>
         <span className={css.id}>{ticket.id}</span>
       </div>

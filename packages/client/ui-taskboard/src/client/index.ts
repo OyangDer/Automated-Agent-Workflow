@@ -1,10 +1,10 @@
 /**
  * Taskboard surface plugin, browser half: one five-column kanban tab in the
- * conversation view ring. Live board state arrives through the forwarded
- * taskboard/changed host event (refetched snapshot published through one
- * root-scoped observable source); mutations are the generated taskboard
- * Remote verbs, unwrapped from their RemoteResult envelopes. The plugin owns
- * no store beyond the tab's viewing state.
+ * conversation view ring. Live board state (the active board's snapshot plus
+ * the board list) arrives through the forwarded taskboard/changed host event
+ * and is republished through one root-scoped observable source; mutations are
+ * the generated taskboard Remote verbs, unwrapped from their RemoteResult
+ * envelopes. The plugin owns no store beyond the tab's viewing state.
  */
 import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the generated Remote API and ctx.remote merge through the Client assembly boundary.
@@ -15,10 +15,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { BoardSnapshot } from '@deepseek-ai/dsh-taskboard/client'
+import type { BoardSnapshot, BoardView } from '@deepseek-ai/dsh-taskboard/client'
 import { createTaskboardStore } from './stores.ts'
 import { TaskboardView } from './TaskboardView.tsx'
-import type { TaskboardInjected } from './contract.ts'
+import type { BoardState, TaskboardInjected } from './contract.ts'
 import { en, zh, type TaskboardKey } from './locales.ts'
 
 export type { TaskboardInjected } from './contract.ts'
@@ -44,28 +44,79 @@ function unwrap<T>(result: RemoteResult<T>): T {
 
 /**
  * Client plugin body: the conversation.view tab with its verbs and live
- * snapshot source.
+ * board-state source.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-taskboard: dictionaries')
   const t = ctx.locale.bind(NS)
 
-  // One root-scoped board snapshot source shared by every session tab: the
-  // forwarded change event triggers a refetch, and the fresh snapshot is
-  // republished through the same source identity so hook bindings stay warm.
-  let current: BoardSnapshot | null = null
+  // One root-scoped board state source shared by every session tab: the
+  // forwarded change event triggers a refetch of the active board, and the
+  // fresh state is republished through the same source identity so hook
+  // bindings stay warm.
+  let current: BoardState = { boardId: 'default', boards: [], snapshot: null }
   const listeners = new Set<() => void>()
-  const refresh = async (): Promise<void> => {
-    try {
-      current = unwrap(await ctx.remote.taskboard.snapshot())
-    } catch {
-      // Keep the last good snapshot; failures surface through the next retry.
-      current = current === null ? { tickets: [] } : current
-    }
+  const publish = (): void => {
     for (const listener of listeners) listener()
   }
-  const board: HostObservable<BoardSnapshot | null> = {
+
+  /** Fetch the board list and one board's snapshot in one round trip. */
+  const fetchBoardState = async (boardId: string): Promise<{ boards: BoardView[]; snapshot: BoardSnapshot }> => {
+    const [boards, snapshot] = await Promise.all([
+      unwrap(await ctx.remote.taskboard.listBoards()),
+      unwrap(await ctx.remote.taskboard.snapshot(boardId)),
+    ])
+    return { boards, snapshot }
+  }
+
+  /** Refetch the active board's state and republish it. */
+  const refresh = async (): Promise<void> => {
+    const boardId = current.boardId
+    try {
+      const next = await fetchBoardState(boardId)
+      // A selection made while this fetch was in flight wins; drop the stale state.
+      if (current.boardId !== boardId) return
+      current = { boardId, ...next }
+    } catch {
+      // Keep the last good state; a first load that fails falls back to an
+      // empty snapshot so the tab renders something.
+      if (current.boardId === boardId && current.snapshot === null) {
+        current = { boardId, boards: current.boards, snapshot: { boardId, name: boardId, tickets: [] } }
+      }
+    }
+    publish()
+  }
+
+  /** Switch the active board and refetch both feeds. */
+  const selectBoard = async (boardId: string): Promise<void> => {
+    if (boardId === current.boardId) {
+      void refresh()
+      return
+    }
+    current = { ...current, boardId }
+    void refresh()
+  }
+
+  /** Create one board from its display name, then open it. */
+  const createBoard = async (name: string): Promise<BoardView> => {
+    const created = unwrap(await ctx.remote.taskboard.createBoard({ name, workspaceId: '' }))
+    await selectBoard(created.boardId)
+    return created
+  }
+
+  /** Archive one board; archiving the active board falls back to default. */
+  const archiveBoard = async (boardId: string): Promise<BoardView> => {
+    const archived = unwrap(await ctx.remote.taskboard.archiveBoard({ boardId }))
+    if (archived.boardId === current.boardId) {
+      await selectBoard('default')
+    } else {
+      void refresh()
+    }
+    return archived
+  }
+
+  const board: HostObservable<BoardState> = {
     getSnapshot: () => current,
     subscribe: (listener) => {
       listeners.add(listener)
@@ -89,6 +140,9 @@ export function apply(ctx: ClientContext): void {
       remove: async request => unwrap(await ctx.remote.taskboard.delete(request)),
       requestReview: async request => unwrap(await ctx.remote.taskboard.requestReview(sessionId, request)),
       refresh: () => { void refresh() },
+      selectBoard,
+      createBoard,
+      archiveBoard,
       hooks: { board },
     }),
   }, TaskboardView))
