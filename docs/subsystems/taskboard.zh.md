@@ -93,46 +93,62 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 ```ts cordis-catalog
 /**
  * Whole-board snapshot, sorted by column then position, scoped to one
- * board the caller may see: its own workspace's boards plus the unowned
- * ones. A board owned by another workspace is denied as not found.
- * @param agent - the calling session agent; its workspace scopes the board.
+ * board the caller may see: its own session-private boards plus its
+ * workspace's project boards and the unowned legacy ones. A board outside
+ * the caller's scope is denied as not found so its existence is not leaked.
+ * @param agent - the calling session agent; its session and workspace scope the board.
  * @param boardId - the board to snapshot, or undefined for the caller's default board.
  * @returns the live board snapshot.
  */
 @Remote('snapshot') async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot>
 
 /**
- * List every board the caller may see: its own workspace's boards plus the
- * unowned ones. The implicit unowned "default" board row is reported first
- * when no record exists for it yet (v1 compatibility).
- * @param agent - the calling session agent; its workspace scopes the listing.
+ * List every board the caller may see: its session-private boards (scope
+ * 'session' owned by this session), its workspace's project boards (scope
+ * 'project' with a matching workspaceId), and the unowned legacy default
+ * board awaiting adoption. Boards outside those scopes never appear, so a
+ * foreign session-private board or a cross-workspace project board is not
+ * leaked. The implicit unowned "default" board row is reported first when
+ * no record exists for it yet (v1 compatibility).
+ * @param agent - the calling session agent; its session and workspace scope the listing.
  * @returns the visible board rows.
  */
 @Remote('listBoards') async listBoards(agent: Agent): Promise<BoardView[]>
 
 /**
- * Create one board through the Remote boundary. The board is stamped with
- * the caller's workspace ('' when unowned); any workspaceId in the request
- * is ignored.
- * @param agent - the calling session agent; its workspace owns the board.
- * @param request - the board name.
+ * Create one board through the Remote boundary. A 'project' scope stamps
+ * the board with the caller's workspace ('' when unowned) and shares it
+ * with every session of that workspace; the default 'session' scope records
+ * the creating session as the owner and keeps the board private to it. The
+ * boardId is always a fresh unique id; any workspaceId in the request is
+ * ignored. An unowned caller (no resolvable cwd) is forced into 'session'
+ * scope regardless of the request: a 'project' request from an unowned
+ * session would otherwise mint a workspaceId-'' board shared with every
+ * unowned session (the unowned leak).
+ * @param agent - the calling session agent; it owns session boards and its workspace owns project boards.
+ * @param request - the board name and visibility scope.
  * @returns the created board.
  */
 @Remote('createBoard') async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView>
 
 /**
- * Archive one board through the Remote boundary.
+ * Archive one board through the Remote boundary. A board the caller cannot
+ * see is denied as not found (no existence leak).
+ * @param agent - the calling session agent.
  * @param request - the board to archive.
  * @returns the archived board.
  */
-@Remote('archiveBoard') async archiveBoardRemote(request: ArchiveBoardRequest): Promise<BoardView>
+@Remote('archiveBoard') async archiveBoardRemote(agent: Agent, request: ArchiveBoardRequest): Promise<BoardView>
 
 /**
- * Create one ticket in Backlog through the Remote boundary.
+ * Create one ticket in Backlog through the Remote boundary. The target
+ * board must be visible to the caller; an invisible board is denied as not
+ * found (no existence leak).
+ * @param agent - the calling session agent.
  * @param request - title, description, priority, ordering dependencies, and optional boardId.
  * @returns the created ticket.
  */
-@Remote('create') createRemote(request: CreateTicketRequest): Promise<TicketView>
+@Remote('create') createRemote(agent: Agent, request: CreateTicketRequest): Promise<TicketView>
 
 /**
  * Move one ticket through the Remote boundary; entering In testing also
@@ -144,18 +160,24 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 @Remote('move') moveRemote(agent: Agent, request: MoveTicketRequest): Promise<TicketView>
 
 /**
- * Edit one ticket through the Remote boundary.
+ * Edit one ticket through the Remote boundary. The ticket's board must be
+ * visible to the caller; an invisible board is denied as not found (no
+ * existence leak).
+ * @param agent - the calling session agent.
  * @param request - replacement content and dependency edges.
  * @returns the edited ticket.
  */
-@Remote('edit') async editRemote(request: EditTicketRequest): Promise<TicketView>
+@Remote('edit') async editRemote(agent: Agent, request: EditTicketRequest): Promise<TicketView>
 
 /**
- * Remove one ticket through the Remote boundary.
+ * Remove one ticket through the Remote boundary. The ticket's board must be
+ * visible to the caller; an invisible board is denied as not found (no
+ * existence leak).
+ * @param agent - the calling session agent.
  * @param request - the ticket to remove.
  * @returns the removal receipt.
  */
-@Remote('delete') async removeRemote(request: RemoveTicketRequest): Promise<RemoveTicketResult>
+@Remote('delete') async removeRemote(agent: Agent, request: RemoveTicketRequest): Promise<RemoveTicketResult>
 
 /**
  * (Re)assign a reviewer for one In testing ticket through the Remote
@@ -168,7 +190,9 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 
 /**
  * Claim the master seat of one board; a stale seat (past the lease) can be
- * preempted, and an unclaimed board is claimed by this agent.
+ * preempted, and an unclaimed board is claimed by this agent. A board the
+ * caller cannot see is denied as not found (no existence leak), so the
+ * master seat of a foreign session-private board cannot be seized.
  * @param boardId - the board to claim.
  * @param agent - the claiming session agent.
  * @returns the board with its fresh master.
@@ -176,7 +200,8 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 async claimMaster(boardId: string, agent: Agent): Promise<BoardView>
 
 /**
- * Release the master seat of one board; only the current master may.
+ * Release the master seat of one board; only the current master may. A
+ * board the caller cannot see is denied as not found (no existence leak).
  * @param boardId - the board to release.
  * @param agent - the current master.
  * @returns the board with an empty seat.
@@ -185,6 +210,7 @@ async releaseMaster(boardId: string, agent: Agent): Promise<BoardView>
 
 /**
  * Transfer the master seat to another session agent with handover notes.
+ * A board the caller cannot see is denied as not found (no existence leak).
  * @param boardId - the board to transfer.
  * @param fromAgent - the current master.
  * @param toAgentId - the receiving session agent id.
@@ -361,7 +387,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:288`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:296`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -384,5 +410,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:241`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:269`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

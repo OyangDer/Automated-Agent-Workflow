@@ -32,9 +32,9 @@ import {
 } from './types.ts'
 import type {
   ArchiveBoardRequest, BoardSnapshot, BoardView, ColumnId, CreateBoardRequest,
-  CreateTicketRequest, EditTicketRequest, MoveTicketRequest, Priority, RemoveTicketRequest,
-  RemoveTicketResult, RequestReviewRequest, TaskboardChanged, TaskboardOperation,
-  TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
+  CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MoveTicketRequest, Priority,
+  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, TaskboardChanged,
+  TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
   agentLabel, appendHistory, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
@@ -96,9 +96,17 @@ const boardSchema = zod.object({
   boardId: zod.string().min(1),
   name: zod.string(),
   workspaceId: zod.string(),
+  scope: zod.enum(['session', 'project'] as const).default('session'),
+  ownerSessionId: zod.string().nullable().default(null),
   masterAgentId: zod.string().nullable().default(null),
   masterClaimedAt: zod.number().nullable().default(null),
   handoverNotes: zod.string().default(''),
+  masterHistory: zod.array(zod.object({
+    fromAgentId: zod.string().nullable(),
+    toAgentId: zod.string(),
+    at: zod.number(),
+    notes: zod.string(),
+  })).default([]),
   archivedAt: zod.number().nullable().default(null),
 })
 
@@ -387,9 +395,15 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Read one board record, lazily materializing the implicit record when the
-   * board is absent (the "default" board always exists implicitly).
+   * board is absent (the "default" board always exists implicitly). An
+   * unseeded materialization lands as a project-shaped unowned board: shared
+   * among unowned sessions until the legacy default board is adopted by a
+   * real workspace.
    */
-  private async ensureBoard(boardId: string, seed?: { name?: string; workspaceId?: string }): Promise<BoardView> {
+  private async ensureBoard(
+    boardId: string,
+    seed?: { name?: string; workspaceId?: string; scope?: 'session' | 'project' },
+  ): Promise<BoardView> {
     const table = await this.boards()
     const existing = table.get(boardId)
     if (existing !== undefined) return existing
@@ -397,10 +411,47 @@ export class TaskboardService extends TypertRemoteService {
       boardId,
       name: seed?.name ?? boardId,
       workspaceId: seed?.workspaceId ?? '',
+      scope: seed?.scope ?? 'project',
+      ownerSessionId: null,
       masterAgentId: null,
       masterClaimedAt: null,
       handoverNotes: '',
       archivedAt: null,
+      masterHistory: [],
+    }
+    await table.put(boardId, record)
+    return record
+  }
+
+  /**
+   * Ensure the caller's session-private default board exists, materializing
+   * it idempotently under the deterministic id "session-<sessionId>" on the
+   * session's first board-surface access. The board is visible only to its
+   * owner session; its name is the workspace directory basename when the
+   * session resolves one, "session board" otherwise.
+   * @param agent - the calling session agent.
+   * @param workspace - the caller's resolved workspace, or undefined when unowned.
+   * @returns the session's private default board.
+   */
+  private async ensureSessionDefaultBoard(
+    agent: Agent,
+    workspace: { id: string; path: string } | undefined,
+  ): Promise<BoardView> {
+    const table = await this.boards()
+    const boardId = 'session-' + agent.id
+    const existing = table.get(boardId)
+    if (existing !== undefined) return existing
+    const record: BoardView = {
+      boardId,
+      name: workspace === undefined ? 'session board' : basename(workspace.path),
+      workspaceId: workspace === undefined ? '' : workspace.id,
+      scope: 'session',
+      ownerSessionId: agent.id,
+      masterAgentId: null,
+      masterClaimedAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+      masterHistory: [],
     }
     await table.put(boardId, record)
     return record
@@ -463,6 +514,8 @@ export class TaskboardService extends TypertRemoteService {
       return this.mutateBoard('default', current => ({
         ...current,
         workspaceId,
+        scope: 'project',
+        ownerSessionId: null,
         ...(name === undefined ? {} : { name }),
       }))
     }
@@ -470,24 +523,76 @@ export class TaskboardService extends TypertRemoteService {
     if (legacy.workspaceId === workspaceId) return legacy
     return this.ensureBoard('default-' + workspaceId, {
       workspaceId,
+      scope: 'project',
       ...(name === undefined ? {} : { name }),
     })
   }
 
   /**
-   * Require one board to be visible to a caller: a record-less board (the
-   * implicit default or a legacy implicit board) is unowned and shared, and a
-   * recorded board must be unowned or owned by the caller's workspace. A
-   * cross-workspace board is denied as not found so its existence is not
-   * leaked.
-   * @param boardId - the board to check.
+   * Materialize one board for a master verb, seeding the implicit "default"
+   * board with the caller's workspace when the record is absent. An unseeded
+   * materialization would land as a project-shaped ''-workspace board that a
+   * workspace session cannot see (TASKBOARD_BOARD_NOT_FOUND), breaking the
+   * very next master verb after a fresh-store claim. An existing record is
+   * returned untouched, so an adopted or v1 legacy default is never
+   * re-stamped.
+   * @param boardId - the board to ensure.
+   * @param agent - the calling session agent; its workspace seeds a materialized 'default'.
+   * @returns the ensured board record.
+   */
+  private async ensureMasterBoard(boardId: string, agent: Agent): Promise<BoardView> {
+    if (boardId !== 'default') return this.ensureBoard(boardId)
+    const workspace = await this.workspaceOf(agent)
+    return this.ensureBoard('default', workspace === undefined
+      ? undefined
+      : { workspaceId: workspace.id, scope: 'project', name: basename(workspace.path) })
+  }
+
+  /**
+   * True when one board row is visible to a caller. Session-scoped boards are
+   * private to their owner session; a session-scoped row WITHOUT an owner is
+   * a v1-shaped legacy record and follows the v1 workspace rule (the unowned
+   * legacy default is shared everywhere, workspace-tagged rows share within
+   * that workspace). A stray ''-workspace legacy row that is NOT the default
+   * board is visible to unowned callers only, so it never leaks into any real
+   * workspace. Project-scoped boards are shared within their owning workspace
+   * ('' matches unowned callers only, so a new unowned project board never
+   * leaks into every workspace).
+   * @param board - the board row to check.
+   * @param sessionId - the caller's session id.
    * @param workspaceId - the caller's workspace id, or '' when unowned.
    */
-  private async assertBoardAccessible(boardId: string, workspaceId: string): Promise<void> {
+  private isBoardVisible(board: BoardView, sessionId: string, workspaceId: string): boolean {
+    if (board.scope === 'session') {
+      if (board.ownerSessionId === null) {
+        // v1-shaped legacy row. The legacy default keeps its v1 "shared
+        // everywhere" semantics; any other ''-workspace row is confined to
+        // unowned callers (a real workspace never sees it).
+        if (board.workspaceId === '' && board.boardId !== 'default') return workspaceId === ''
+        return board.workspaceId === '' || board.workspaceId === workspaceId
+      }
+      return board.ownerSessionId === sessionId
+    }
+    return board.workspaceId === workspaceId
+  }
+
+  /**
+   * Require one board to be visible to a caller: a record-less board (the
+   * implicit default or a legacy implicit board) is unowned and shared, and a
+   * recorded board must be visible under the dual-scope rule (session boards
+   * only to their owner, project boards only within their workspace). A board
+   * outside the caller's scope is denied as not found so its existence is not
+   * leaked.
+   * @param boardId - the board to check.
+   * @param agent - the calling session agent.
+   */
+  private async assertBoardAccessible(boardId: string, agent: Agent): Promise<void> {
     const table = await this.boards()
     const board = table.get(boardId)
     if (board === undefined) return
-    if (board.workspaceId === '' || board.workspaceId === workspaceId) return
+    const workspace = await this.workspaceOf(agent)
+    const workspaceId = workspace === undefined ? '' : workspace.id
+    if (this.isBoardVisible(board, agent.id, workspaceId)) return
     throw new TaskboardError('board "' + boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
   }
 
@@ -520,7 +625,7 @@ export class TaskboardService extends TypertRemoteService {
 
   /** Require the caller to be the current master of one board (by id). */
   private async assertMasterOfBoard(boardId: string, agent: Agent): Promise<void> {
-    await this.ensureBoard(boardId)
+    await this.ensureMasterBoard(boardId, agent)
     const table = await this.boards()
     const board = table.get(boardId)
     if (board === undefined || board.masterAgentId !== agent.id) {
@@ -840,6 +945,7 @@ export class TaskboardService extends TypertRemoteService {
     if (current === undefined) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
+    await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
     const position = this.positionBetween(table, request.column, request.beforeTicketId, request.afterTicketId)
     const ticket = await this.mutate(request.ticketId, 'move', moved => appendHistory(
@@ -866,9 +972,10 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Whole-board snapshot, sorted by column then position, scoped to one
-   * board the caller may see: its own workspace's boards plus the unowned
-   * ones. A board owned by another workspace is denied as not found.
-   * @param agent - the calling session agent; its workspace scopes the board.
+   * board the caller may see: its own session-private boards plus its
+   * workspace's project boards and the unowned legacy ones. A board outside
+   * the caller's scope is denied as not found so its existence is not leaked.
+   * @param agent - the calling session agent; its session and workspace scope the board.
    * @param boardId - the board to snapshot, or undefined for the caller's default board.
    * @returns the live board snapshot.
    */
@@ -876,12 +983,13 @@ export class TaskboardService extends TypertRemoteService {
   async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot> {
     const workspace = await this.workspaceOf(agent)
     const workspaceId = workspace === undefined ? '' : workspace.id
+    await this.ensureSessionDefaultBoard(agent, workspace)
     const defaultBoard = await this.ensureDefaultBoard(
       workspaceId,
       workspace === undefined ? undefined : basename(workspace.path),
     )
     const board = boardId ?? defaultBoard?.boardId ?? 'default'
-    await this.assertBoardAccessible(board, workspaceId)
+    await this.assertBoardAccessible(board, agent)
     const table = await this.openedTable()
     const rows: TicketView[] = []
     for (const [, ticket] of table.entries()) {
@@ -897,16 +1005,21 @@ export class TaskboardService extends TypertRemoteService {
   private openTable: KvTable<string, TicketView> | null = null
 
   /**
-   * List every board the caller may see: its own workspace's boards plus the
-   * unowned ones. The implicit unowned "default" board row is reported first
-   * when no record exists for it yet (v1 compatibility).
-   * @param agent - the calling session agent; its workspace scopes the listing.
+   * List every board the caller may see: its session-private boards (scope
+   * 'session' owned by this session), its workspace's project boards (scope
+   * 'project' with a matching workspaceId), and the unowned legacy default
+   * board awaiting adoption. Boards outside those scopes never appear, so a
+   * foreign session-private board or a cross-workspace project board is not
+   * leaked. The implicit unowned "default" board row is reported first when
+   * no record exists for it yet (v1 compatibility).
+   * @param agent - the calling session agent; its session and workspace scope the listing.
    * @returns the visible board rows.
    */
   @Remote('listBoards')
   async listBoards(agent: Agent): Promise<BoardView[]> {
     const workspace = await this.workspaceOf(agent)
     const workspaceId = workspace === undefined ? '' : workspace.id
+    await this.ensureSessionDefaultBoard(agent, workspace)
     await this.ensureDefaultBoard(
       workspaceId,
       workspace === undefined ? undefined : basename(workspace.path),
@@ -914,16 +1027,19 @@ export class TaskboardService extends TypertRemoteService {
     const table = await this.boards()
     const boards: BoardView[] = []
     for (const [, board] of table.entries()) {
-      if (board.workspaceId === '' || board.workspaceId === workspaceId) boards.push(board)
+      if (this.isBoardVisible(board, agent.id, workspaceId)) boards.push(board)
     }
     if (table.get('default') === undefined) {
       boards.unshift({
         boardId: 'default',
         name: 'default',
         workspaceId: '',
+        scope: 'project',
+        ownerSessionId: null,
         masterAgentId: null,
         masterClaimedAt: null,
         handoverNotes: '',
+        masterHistory: [],
         archivedAt: null,
       })
     }
@@ -931,17 +1047,27 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Create one board through the Remote boundary. The board is stamped with
-   * the caller's workspace ('' when unowned); any workspaceId in the request
-   * is ignored.
-   * @param agent - the calling session agent; its workspace owns the board.
-   * @param request - the board name.
+   * Create one board through the Remote boundary. A 'project' scope stamps
+   * the board with the caller's workspace ('' when unowned) and shares it
+   * with every session of that workspace; the default 'session' scope records
+   * the creating session as the owner and keeps the board private to it. The
+   * boardId is always a fresh unique id; any workspaceId in the request is
+   * ignored. An unowned caller (no resolvable cwd) is forced into 'session'
+   * scope regardless of the request: a 'project' request from an unowned
+   * session would otherwise mint a workspaceId-'' board shared with every
+   * unowned session (the unowned leak).
+   * @param agent - the calling session agent; it owns session boards and its workspace owns project boards.
+   * @param request - the board name and visibility scope.
    * @returns the created board.
    */
   @Remote('createBoard')
   async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView> {
     const workspace = await this.workspaceOf(agent)
     const workspaceId = workspace === undefined ? '' : workspace.id
+    const scope = workspaceId === ''
+      ? 'session' as const
+      : request.scope === 'project' ? 'project' as const : 'session' as const
+    await this.ensureSessionDefaultBoard(agent, workspace)
     await this.ensureDefaultBoard(
       workspaceId,
       workspace === undefined ? undefined : basename(workspace.path),
@@ -950,33 +1076,42 @@ export class TaskboardService extends TypertRemoteService {
       boardId: 'board-' + randomUUID(),
       name: resolveBoardName(request.name),
       workspaceId,
+      scope,
+      ownerSessionId: scope === 'session' ? agent.id : null,
       masterAgentId: null,
       masterClaimedAt: null,
       handoverNotes: '',
       archivedAt: null,
+      masterHistory: [],
     }
     await (await this.boards()).put(record.boardId, record)
     return record
   }
 
   /**
-   * Archive one board through the Remote boundary.
+   * Archive one board through the Remote boundary. A board the caller cannot
+   * see is denied as not found (no existence leak).
+   * @param agent - the calling session agent.
    * @param request - the board to archive.
    * @returns the archived board.
    */
   @Remote('archiveBoard')
-  async archiveBoardRemote(request: ArchiveBoardRequest): Promise<BoardView> {
+  async archiveBoardRemote(agent: Agent, request: ArchiveBoardRequest): Promise<BoardView> {
+    await this.assertBoardAccessible(request.boardId, agent)
     return this.mutateBoard(request.boardId, current => ({ ...current, archivedAt: Date.now() }))
   }
 
   /**
-   * Create one ticket in Backlog through the Remote boundary.
+   * Create one ticket in Backlog through the Remote boundary. The target
+   * board must be visible to the caller; an invisible board is denied as not
+   * found (no existence leak).
+   * @param agent - the calling session agent.
    * @param request - title, description, priority, ordering dependencies, and optional boardId.
    * @returns the created ticket.
    */
   @Remote('create')
-  createRemote(request: CreateTicketRequest): Promise<TicketView> {
-    return this.createRecordForBoard(request)
+  createRemote(agent: Agent, request: CreateTicketRequest): Promise<TicketView> {
+    return this.createRecordForBoard(agent, request)
   }
 
   /**
@@ -984,9 +1119,11 @@ export class TaskboardService extends TypertRemoteService {
    * taskboard_create tool. The Remote surface leaves type/targetBranch at
    * their defaults; the master tool supplies them explicitly.
    */
-  private createRecordForBoard(
+  private async createRecordForBoard(
+    agent: Agent,
     request: CreateTicketRequest & { type?: TicketType; targetBranch?: string },
   ): Promise<TicketView> {
+    await this.assertBoardAccessible(request.boardId ?? 'default', agent)
     const title = resolveTitle(request.title)
     const priority = TASKBOARD_PRIORITIES.includes(request.priority) ? request.priority : 'normal'
     const type = request.type !== undefined && TASKBOARD_TYPES.includes(request.type) ? request.type : 'feature'
@@ -1045,12 +1182,15 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Edit one ticket through the Remote boundary.
+   * Edit one ticket through the Remote boundary. The ticket's board must be
+   * visible to the caller; an invisible board is denied as not found (no
+   * existence leak).
+   * @param agent - the calling session agent.
    * @param request - replacement content and dependency edges.
    * @returns the edited ticket.
    */
   @Remote('edit')
-  async editRemote(request: EditTicketRequest): Promise<TicketView> {
+  async editRemote(agent: Agent, request: EditTicketRequest): Promise<TicketView> {
     const title = resolveTitle(request.title)
     const priority = TASKBOARD_PRIORITIES.includes(request.priority) ? request.priority : 'normal'
     const table = await this.openedTable()
@@ -1058,6 +1198,7 @@ export class TaskboardService extends TypertRemoteService {
     if (current === undefined) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
+    await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
     this.validateDependencies(table, request.ticketId, request.dependsOn)
     return this.mutate(request.ticketId, 'edit', edited => appendHistory(
@@ -1076,17 +1217,21 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Remove one ticket through the Remote boundary.
+   * Remove one ticket through the Remote boundary. The ticket's board must be
+   * visible to the caller; an invisible board is denied as not found (no
+   * existence leak).
+   * @param agent - the calling session agent.
    * @param request - the ticket to remove.
    * @returns the removal receipt.
    */
   @Remote('delete')
-  async removeRemote(request: RemoveTicketRequest): Promise<RemoveTicketResult> {
+  async removeRemote(agent: Agent, request: RemoveTicketRequest): Promise<RemoveTicketResult> {
     const table = await this.tickets()
     const current = table.get(request.ticketId)
     if (current === undefined) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
+    await this.assertBoardAccessible(current.boardId, agent)
     const boardId = TaskboardService.boardContextOf(request.boardId, current)
     const removed = await table.delete(request.ticketId)
     if (!removed) {
@@ -1111,6 +1256,7 @@ export class TaskboardService extends TypertRemoteService {
     if (current === undefined) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
+    await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
     if (current.column !== 'in_testing') {
       throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
@@ -1126,13 +1272,16 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Claim the master seat of one board; a stale seat (past the lease) can be
-   * preempted, and an unclaimed board is claimed by this agent.
+   * preempted, and an unclaimed board is claimed by this agent. A board the
+   * caller cannot see is denied as not found (no existence leak), so the
+   * master seat of a foreign session-private board cannot be seized.
    * @param boardId - the board to claim.
    * @param agent - the claiming session agent.
    * @returns the board with its fresh master.
    */
   async claimMaster(boardId: string, agent: Agent): Promise<BoardView> {
-    await this.ensureBoard(boardId)
+    await this.assertBoardAccessible(boardId, agent)
+    await this.ensureMasterBoard(boardId, agent)
     const now = Date.now()
     return this.mutateBoard(boardId, (current) => {
       if (current.masterAgentId !== null && current.masterAgentId !== agent.id) {
@@ -1145,17 +1294,32 @@ export class TaskboardService extends TypertRemoteService {
           )
         }
       }
-      return { ...current, masterAgentId: agent.id, masterClaimedAt: now }
+      // A same-owner re-claim is a no-op: the seat and its history stay untouched.
+      if (current.masterAgentId === agent.id) return current
+      const entry: MasterHistoryEntry = {
+        fromAgentId: current.masterAgentId,
+        toAgentId: agent.id,
+        at: now,
+        notes: '',
+      }
+      return {
+        ...current,
+        masterAgentId: agent.id,
+        masterClaimedAt: now,
+        masterHistory: [...(current.masterHistory ?? []), entry],
+      }
     })
   }
 
   /**
-   * Release the master seat of one board; only the current master may.
+   * Release the master seat of one board; only the current master may. A
+   * board the caller cannot see is denied as not found (no existence leak).
    * @param boardId - the board to release.
    * @param agent - the current master.
    * @returns the board with an empty seat.
    */
   async releaseMaster(boardId: string, agent: Agent): Promise<BoardView> {
+    await this.assertBoardAccessible(boardId, agent)
     return this.mutateBoard(boardId, (current) => {
       if (current.masterAgentId !== agent.id) {
         throw new TaskboardError('only the current master may release the seat', 'TASKBOARD_NOT_MASTER')
@@ -1166,6 +1330,7 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Transfer the master seat to another session agent with handover notes.
+   * A board the caller cannot see is denied as not found (no existence leak).
    * @param boardId - the board to transfer.
    * @param fromAgent - the current master.
    * @param toAgentId - the receiving session agent id.
@@ -1173,6 +1338,7 @@ export class TaskboardService extends TypertRemoteService {
    * @returns the board with the new master.
    */
   async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView> {
+    await this.assertBoardAccessible(boardId, fromAgent)
     return this.mutateBoard(boardId, (current) => {
       if (current.masterAgentId !== fromAgent.id) {
         throw new TaskboardError('only the current master may transfer the seat', 'TASKBOARD_NOT_MASTER')
@@ -1180,11 +1346,20 @@ export class TaskboardService extends TypertRemoteService {
       if (typeof toAgentId !== 'string' || toAgentId.trim() === '') {
         throw new TaskboardError('transfer target agent id must be a non-empty string', 'TASKBOARD_INVALID_INPUT')
       }
+      const notes = typeof handoverNotes === 'string' ? handoverNotes : ''
+      const now = Date.now()
+      const entry: MasterHistoryEntry = {
+        fromAgentId: current.masterAgentId,
+        toAgentId,
+        at: now,
+        notes,
+      }
       return {
         ...current,
         masterAgentId: toAgentId,
-        masterClaimedAt: Date.now(),
-        handoverNotes: typeof handoverNotes === 'string' ? handoverNotes : '',
+        masterClaimedAt: now,
+        handoverNotes: notes,
+        masterHistory: [...(current.masterHistory ?? []), entry],
       }
     })
   }
@@ -1403,7 +1578,7 @@ export class TaskboardService extends TypertRemoteService {
   ): Promise<TicketView> {
     const boardId = request.boardId ?? 'default'
     await this.assertMasterOfBoard(boardId, agent)
-    return this.createRecordForBoard({ ...request, boardId })
+    return this.createRecordForBoard(agent, { ...request, boardId })
   }
 
   /**

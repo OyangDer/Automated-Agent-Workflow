@@ -1743,32 +1743,32 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     methods: [
       {
         signature: '@Remote(\'snapshot\') async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot>',
-        description: 'Whole-board snapshot, sorted by column then position, scoped to one board the caller may see: its own workspace\'s boards plus the unowned ones. A board owned by another workspace is denied as not found.',
-        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace scopes the board.' }, { name: 'boardId', description: 'the board to snapshot, or undefined for the caller\'s default board.' }],
+        description: 'Whole-board snapshot, sorted by column then position, scoped to one board the caller may see: its own session-private boards plus its workspace\'s project boards and the unowned legacy ones. A board outside the caller\'s scope is denied as not found so its existence is not leaked.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its session and workspace scope the board.' }, { name: 'boardId', description: 'the board to snapshot, or undefined for the caller\'s default board.' }],
         returns: 'the live board snapshot.',
       },
       {
         signature: '@Remote(\'listBoards\') async listBoards(agent: Agent): Promise<BoardView[]>',
-        description: 'List every board the caller may see: its own workspace\'s boards plus the unowned ones. The implicit unowned "default" board row is reported first when no record exists for it yet (v1 compatibility).',
-        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace scopes the listing.' }],
+        description: 'List every board the caller may see: its session-private boards (scope \'session\' owned by this session), its workspace\'s project boards (scope \'project\' with a matching workspaceId), and the unowned legacy default board awaiting adoption. Boards outside those scopes never appear, so a foreign session-private board or a cross-workspace project board is not leaked. The implicit unowned "default" board row is reported first when no record exists for it yet (v1 compatibility).',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its session and workspace scope the listing.' }],
         returns: 'the visible board rows.',
       },
       {
         signature: '@Remote(\'createBoard\') async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView>',
-        description: 'Create one board through the Remote boundary. The board is stamped with the caller\'s workspace (\'\' when unowned); any workspaceId in the request is ignored.',
-        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace owns the board.' }, { name: 'request', description: 'the board name.' }],
+        description: 'Create one board through the Remote boundary. A \'project\' scope stamps the board with the caller\'s workspace (\'\' when unowned) and shares it with every session of that workspace; the default \'session\' scope records the creating session as the owner and keeps the board private to it. The boardId is always a fresh unique id; any workspaceId in the request is ignored. An unowned caller (no resolvable cwd) is forced into \'session\' scope regardless of the request: a \'project\' request from an unowned session would otherwise mint a workspaceId-\'\' board shared with every unowned session (the unowned leak).',
+        parameters: [{ name: 'agent', description: 'the calling session agent; it owns session boards and its workspace owns project boards.' }, { name: 'request', description: 'the board name and visibility scope.' }],
         returns: 'the created board.',
       },
       {
-        signature: '@Remote(\'archiveBoard\') async archiveBoardRemote(request: ArchiveBoardRequest): Promise<BoardView>',
-        description: 'Archive one board through the Remote boundary.',
-        parameters: [{ name: 'request', description: 'the board to archive.' }],
+        signature: '@Remote(\'archiveBoard\') async archiveBoardRemote(agent: Agent, request: ArchiveBoardRequest): Promise<BoardView>',
+        description: 'Archive one board through the Remote boundary. A board the caller cannot see is denied as not found (no existence leak).',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the board to archive.' }],
         returns: 'the archived board.',
       },
       {
-        signature: '@Remote(\'create\') createRemote(request: CreateTicketRequest): Promise<TicketView>',
-        description: 'Create one ticket in Backlog through the Remote boundary.',
-        parameters: [{ name: 'request', description: 'title, description, priority, ordering dependencies, and optional boardId.' }],
+        signature: '@Remote(\'create\') createRemote(agent: Agent, request: CreateTicketRequest): Promise<TicketView>',
+        description: 'Create one ticket in Backlog through the Remote boundary. The target board must be visible to the caller; an invisible board is denied as not found (no existence leak).',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'title, description, priority, ordering dependencies, and optional boardId.' }],
         returns: 'the created ticket.',
       },
       {
@@ -1778,15 +1778,15 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the moved ticket.',
       },
       {
-        signature: '@Remote(\'edit\') async editRemote(request: EditTicketRequest): Promise<TicketView>',
-        description: 'Edit one ticket through the Remote boundary.',
-        parameters: [{ name: 'request', description: 'replacement content and dependency edges.' }],
+        signature: '@Remote(\'edit\') async editRemote(agent: Agent, request: EditTicketRequest): Promise<TicketView>',
+        description: 'Edit one ticket through the Remote boundary. The ticket\'s board must be visible to the caller; an invisible board is denied as not found (no existence leak).',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'replacement content and dependency edges.' }],
         returns: 'the edited ticket.',
       },
       {
-        signature: '@Remote(\'delete\') async removeRemote(request: RemoveTicketRequest): Promise<RemoveTicketResult>',
-        description: 'Remove one ticket through the Remote boundary.',
-        parameters: [{ name: 'request', description: 'the ticket to remove.' }],
+        signature: '@Remote(\'delete\') async removeRemote(agent: Agent, request: RemoveTicketRequest): Promise<RemoveTicketResult>',
+        description: 'Remove one ticket through the Remote boundary. The ticket\'s board must be visible to the caller; an invisible board is denied as not found (no existence leak).',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the ticket to remove.' }],
         returns: 'the removal receipt.',
       },
       {
@@ -1797,19 +1797,19 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'async claimMaster(boardId: string, agent: Agent): Promise<BoardView>',
-        description: 'Claim the master seat of one board; a stale seat (past the lease) can be preempted, and an unclaimed board is claimed by this agent.',
+        description: 'Claim the master seat of one board; a stale seat (past the lease) can be preempted, and an unclaimed board is claimed by this agent. A board the caller cannot see is denied as not found (no existence leak), so the master seat of a foreign session-private board cannot be seized.',
         parameters: [{ name: 'boardId', description: 'the board to claim.' }, { name: 'agent', description: 'the claiming session agent.' }],
         returns: 'the board with its fresh master.',
       },
       {
         signature: 'async releaseMaster(boardId: string, agent: Agent): Promise<BoardView>',
-        description: 'Release the master seat of one board; only the current master may.',
+        description: 'Release the master seat of one board; only the current master may. A board the caller cannot see is denied as not found (no existence leak).',
         parameters: [{ name: 'boardId', description: 'the board to release.' }, { name: 'agent', description: 'the current master.' }],
         returns: 'the board with an empty seat.',
       },
       {
         signature: 'async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView>',
-        description: 'Transfer the master seat to another session agent with handover notes.',
+        description: 'Transfer the master seat to another session agent with handover notes. A board the caller cannot see is denied as not found (no existence leak).',
         parameters: [{ name: 'boardId', description: 'the board to transfer.' }, { name: 'fromAgent', description: 'the current master.' }, { name: 'toAgentId', description: 'the receiving session agent id.' }, { name: 'handoverNotes', description: 'notes for the next master.' }],
         returns: 'the board with the new master.',
       },
@@ -2925,10 +2925,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface BoardSnapshot {\n    boardId: string;\n    name: string;\n    tickets: TicketView[];\n}',
   },
   {
-    name: 'BoardView',
-    declaration: 'export interface BoardView {\n    boardId: string;\n    name: string;\n    workspaceId: string;\n    masterAgentId: string | null;\n    masterClaimedAt: number | null;\n    handoverNotes: string;\n    archivedAt: number | null;\n}',
-  },
-  {
     name: 'Branded',
     declaration: 'export type Branded<B extends string> = string & {\n    readonly [BRAND]: B;\n};',
   },
@@ -3107,10 +3103,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CreateAgentOptions',
     declaration: 'export interface CreateAgentOptions {\n    readonly sessionId: SessionId;\n    readonly meta?: {\n        readonly cwd?: string;\n        readonly parentSession?: SessionId;\n        readonly seedLength?: number;\n        readonly origin?: \'subagent\';\n        readonly delegationDepth?: number;\n        readonly agentPreset?: string;\n    };\n    readonly seed?: readonly SessionEvent[];\n    readonly agentOptions?: AgentOptions;\n    readonly signal?: AbortSignal;\n    readonly setup?: AgentSetup;\n}',
-  },
-  {
-    name: 'CreateBoardRequest',
-    declaration: 'export interface CreateBoardRequest {\n    name: string;\n    workspaceId?: string;\n}',
   },
   {
     name: 'CreateGoalRequest',

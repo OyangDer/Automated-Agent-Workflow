@@ -121,18 +121,40 @@ export interface TicketView {
   history: TicketHistoryEntry[]
 }
 
+/** One durable master-seat transition recorded on the board, for hierarchy-tree rendering. */
+export interface MasterHistoryEntry {
+  /** The previous master session id; null when the seat was empty. */
+  fromAgentId: string | null
+  /** The session id taking the seat. */
+  toAgentId: string
+  /** Unix epoch milliseconds when the transition was recorded. */
+  at: number
+  /** Handover notes carried by a transfer; empty for a claim. */
+  notes: string
+}
+
 /** One board row surfaced by the Remote API and the master-seat domain operations. */
 export interface BoardView {
   boardId: string
   name: string
   /** The owning workspace id; empty when the board is unowned (shared across workspaces). */
   workspaceId: string
+  /**
+   * Board visibility scope: 'session' boards are private to the creating
+   * session (ownerSessionId); 'project' boards are shared by every session
+   * of their owning workspace.
+   */
+  scope: 'session' | 'project'
+  /** The creating session id of a session-scoped board; null for project and legacy boards. */
+  ownerSessionId: string | null
   /** The session agent holding the master seat, or null when unclaimed. */
   masterAgentId: string | null
   /** When the master seat was claimed; null while unclaimed. */
   masterClaimedAt: number | null
   /** Handover notes written on transferMaster, for the next master. */
   handoverNotes: string
+  /** Durable master-seat transitions (claim/transfer), for hierarchy-tree rendering. */
+  masterHistory?: MasterHistoryEntry[]
   /** When the board was archived; null while active. */
   archivedAt: number | null
 }
@@ -215,6 +237,12 @@ export interface RequestReviewRequest {
 /** User creates a board through the Remote API. */
 export interface CreateBoardRequest {
   name: string
+  /**
+   * Board visibility scope: 'session' (default) keeps the board private to
+   * the creating session; 'project' shares it with every session of the
+   * caller's workspace (the workspace is stamped from the session cwd).
+   */
+  scope?: 'session' | 'project'
   /** Ignored by the host: the board's workspace is stamped from the caller's session cwd. */
   workspaceId?: string
 }

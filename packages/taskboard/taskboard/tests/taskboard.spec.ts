@@ -188,8 +188,17 @@ afterEach(async () => {
   await Promise.all(openRoots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 
-async function createTicket(service: TaskboardService, title: string, dependsOn: string[] = [], boardId = 'default'): Promise<TicketView> {
-  return await service.createRemote({ title, description: 'describe ' + title, priority: 'normal', dependsOn, boardId })
+/** A throwaway unowned agent for ticket creation that does not care about the caller. */
+const helperAgent = stubAgent('ticket-helper-agent')
+
+async function createTicket(
+  service: TaskboardService,
+  title: string,
+  dependsOn: string[] = [],
+  boardId = 'default',
+  agent: Agent = helperAgent,
+): Promise<TicketView> {
+  return await service.createRemote(agent, { title, description: 'describe ' + title, priority: 'normal', dependsOn, boardId })
 }
 
 async function toNotStarted(service: TaskboardService, agent: Agent, ticket: TicketView): Promise<TicketView> {
@@ -243,20 +252,30 @@ describe('TaskboardService workflow', () => {
 
   it('lists, creates and archives boards through the Remote surface', async () => {
     const { service, devA } = await harness()
+    // First access materializes the session-private default board and the legacy default.
     const boards = await service.listBoards(devA)
-    expect(boards).toHaveLength(1)
-    expect(boards[0]!.boardId).toBe('default')
+    expect(boards).toHaveLength(2)
+    expect(boards.find(board => board.boardId === 'default')).toMatchObject({ boardId: 'default', workspaceId: '' })
+    expect(boards.find(board => board.scope === 'session')).toMatchObject({
+      boardId: 'session-' + devA.id,
+      scope: 'session',
+      ownerSessionId: devA.id,
+    })
     const created = await service.createBoardRemote(devA, { name: 'Sprint 42', workspaceId: 'ws-1' })
     expect(created.boardId).toMatch(/^board-/)
     expect(created.name).toBe('Sprint 42')
-    // The caller's workspace stamps the board; an unowned caller creates unowned boards.
+    // An unowned caller's new board defaults to session scope: it carries no
+    // workspace and is owned by the creating session.
     expect(created.workspaceId).toBe('')
+    expect(created.scope).toBe('session')
+    expect(created.ownerSessionId).toBe(devA.id)
     expect(created.masterAgentId).toBeNull()
     const listed = await service.listBoards(devA)
-    expect(listed.map(board => board.boardId).sort()).toEqual([created.boardId, 'default'].sort())
-    const archived = await service.archiveBoardRemote({ boardId: created.boardId })
+    expect(listed.map(board => board.boardId).sort())
+      .toEqual([created.boardId, 'session-' + devA.id, 'default'].sort())
+    const archived = await service.archiveBoardRemote(devA, { boardId: created.boardId })
     expect(archived.archivedAt).not.toBeNull()
-    await expect(service.archiveBoardRemote({ boardId: 'no-such-board' })).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.archiveBoardRemote(devA, { boardId: 'no-such-board' })).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
   })
 
   it('claims, holds, preempts and releases the master seat', async () => {
@@ -414,13 +433,13 @@ describe('TaskboardService workflow', () => {
   })
 
   it('emits a forwarded change per mutation and a tombstone on removal', async () => {
-    const { service, changes } = await harness()
+    const { service, devA, changes } = await harness()
     const ticket = await createTicket(service, 'to remove')
     expect(changes.at(-1)).toMatchObject({ operation: 'create', ticketId: ticket.id, boardId: 'default' })
-    const result = await service.removeRemote({ ticketId: ticket.id })
+    const result = await service.removeRemote(devA, { ticketId: ticket.id })
     expect(result.removedId).toBe(ticket.id)
     expect(changes.at(-1)).toEqual({ operation: 'remove', ticketId: ticket.id, boardId: 'default', ticket: null })
-    await expect(service.removeRemote({ ticketId: ticket.id })).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
+    await expect(service.removeRemote(devA, { ticketId: ticket.id })).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
   })
 
   it('claims a Not started ticket and enforces ownership and capacity', async () => {
@@ -519,16 +538,16 @@ describe('TaskboardService workflow', () => {
   })
 
   it('rejects dependency cycles and unknown dependencies on create/edit', async () => {
-    const { service } = await harness()
+    const { service, devA } = await harness()
     const a = await createTicket(service, 'node a')
     const b = await createTicket(service, 'node b')
     // Duplicate entries are invalid input.
     await expect(createTicket(service, 'dup', [a.id, a.id])).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
     // A depends on B; editing B to depend on A closes the cycle.
-    await service.editRemote({ ticketId: a.id, title: 'node a', description: '', priority: 'normal', dependsOn: [b.id] })
-    await expect(service.editRemote({ ticketId: b.id, title: 'node b', description: '', priority: 'normal', dependsOn: [a.id] }))
+    await service.editRemote(devA, { ticketId: a.id, title: 'node a', description: '', priority: 'normal', dependsOn: [b.id] })
+    await expect(service.editRemote(devA, { ticketId: b.id, title: 'node b', description: '', priority: 'normal', dependsOn: [a.id] }))
       .rejects.toMatchObject({ code: 'TASKBOARD_DEPENDENCY_CYCLE' })
-    await expect(service.editRemote({ ticketId: b.id, title: 'node b', description: '', priority: 'normal', dependsOn: ['missing-ticket'] }))
+    await expect(service.editRemote(devA, { ticketId: b.id, title: 'node b', description: '', priority: 'normal', dependsOn: ['missing-ticket'] }))
       .rejects.toMatchObject({ code: 'TASKBOARD_DEPENDENCY_UNKNOWN' })
   })
 
@@ -783,7 +802,7 @@ describe('TaskboardService workflow', () => {
     await expect(service.resolveReview(devA, reported.ticket.id, 'approve', 'verified', []))
       .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
     // Record the master-confirmed target branch, then the approve lands.
-    await service.editRemote({ ticketId: merge.id, title: 'merge the branch', description: '', priority: 'normal', dependsOn: [], targetBranch: 'main' })
+    await service.editRemote(devA, { ticketId: merge.id, title: 'merge the branch', description: '', priority: 'normal', dependsOn: [], targetBranch: 'main' })
     const result = await service.resolveReview(devA, reported.ticket.id, 'approve', 'verified', [])
     expect(result.action).toBe('approved')
     expect(result.ticket.column).toBe('done')
@@ -848,31 +867,44 @@ describe('TaskboardService workflow', () => {
     const { service } = await harness({ resolveByPath })
     const agentA = stubAgentWithCwd('ws-agent-a', cwdA)
     const agentB = stubAgentWithCwd('ws-agent-b', cwdB)
-    // First access auto-creates a per-workspace default board named after the directory basename.
+    // First access auto-creates the session-private default board plus a
+    // per-workspace default board named after the directory basename.
     const boardsA = await service.listBoards(agentA)
-    expect(boardsA).toHaveLength(1)
-    expect(boardsA[0]).toMatchObject({ boardId: 'default', workspaceId: 'ws-alpha', name: 'project-alpha' })
+    expect(boardsA).toHaveLength(2)
+    expect(boardsA.map(board => board.scope).sort()).toEqual(['project', 'session'])
+    expect(boardsA.find(board => board.scope === 'project')).toMatchObject({ boardId: 'default', workspaceId: 'ws-alpha', name: 'project-alpha' })
+    expect(boardsA.find(board => board.scope === 'session')).toMatchObject({ scope: 'session', ownerSessionId: agentA.id, name: 'project-alpha' })
     const boardsB = await service.listBoards(agentB)
-    expect(boardsB).toHaveLength(1)
-    expect(boardsB[0]).toMatchObject({ workspaceId: 'ws-beta', name: 'project-beta' })
-    expect(boardsB[0]!.boardId).not.toBe('default')
-    // Tickets created on a workspace's default board stay invisible to the other workspace.
-    const ticketA = await service.createRemote({ title: 'alpha card', description: '', priority: 'normal', dependsOn: [], boardId: boardsA[0]!.boardId })
-    const ticketB = await service.createRemote({ title: 'beta card', description: '', priority: 'normal', dependsOn: [], boardId: boardsB[0]!.boardId })
-    const snapA = await service.snapshot(agentA, boardsA[0]!.boardId)
+    expect(boardsB).toHaveLength(2)
+    const projectB = boardsB.find(board => board.scope === 'project')!
+    expect(projectB).toMatchObject({ workspaceId: 'ws-beta', name: 'project-beta' })
+    expect(projectB.boardId).not.toBe('default')
+    // Tickets created on a workspace's project board stay invisible to the other workspace.
+    const projectA = boardsA.find(board => board.scope === 'project')!
+    const ticketA = await service.createRemote(agentA, { title: 'alpha card', description: '', priority: 'normal', dependsOn: [], boardId: projectA.boardId })
+    const ticketB = await service.createRemote(agentB, { title: 'beta card', description: '', priority: 'normal', dependsOn: [], boardId: projectB.boardId })
+    const snapA = await service.snapshot(agentA, projectA.boardId)
     expect(snapA.tickets.map(ticket => ticket.id)).toEqual([ticketA.id])
-    const snapB = await service.snapshot(agentB, boardsB[0]!.boardId)
+    const snapB = await service.snapshot(agentB, projectB.boardId)
     expect(snapB.tickets.map(ticket => ticket.id)).toEqual([ticketB.id])
     // Cross-workspace boards are denied as not found and never listed.
-    await expect(service.snapshot(agentA, boardsB[0]!.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
-    await expect(service.snapshot(agentB, boardsA[0]!.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
-    expect((await service.listBoards(agentA)).map(board => board.boardId)).not.toContain(boardsB[0]!.boardId)
-    expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(boardsA[0]!.boardId)
-    // createBoard stamps the caller's workspace over any requested value.
-    const createdA = await service.createBoardRemote(agentA, { name: 'Sprint A', workspaceId: 'ws-beta' })
+    await expect(service.snapshot(agentA, projectB.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.snapshot(agentB, projectA.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    expect((await service.listBoards(agentA)).map(board => board.boardId)).not.toContain(projectB.boardId)
+    expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(projectA.boardId)
+    // A project-scoped createBoard stamps the caller's workspace over any requested value.
+    const createdA = await service.createBoardRemote(agentA, { name: 'Sprint A', workspaceId: 'ws-beta', scope: 'project' })
     expect(createdA.workspaceId).toBe('ws-alpha')
+    expect(createdA.scope).toBe('project')
+    expect(createdA.ownerSessionId).toBeNull()
     expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(createdA.boardId)
     await expect(service.snapshot(agentB, createdA.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // A session-scoped createBoard is private to its creator even within the workspace.
+    const privateA = await service.createBoardRemote(agentA, { name: 'Scratch A' })
+    expect(privateA.scope).toBe('session')
+    expect(privateA.ownerSessionId).toBe(agentA.id)
+    expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(privateA.boardId)
+    await expect(service.snapshot(agentB, privateA.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
   })
 
   it('lazily adopts the legacy unowned default board to the first real workspace', async () => {
@@ -884,13 +916,16 @@ describe('TaskboardService workflow', () => {
     const { service } = await harness({ resolveByPath })
     // v1-shaped data lives on the unowned default board before any real-workspace access.
     const unowned = stubAgent('legacy-unowned')
-    const legacyTicket = await service.createRemote({ title: 'legacy card', description: '', priority: 'normal', dependsOn: [], boardId: 'default' })
+    const legacyTicket = await service.createRemote(unowned, { title: 'legacy card', description: '', priority: 'normal', dependsOn: [], boardId: 'default' })
     expect((await service.snapshot(unowned, 'default')).tickets.map(ticket => ticket.id)).toEqual([legacyTicket.id])
-    // The first real-workspace access adopts the default board and names it after the directory.
+    // The first real-workspace access adopts the default board, names it after
+    // the directory, and re-scopes it as a project-shared board.
     const owner = stubAgentWithCwd('legacy-owner', cwdA)
     const boards = await service.listBoards(owner)
-    expect(boards).toHaveLength(1)
-    expect(boards[0]).toMatchObject({ boardId: 'default', workspaceId: 'ws-legacy', name: 'legacy-project' })
+    expect(boards).toHaveLength(2)
+    expect(boards.find(board => board.boardId === 'default')).toMatchObject({
+      boardId: 'default', workspaceId: 'ws-legacy', name: 'legacy-project', scope: 'project',
+    })
     // The adopted board still serves the legacy tickets.
     expect((await service.snapshot(owner, 'default')).tickets.map(ticket => ticket.id)).toEqual([legacyTicket.id])
     // The unowned session loses the adopted board.
@@ -899,10 +934,60 @@ describe('TaskboardService workflow', () => {
     // A second real workspace cannot see the adopted default board either.
     const other = stubAgentWithCwd('legacy-other', cwdB)
     const boardsB = await service.listBoards(other)
-    expect(boardsB).toHaveLength(1)
-    expect(boardsB[0]).toMatchObject({ workspaceId: 'ws-other', name: 'other-project' })
-    expect(boardsB[0]!.boardId).not.toBe('default')
+    expect(boardsB).toHaveLength(2)
+    expect(boardsB.find(board => board.workspaceId === 'ws-other')).toMatchObject({ workspaceId: 'ws-other', name: 'other-project' })
+    expect(boardsB.find(board => board.workspaceId === 'ws-other')!.boardId).not.toBe('default')
     await expect(service.snapshot(other, 'default')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+  })
+
+  it('seeds the materialized default board with the caller workspace on master verbs', async () => {
+    const cwdA = 'C:\\work\\seed-project'
+    const cwdB = 'C:\\work\\seed-other'
+    const wsA = workspaceStub('ws-seed', cwdA)
+    const wsB = workspaceStub('ws-other', cwdB)
+    const resolveByPath = vi.fn(async (path: string) => path === cwdA ? wsA : path === cwdB ? wsB : undefined)
+    // Scenario 1 (the accessibility regression): a workspace session claims
+    // the implicit default on a fresh store; the materialized board must carry
+    // the caller's workspace so the very next master verb is writable (an
+    // unseeded materialization landed as a ''-workspace project board and the
+    // follow-up createAsMaster/createRemote were denied as not found).
+    {
+      const { service } = await harness({ resolveByPath })
+      const agent = stubAgentWithCwd('seed-master-a', cwdA)
+      const other = stubAgentWithCwd('seed-other-a', cwdB)
+      const claimed = await service.claimMaster('default', agent)
+      expect(claimed).toMatchObject({
+        boardId: 'default', workspaceId: 'ws-seed', scope: 'project', name: 'seed-project',
+      })
+      expect(claimed.masterAgentId).toBe(agent.id)
+      // createAsMaster on the claimed default succeeds immediately.
+      const planned = await service.createAsMaster(agent, { title: 'right after claim', description: '', priority: 'normal', dependsOn: [] })
+      expect(planned.boardId).toBe('default')
+      // createRemote on the claimed default succeeds too.
+      const remote = await service.createRemote(agent, { title: 'remote after claim', description: '', priority: 'normal', dependsOn: [], boardId: 'default' })
+      expect(remote.boardId).toBe('default')
+      expect((await service.snapshot(agent, 'default')).tickets.map(ticket => ticket.id).sort())
+        .toEqual([planned.id, remote.id].sort())
+      // The seeded record shows up in the board listing.
+      expect((await service.listBoards(agent)).find(board => board.boardId === 'default'))
+        .toMatchObject({ workspaceId: 'ws-seed', scope: 'project' })
+      // Another workspace session cannot reach the seeded default (no leak).
+      await expect(service.snapshot(other, 'default')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+      expect((await service.listBoards(other)).map(board => board.boardId)).not.toContain('default')
+    }
+    // Scenario 2 (the ensureBoard-related path): a createAsMaster attempt
+    // before the seat is claimed must not leave the implicit default bricked
+    // as a ''-workspace board; the later claim still materializes seeded.
+    {
+      const { service } = await harness({ resolveByPath })
+      const agent = stubAgentWithCwd('seed-master-b', cwdA)
+      await expect(service.createAsMaster(agent, { title: 'no seat yet', description: '', priority: 'normal', dependsOn: [] }))
+        .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+      const claimed = await service.claimMaster('default', agent)
+      expect(claimed).toMatchObject({ boardId: 'default', workspaceId: 'ws-seed', scope: 'project' })
+      const planned = await service.createAsMaster(agent, { title: 'after the failed attempt', description: '', priority: 'normal', dependsOn: [] })
+      expect(planned.boardId).toBe('default')
+    }
   })
 
   it('falls back to unowned when the session cwd cannot be resolved to a workspace', async () => {
@@ -911,15 +996,155 @@ describe('TaskboardService workflow', () => {
     const agent = stubAgentWithCwd('unresolved-agent', 'C:\\work\\missing-project')
     // A resolving failure falls back to unowned: the legacy default board remains shared.
     const boards = await service.listBoards(agent)
-    expect(boards).toHaveLength(1)
-    expect(boards[0]).toMatchObject({ boardId: 'default', workspaceId: '' })
-    // createBoard stamps the unowned caller with the empty workspace id.
+    expect(boards).toHaveLength(2)
+    expect(boards.find(board => board.boardId === 'default')).toMatchObject({ boardId: 'default', workspaceId: '' })
+    // createBoard stamps the unowned caller with the empty workspace id and,
+    // by default, lands in session scope owned by the caller.
     const created = await service.createBoardRemote(agent, { name: 'Unowned board' })
     expect(created.workspaceId).toBe('')
-    // A session without any cwd sees the same unowned boards.
+    expect(created.scope).toBe('session')
+    expect(created.ownerSessionId).toBe(agent.id)
+    // An explicit project request from an unowned session is coerced back to
+    // session scope: it must never mint a workspaceId-'' project board that
+    // would be shared with every other unowned session.
+    const forced = await service.createBoardRemote(agent, { name: 'Unowned project attempt', scope: 'project' })
+    expect(forced.workspaceId).toBe('')
+    expect(forced.scope).toBe('session')
+    expect(forced.ownerSessionId).toBe(agent.id)
+    // Another unowned session cannot see it: the unowned leak is closed —
+    // new boards always land in scope/owner instead of being shared everywhere.
     const other = stubAgent('no-cwd-agent')
-    expect((await service.listBoards(other)).map(board => board.boardId)).toContain(created.boardId)
-    await expect(service.snapshot(other, created.boardId)).resolves.toMatchObject({ boardId: created.boardId })
+    expect((await service.listBoards(other)).map(board => board.boardId)).not.toContain(created.boardId)
+    expect((await service.listBoards(other)).map(board => board.boardId)).not.toContain(forced.boardId)
+    await expect(service.snapshot(other, created.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.snapshot(other, forced.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // The creating session still sees and snapshots its own boards.
+    expect((await service.listBoards(agent)).map(board => board.boardId)).toContain(created.boardId)
+    expect((await service.listBoards(agent)).map(board => board.boardId)).toContain(forced.boardId)
+    await expect(service.snapshot(agent, created.boardId)).resolves.toMatchObject({ boardId: created.boardId })
+    await expect(service.snapshot(agent, forced.boardId)).resolves.toMatchObject({ boardId: forced.boardId })
+  })
+
+  it('isolates session-private boards across sessions and shares project boards within a workspace', async () => {
+    const cwdA = 'C:\\work\\team-project'
+    const wsA = workspaceStub('ws-team', cwdA)
+    const resolveByPath = vi.fn(async (path: string) => path === cwdA ? wsA : undefined)
+    const { service } = await harness({ resolveByPath })
+    const first = stubAgentWithCwd('team-session-1', cwdA)
+    const second = stubAgentWithCwd('team-session-2', cwdA)
+    // First access: each session sees its own private board plus the project board.
+    const boardsFirst = await service.listBoards(first)
+    const boardsSecond = await service.listBoards(second)
+    expect(boardsFirst.map(board => board.scope).sort()).toEqual(['project', 'session'])
+    expect(boardsSecond.map(board => board.scope).sort()).toEqual(['project', 'session'])
+    const privateFirst = boardsFirst.find(board => board.scope === 'session')!
+    expect(privateFirst).toMatchObject({ ownerSessionId: first.id, workspaceId: 'ws-team', name: 'team-project' })
+    // The sibling session cannot see the private board (no existence leak).
+    expect(boardsSecond.map(board => board.boardId)).not.toContain(privateFirst.boardId)
+    await expect(service.snapshot(second, privateFirst.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // The owner session snapshots it fine.
+    await expect(service.snapshot(first, privateFirst.boardId)).resolves.toMatchObject({ boardId: privateFirst.boardId })
+    // A project board created by one session is shared with the sibling.
+    const shared = await service.createBoardRemote(first, { name: 'Shared Sprint', scope: 'project' })
+    expect(shared.scope).toBe('project')
+    expect(shared.workspaceId).toBe('ws-team')
+    expect(shared.ownerSessionId).toBeNull()
+    expect((await service.listBoards(second)).map(board => board.boardId)).toContain(shared.boardId)
+    await expect(service.snapshot(second, shared.boardId)).resolves.toMatchObject({ boardId: shared.boardId })
+    // A session board created by the second session is invisible to the first.
+    const privateSecond = await service.createBoardRemote(second, { name: 'My scratchpad' })
+    expect(privateSecond.scope).toBe('session')
+    expect(privateSecond.ownerSessionId).toBe(second.id)
+    expect((await service.listBoards(first)).map(board => board.boardId)).not.toContain(privateSecond.boardId)
+    await expect(service.snapshot(first, privateSecond.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+  })
+
+  it('auto-creates one default private board per session', async () => {
+    const { service, devA, devB } = await harness()
+    const boardsA = await service.listBoards(devA)
+    const sessionA = boardsA.find(board => board.scope === 'session')!
+    expect(sessionA.boardId).toBe('session-' + devA.id)
+    expect(sessionA.name).toBe('session board')
+    expect(sessionA.ownerSessionId).toBe(devA.id)
+    expect(sessionA.workspaceId).toBe('')
+    // A second session gets its own private default board, never the first's.
+    const boardsB = await service.listBoards(devB)
+    const sessionB = boardsB.find(board => board.scope === 'session')!
+    expect(sessionB.boardId).toBe('session-' + devB.id)
+    expect(sessionB.boardId).not.toBe(sessionA.boardId)
+    expect(boardsB.map(board => board.boardId)).not.toContain(sessionA.boardId)
+    // Re-access is idempotent: exactly one private board per session.
+    expect((await service.listBoards(devA)).filter(board => board.scope === 'session')).toHaveLength(1)
+    expect((await service.listBoards(devB)).filter(board => board.scope === 'session')).toHaveLength(1)
+  })
+
+  it('appends masterHistory on claim and transfer for the hierarchy tree', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const { service, devA, devB } = await harness()
+      const claimed = await service.claimMaster('default', devA)
+      expect(claimed.masterHistory).toHaveLength(1)
+      expect(claimed.masterHistory![0]).toMatchObject({ fromAgentId: null, toAgentId: devA.id, notes: '' })
+      expect(typeof claimed.masterHistory![0]!.at).toBe('number')
+      const transferred = await service.transferMaster('default', devA, devB.id, 'handing over the board')
+      expect(transferred.masterHistory).toHaveLength(2)
+      expect(transferred.masterHistory![1]).toMatchObject({
+        fromAgentId: devA.id, toAgentId: devB.id, notes: 'handing over the board',
+      })
+      // A stale-seat preemption records the displaced master as the source.
+      vi.advanceTimersByTime(900001)
+      const preempted = await service.claimMaster('default', devA)
+      expect(preempted.masterHistory).toHaveLength(3)
+      expect(preempted.masterHistory![2]).toMatchObject({ fromAgentId: devB.id, toAgentId: devA.id })
+      // A same-owner re-claim does not duplicate a history row.
+      const again = await service.claimMaster('default', devA)
+      expect(again.masterHistory).toHaveLength(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects create/edit/move/remove/archive on boards the caller cannot see', async () => {
+    const cwdA = 'C:\\work\\guarded-project'
+    const wsA = workspaceStub('ws-guarded', cwdA)
+    const resolveByPath = vi.fn(async (path: string) => path === cwdA ? wsA : undefined)
+    const { service } = await harness({ resolveByPath })
+    const owner = stubAgentWithCwd('guard-owner', cwdA)
+    const intruder = stubAgentWithCwd('guard-intruder', cwdA)
+    const boards = await service.listBoards(owner)
+    const privateBoard = boards.find(board => board.scope === 'session')!
+    // create: a ticket cannot be created on another session's private board.
+    await expect(service.createRemote(intruder, { title: 'sneak', description: '', priority: 'normal', dependsOn: [], boardId: privateBoard.boardId }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // The owner creates a ticket; the intruder cannot move/edit/remove it.
+    const ticket = await service.createRemote(owner, { title: 'owned', description: '', priority: 'normal', dependsOn: [], boardId: privateBoard.boardId })
+    await expect(service.moveRemote(intruder, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.editRemote(intruder, { ticketId: ticket.id, title: 'owned', description: '', priority: 'normal', dependsOn: [] }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.removeRemote(intruder, { ticketId: ticket.id }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // archive: another session cannot archive a private board.
+    await expect(service.archiveBoardRemote(intruder, { boardId: privateBoard.boardId }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // master-seat verbs are equally guarded: the intruder cannot claim, release
+    // or transfer the private board's seat (no existence leak).
+    await expect(service.claimMaster(privateBoard.boardId, intruder))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.releaseMaster(privateBoard.boardId, intruder))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.transferMaster(privateBoard.boardId, intruder, 'some-other-agent', 'handover'))
+      .rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    // The owner's own verbs succeed on the private board (with the boardId).
+    const moved = await service.moveRemote(owner, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null, boardId: privateBoard.boardId })
+    expect(moved.column).toBe('not_started')
+    const archived = await service.archiveBoardRemote(owner, { boardId: privateBoard.boardId })
+    expect(archived.archivedAt).not.toBeNull()
+    // The owner claims and releases the seat on their own private board.
+    const claimed = await service.claimMaster(privateBoard.boardId, owner)
+    expect(claimed.masterAgentId).toBe(owner.id)
+    const released = await service.releaseMaster(privateBoard.boardId, owner)
+    expect(released.masterAgentId).toBeNull()
   })
 
   it('loads v1-shaped records from a seeded storage root with zod defaults', async () => {
@@ -942,12 +1167,27 @@ describe('TaskboardService workflow', () => {
       dependsOn: [],
       history: [],
     }
+    // A v1-shaped board row without the scope/ownerSessionId/masterHistory
+    // fields: zod defaults fill them in (scope 'session', null owner, empty
+    // history) and the legacy unowned default stays visible to an unowned caller.
+    const v1Board = {
+      boardId: 'default',
+      name: 'default',
+      workspaceId: '',
+      masterAgentId: null,
+      masterClaimedAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+    }
     await writeFile(
       join(root, 'taskboard.json'),
       JSON.stringify({
         unit: { name: 'taskboard', version: 1 },
         global: null,
-        tables: { tickets: { [v1Ticket.id]: v1Ticket } },
+        tables: {
+          tickets: { [v1Ticket.id]: v1Ticket },
+          boards: { [v1Board.boardId]: v1Board },
+        },
       }, null, 2),
     )
     const { service, devA } = await harness({ root })
@@ -960,6 +1200,54 @@ describe('TaskboardService workflow', () => {
     expect(loaded.status).toBe('claimed')
     expect(loaded.failure).toBeNull()
     expect(loaded.workerAgentId).toBeUndefined()
+    // The v1 board row loads with the new dual-scope defaults intact.
+    const boards = await service.listBoards(devA)
+    const loadedBoard = boards.find(board => board.boardId === 'default')!
+    expect(loadedBoard).toMatchObject({
+      boardId: 'default',
+      workspaceId: '',
+      scope: 'session',
+      ownerSessionId: null,
+      masterHistory: [],
+    })
+    expect(loadedBoard.masterAgentId).toBeNull()
+    expect(loadedBoard.archivedAt).toBeNull()
+  })
+
+  it('keeps a stray legacy empty-workspace board away from real workspaces', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskboard-legacy-orphan-'))
+    // A v2-era orphan: workspaceId '' but NOT the legacy default board. It
+    // must never surface in a real workspace's listing or snapshot.
+    const orphan = {
+      boardId: 'orphan-board',
+      name: 'orphan',
+      workspaceId: '',
+      masterAgentId: null,
+      masterClaimedAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+    }
+    await writeFile(
+      join(root, 'taskboard.json'),
+      JSON.stringify({
+        unit: { name: 'taskboard', version: 1 },
+        global: null,
+        tables: { boards: { [orphan.boardId]: orphan } },
+      }, null, 2),
+    )
+    const cwd = 'C:\\work\\clean-project'
+    const ws = workspaceStub('ws-clean', cwd)
+    const resolveByPath = vi.fn(async (path: string) => path === cwd ? ws : undefined)
+    const { service } = await harness({ root, resolveByPath })
+    // An unowned caller may still see the orphan under the legacy rule.
+    const unowned = stubAgent('orphan-unowned')
+    expect((await service.listBoards(unowned)).map(board => board.boardId)).toContain('orphan-board')
+    // A real workspace session never sees it.
+    const workspaceAgent = stubAgentWithCwd('orphan-workspace', cwd)
+    const workspaceBoards = await service.listBoards(workspaceAgent)
+    expect(workspaceBoards.map(board => board.boardId)).not.toContain('orphan-board')
+    await expect(service.snapshot(workspaceAgent, 'orphan-board')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.claimMaster('orphan-board', workspaceAgent)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
   })
 })
 
