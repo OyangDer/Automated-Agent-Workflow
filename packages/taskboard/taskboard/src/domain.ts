@@ -109,6 +109,44 @@ export function buildReviewPrompt(ticket: TicketView): string {
 }
 
 /**
+ * The prompt a report-mode reviewer runs with. Self-contained like
+ * {@link buildReviewPrompt}, but the child never touches the card: it
+ * inspects the workspace and the tests, then returns its conclusion through
+ * the structured-output tool (the driver's structured_output capture) as
+ * { verdict, summary, problems }. The master reads that conclusion and acts
+ * on it with taskboard_resolve_review.
+ * @param ticket - the ticket under review.
+ * @returns the child's user prompt text.
+ */
+export function buildReviewReportPrompt(ticket: TicketView): string {
+  const assignee = ticket.assignee === null ? '(unassigned)' : ticket.assignee.label
+  const description = ticket.description.trim() === '' ? '(none)' : ticket.description
+  const devNotes = ticket.devNotes.trim() === '' ? '(none)' : ticket.devNotes
+  return [
+    ['You are the reviewer for taskboard ticket', ticket.id, '("' + ticket.title + '"), currently In testing.'].join(' '),
+    '',
+    'Ticket content:',
+    '  Title: ' + ticket.title,
+    '  Priority: ' + ticket.priority,
+    '  Description: ' + description,
+    '  Developer: ' + assignee,
+    '  Review attempt: ' + String(ticket.reviewAttempts + 1),
+    '  Developer notes: ' + devNotes,
+    '',
+    'Review the implementation against the description and acceptance criteria:',
+    '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
+    '2. Run the relevant tests and builds where the ticket concerns code.',
+    '3. Check edge cases and error paths named in the description, not just the happy path.',
+    '',
+    'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool.',
+    'Finish by calling the structured_output tool exactly once with:',
+    '  - verdict: "approve" when the work passes, "reject" when it must be reworked,',
+    '  - summary: what you inspected and why it passes or fails,',
+    '  - problems: concrete, actionable rework items (empty when approving).',
+  ].join('\n')
+}
+
+/**
  * The prompt a freshly spawned worker runs with. Self-contained: the spawned
  * child has no shared conversation with the master, so the ticket content,
  * the working directory, and the exact finishing contract are all inlined.
@@ -163,5 +201,6 @@ export const WORKFLOW_SECTION = [
   "- v2 master dispatch: before assigning work, claim the board's master seat with taskboard_claim_master (boardId defaults to \"default\"). Only the current master may call taskboard_assign and taskboard_reassign.",
   '- Dispatch a Not started ticket with taskboard_assign: the card moves to In progress and a fresh worker subagent (DeepSeek v4 flash) is spawned with the ticket content; the card records the worker identity. Workers finish with taskboard_report (done) or taskboard_fail (blocked).',
   '- When a worker fails or its session terminates without reporting, the card stays In progress with status "blocked" and a failure record. Use taskboard_reassign with action "retry" to spawn a new worker, or action "backlog" to return the card to Not started.',
+  '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
   "- Never move cards on the user's behalf: dragging cards between columns — in particular Backlog to Not started — is the user's \"start this\" signal in the web UI.",
 ].join('\n')

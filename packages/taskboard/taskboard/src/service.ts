@@ -14,7 +14,9 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   defineDomain, DomainError, domainTable,
@@ -34,8 +36,8 @@ import type {
   TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
-  agentLabel, appendHistory, buildReviewPrompt, buildWorkerPrompt, reviewerLabel,
-  TaskboardError, WORKFLOW_SECTION,
+  agentLabel, appendHistory, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
+  reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
@@ -73,6 +75,15 @@ const ticketSchema = zod.object({
     }),
     zod.null(),
   ]),
+  reviewOutcome: zod.union([
+    zod.object({
+      verdict: zod.enum(['approve', 'reject']),
+      summary: zod.string(),
+      problems: zod.array(zod.string()),
+      at: zod.number(),
+    }),
+    zod.null(),
+  ]).default(null),
   devNotes: zod.string(),
   dependsOn: zod.array(zod.string()),
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
@@ -88,6 +99,32 @@ const boardSchema = zod.object({
   handoverNotes: zod.string().default(''),
   archivedAt: zod.number().nullable().default(null),
 })
+
+/**
+ * The structured report a report-mode reviewer must return through the
+ * structured-output tool: { verdict, summary, problems }. Within
+ * assertObjectJsonSchema's enforced subset (object root, required as an array
+ * of property names, no per-property required flag).
+ */
+const REVIEW_OUTCOME_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    verdict: { type: 'string', enum: ['approve', 'reject'] },
+    summary: { type: 'string' },
+    problems: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['verdict', 'summary', 'problems'],
+}
+
+/** True when a settled run's structured value matches the review-report shape. */
+function isReviewOutcome(value: unknown): value is { verdict: 'approve' | 'reject'; summary: string; problems: string[] } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  if (record.verdict !== 'approve' && record.verdict !== 'reject') return false
+  if (typeof record.summary !== 'string') return false
+  return Array.isArray(record.problems) && record.problems.every(problem => typeof problem === 'string')
+}
 
 /** The taskboard storage domain declaration: tickets plus boards tables. */
 const TASKBOARD_DOMAIN = defineDomain({
@@ -113,6 +150,8 @@ export interface Config {
   workerProvider?: string
   /** Master seat lease in milliseconds; a stale seat can be preempted. */
   masterSeatTimeoutMs?: number
+  /** Review protocol: "report" has the reviewer return a structured verdict (master resolves); "direct" keeps the v1 reviewer tools. */
+  reviewMode?: 'report' | 'direct'
 }
 
 /** Schemastery configuration for the taskboard consumer. */
@@ -123,6 +162,7 @@ export const Config: z<Config> = z.object({
   workerModel: z.string().default('deepseek-v4-flash'),
   workerProvider: z.string().default('spawn'),
   masterSeatTimeoutMs: z.number().default(900000),
+  reviewMode: z.union(['report', 'direct'] as const).default('report'),
 })
 
 /** One worker-spawn outcome. */
@@ -132,7 +172,7 @@ export type WorkerSpawnResult =
 
 /** One reviewer-spawn outcome. */
 export type ReviewSpawnResult =
-  | { spawned: true; reviewer: TicketAssignee }
+  | { spawned: true; reviewer: TicketAssignee; run: SubagentRun }
   | { spawned: false; reason: 'unavailable' | 'failed' }
 
 /** Tool payload: the card plus what happened to the review seat. */
@@ -154,6 +194,18 @@ export interface ReassignTicketResult {
   ticket: TicketView
   worker: 'spawned' | 'unavailable' | 'failed' | null
   workerAgentId: string | null
+}
+
+/** Tool payload: the card plus the followup/archive outcomes of a resolved review. */
+export interface ResolveReviewResult {
+  ticket: TicketView
+  action: 'approved' | 'rejected'
+  /** reject: whether the original worker session received the rework feedback. */
+  followup: 'sent' | 'unavailable' | 'none'
+  /** approve: whether the worker session was archived by the host. */
+  archived: boolean
+  /** reject: true when the third consecutive reject marked the card blocked. */
+  blockedAfterReject: boolean
 }
 
 /** The compact row taskboard_list returns per ticket. */
@@ -243,6 +295,7 @@ export class TaskboardService extends TypertRemoteService {
     workerModel: string
     workerProvider: string
     masterSeatTimeoutMs: number
+    reviewMode: 'report' | 'direct'
   }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
@@ -255,6 +308,7 @@ export class TaskboardService extends TypertRemoteService {
       workerModel: config.workerModel ?? 'deepseek-v4-flash',
       workerProvider: config.workerProvider ?? 'spawn',
       masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
+      reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
     }
     this.domain = ctx.storageDomain.open(TASKBOARD_DOMAIN)
     // The open races shutdown when the host unmounts before it resolves;
@@ -451,25 +505,136 @@ export class TaskboardService extends TypertRemoteService {
     }
   }
 
-  /** Spawn the reviewer child for one ticket through the subagent seam. */
+  /**
+   * Spawn the reviewer child for one ticket through the subagent seam. In
+   * "report" mode the child only inspects and returns a structured verdict
+   * ({ verdict, summary, problems }) — it is denied the card-mutating review
+   * tools and the master resolves the review with taskboard_resolve_review.
+   * In "direct" mode the v1 contract holds: the reviewer itself calls
+   * taskboard_approve / taskboard_reject.
+   */
   private async spawnReviewer(parent: Agent, ticket: TicketView): Promise<ReviewSpawnResult> {
     const subagents = this.ctx.get('subagents')
     if (subagents === undefined) {
       return { spawned: false, reason: 'unavailable' }
     }
     try {
-      const prompt: ContentBlock[] = [{ type: 'text', text: buildReviewPrompt(ticket) }]
+      const reportMode = this.resolved.reviewMode === 'report'
+      const prompt: ContentBlock[] = [{
+        type: 'text',
+        text: reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket),
+      }]
       const request: SubagentStartRequest = {
         label: 'review ' + ticket.id,
         prompt,
         parent,
         signal: new AbortController().signal,
         agentOptions: { model: this.resolved.workerModel },
+        // Report mode: the reviewer returns a structured conclusion only and
+        // never decides on the card; direct mode keeps the v1 reviewer tools.
+        ...(reportMode ? {
+          outputSchema: REVIEW_OUTCOME_SCHEMA,
+          toolFilter: { deny: REVIEWER_DENIED_TOOLS },
+        } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
-      return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) } }
+      return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run }
     } catch {
       return { spawned: false, reason: 'failed' }
+    }
+  }
+
+  /**
+   * Attach the reviewer-run settlement listener: when the report-mode child
+   * settles with a structured verdict, write it back onto the card. Only the
+   * reviewer the card currently names may write; the run never rejects (a
+   * model error resolves with stopReason "error"), so the rejection arm is a
+   * defensive no-op.
+   */
+  private trackReviewerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
+    const result: Promise<SubagentResult> | undefined = run.result
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- typed required, but seam stubs may omit result.
+    if (result === undefined) return
+    void result.then(
+      (outcome) => { void this.recordReviewOutcome(ticketId, sessionId, outcome).catch(() => {}) },
+      () => {},
+    )
+  }
+
+  /** Persist the structured reviewer report when the settled run produced one. */
+  private async recordReviewOutcome(ticketId: string, sessionId: string, outcome: SubagentResult): Promise<void> {
+    const structured = outcome.structured
+    if (structured === undefined || !isReviewOutcome(structured)) return
+    await this.mutate(ticketId, 'review-claim', (current) => {
+      // The card must still name this reviewer and remain under review;
+      // a resolved or re-reviewed card no longer accepts the report.
+      if (current.reviewer === null || current.reviewer.agentId !== sessionId) return current
+      if (current.column !== 'in_testing') return current
+      return {
+        ...current,
+        reviewOutcome: {
+          verdict: structured.verdict,
+          summary: structured.summary,
+          problems: structured.problems,
+          at: Date.now(),
+        },
+        updatedAt: Date.now(),
+      }
+    })
+  }
+
+  /**
+   * Follow up the original worker after a rejection (打回原窗口). The worker
+   * was spawned one-shot by V2-1's assign, and the continuation manager only
+   * accepts continuable children, so this is best-effort: when the followup
+   * cannot be delivered the master re-dispatches with taskboard_reassign.
+   */
+  private async followupWorker(master: Agent, ticket: TicketView, feedback: string): Promise<'sent' | 'unavailable' | 'none'> {
+    if (ticket.workerSessionId === undefined) return 'none'
+    const subagents = this.ctx.get('subagents')
+    if (subagents === undefined || typeof subagents.followup !== 'function') return 'unavailable'
+    try {
+      const content: ContentBlock[] = [{
+        type: 'text',
+        text: [
+          'The reviewer rejected taskboard ticket ' + ticket.id + ' ("' + ticket.title + '").',
+          '',
+          'Rework feedback:',
+          feedback,
+          '',
+          'Fix the issues above, then finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing the rework.',
+        ].join('\n'),
+      }]
+      await subagents.followup(
+        master,
+        ticket.workerSessionId as SessionId,
+        content,
+        {
+          source: { kind: 'coordinator', form: 'relay', senderSessionId: master.id },
+          signal: new AbortController().signal,
+        },
+      )
+      return 'sent'
+    } catch {
+      return 'unavailable'
+    }
+  }
+
+  /**
+   * Best-effort worker-session archive when a card lands in Done: the host's
+   * workspace registry hides archived sessions from the grouping surfaces. A
+   * missing registry, an unknown session, or a storage fault is not an error
+   * — the resolution still succeeds and the result reports archived=false.
+   */
+  private async archiveWorkerSession(ticket: TicketView): Promise<boolean> {
+    if (ticket.workerSessionId === undefined) return false
+    const registry = this.ctx.get('workspaceRegistry') as { archiveSession?: (sessionId: SessionId) => Promise<void> } | undefined
+    if (registry === undefined || typeof registry.archiveSession !== 'function') return false
+    try {
+      await registry.archiveSession(ticket.workerSessionId as SessionId)
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -574,7 +739,9 @@ export class TaskboardService extends TypertRemoteService {
     if (request.column === 'in_testing' && ticket.reviewer === null) {
       const spawn = await this.spawnReviewer(agent, ticket)
       if (spawn.spawned) {
-        return this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+        const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+        this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
+        return withReviewer
       }
     }
     return ticket
@@ -682,6 +849,7 @@ export class TaskboardService extends TypertRemoteService {
       reviewer: null,
       reviewAttempts: 0,
       lastReview: null,
+      reviewOutcome: null,
       devNotes: '',
       dependsOn: request.dependsOn,
       history: [] as TicketView['history'],
@@ -791,7 +959,9 @@ export class TaskboardService extends TypertRemoteService {
     if (!spawn.spawned) {
       throw new TaskboardError('no reviewer backend is available to assign', 'TASKBOARD_INVALID_TRANSITION')
     }
-    return this.attachReviewer(current.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+    const withReviewer = await this.attachReviewer(current.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+    this.trackReviewerRun(current.id, spawn.reviewer.agentId, spawn.run)
+    return withReviewer
   }
 
   /**
@@ -950,6 +1120,7 @@ export class TaskboardService extends TypertRemoteService {
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
 
@@ -1165,6 +1336,7 @@ export class TaskboardService extends TypertRemoteService {
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
 
@@ -1243,6 +1415,117 @@ export class TaskboardService extends TypertRemoteService {
         'review rejected, returned for rework',
       )
     })
+  }
+
+  /**
+   * The master resolves a report-mode review against the reviewer-reported
+   * verdict (taskboard_resolve_review). Approve lands the card in Done and
+   * archives the worker session; reject returns the card for rework, tries to
+   * follow up the original worker, and marks the card blocked on the third
+   * consecutive reject for the user to decide. The master may not overturn a
+   * rejection into an approval — the verdict is applied as reported.
+   * @param agent - the master session agent.
+   * @param ticketId - the In testing ticket under review.
+   * @param verdict - the reviewer-reported conclusion to apply.
+   * @param summary - what the reviewer inspected and concluded.
+   * @param problems - concrete rework items (empty on approval).
+   * @returns the resolved card plus the followup/archive outcomes.
+   */
+  async resolveReview(
+    agent: Agent,
+    ticketId: string,
+    verdict: string,
+    summary: string,
+    problems: string[],
+  ): Promise<ResolveReviewResult> {
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    if (current.column !== 'in_testing') {
+      throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
+    }
+    // Runtime guard: the tool schema enforces the enum, but a direct domain
+    // caller must not silently turn an unknown verdict into a rejection.
+    if (verdict !== 'approve' && verdict !== 'reject') {
+      throw new TaskboardError('verdict must be "approve" or "reject"', 'TASKBOARD_INVALID_INPUT')
+    }
+    const cleanSummary = typeof summary === 'string' ? summary.trim() : ''
+    const cleanProblems = Array.isArray(problems)
+      ? problems
+        .filter(problem => typeof problem === 'string')
+        .map(problem => problem.trim())
+        .filter(problem => problem.length > 0)
+      : []
+    // The reviewer identity comes from the attached review seat; a resolution
+    // without a reviewer seat attributes the decision to the master.
+    const reviewer: TicketAssignee = current.reviewer ?? { agentId: agent.id, label: agentLabel(agent) }
+    const attempt = current.reviewAttempts + 1
+
+    if (verdict === 'approve') {
+      const approved = await this.mutate(ticketId, 'approve', (ticket) => {
+        if (ticket.column !== 'in_testing') {
+          throw new TaskboardError('ticket "' + ticket.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
+        }
+        return appendHistory(
+          {
+            ...ticket,
+            column: 'done',
+            status: 'claimed',
+            reviewAttempts: attempt,
+            lastReview: {
+              outcome: 'approved',
+              feedback: cleanSummary,
+              reviewer,
+              attempt,
+              at: Date.now(),
+            },
+            updatedAt: Date.now(),
+          },
+          'approve',
+          'review approved by master',
+        )
+      })
+      const archived = await this.archiveWorkerSession(approved)
+      return { ticket: approved, action: 'approved', followup: 'none', archived, blockedAfterReject: false }
+    }
+
+    const feedback = cleanProblems.length > 0 ? cleanProblems.join('\n') : cleanSummary
+    if (feedback.length === 0) {
+      throw new TaskboardError('reject requires problems or a summary', 'TASKBOARD_INVALID_INPUT')
+    }
+    const blockedAfterReject = attempt >= 3
+    const rejected = await this.mutate(ticketId, 'reject', (ticket) => {
+      if (ticket.column !== 'in_testing') {
+        throw new TaskboardError('ticket "' + ticket.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
+      }
+      return appendHistory(
+        {
+          ...ticket,
+          column: 'in_progress',
+          status: blockedAfterReject ? 'blocked' : 'running',
+          failure: blockedAfterReject ? { reason: 'rejected 3 times, awaiting user decision', at: Date.now() } : null,
+          reviewAttempts: attempt,
+          lastReview: {
+            outcome: 'rejected',
+            feedback,
+            reviewer,
+            attempt,
+            at: Date.now(),
+          },
+          reviewer: null,
+          updatedAt: Date.now(),
+        },
+        'reject',
+        blockedAfterReject
+          ? 'review rejected 3 times; awaiting user decision'
+          : 'review rejected, returned for rework',
+      )
+    })
+    const followup = await this.followupWorker(agent, rejected, feedback)
+    return { ticket: rejected, action: 'rejected', followup, archived: false, blockedAfterReject }
   }
 
   /**
@@ -1487,6 +1770,20 @@ export class TaskboardService extends TypertRemoteService {
                 { type: 'null' },
               ] as const, required: true,
             },
+            reviewOutcome: {
+              oneOf: [
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    verdict: { type: 'string', required: true, enum: ['approve', 'reject'] },
+                    summary: { type: 'string', required: true },
+                    problems: { type: 'array', required: true, items: { type: 'string' } },
+                    at: { type: 'number', required: true },
+                  },
+                },
+                { type: 'null' },
+              ] as const, required: true,
+            },
             devNotes: { type: 'string', required: true },
             dependsOn: { type: 'array', required: true, items: { type: 'string' } },
             history: {
@@ -1524,6 +1821,7 @@ export class TaskboardService extends TypertRemoteService {
           reviewer: ticket.reviewer,
           reviewAttempts: ticket.reviewAttempts,
           lastReview: ticket.lastReview,
+          reviewOutcome: ticket.reviewOutcome,
           devNotes: ticket.devNotes,
           dependsOn: ticket.dependsOn,
           history: ticket.history,
@@ -1894,6 +2192,59 @@ export class TaskboardService extends TypertRemoteService {
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Reassign taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
     }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_resolve_review',
+      description: 'Resolve a report-mode review (master only): apply the reviewer-reported verdict for an In testing taskboard ticket. approve moves the card to Done and archives the worker session; reject returns the card for rework with the reviewer\'s problems as feedback. The master applies the verdict as reported and may not overturn a rejection. After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The In testing ticket under review.' },
+        verdict: {
+          type: 'string' as const, required: true, enum: ['approve', 'reject'],
+          description: 'The reviewer-reported conclusion to apply.',
+        },
+        summary: {
+          type: 'string' as const, required: true,
+          description: 'What the reviewer inspected and concluded.',
+        },
+        problems: {
+          type: 'array' as const, required: true, items: { type: 'string' as const },
+          description: 'Concrete rework items reported by the reviewer (empty when approving).',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ticketId: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+            action: { type: 'string', required: true, enum: ['approved', 'rejected'] },
+            followup: { type: 'string', required: true, enum: ['sent', 'unavailable', 'none'] },
+            archived: { type: 'boolean', required: true },
+            blockedAfterReject: { type: 'boolean', required: true },
+          },
+        },
+        render: (_args, value: { ticketId: string; action: 'approved' | 'rejected'; followup: string; blockedAfterReject: boolean }) => [{
+          type: 'text' as const,
+          text: value.action === 'approved'
+            ? 'ticket ' + value.ticketId + ' approved and Done'
+            : 'ticket ' + value.ticketId + ' rejected for rework (worker followup ' + value.followup + (value.blockedAfterReject ? '; blocked after 3 rejects' : '') + ')',
+        }],
+      },
+      execute: async (args: { ticketId: string; verdict: 'approve' | 'reject'; summary: string; problems: string[] }, exec) => {
+        const result = await this.resolveReview(TaskboardService.agentOf(exec), args.ticketId, args.verdict, args.summary, args.problems)
+        return {
+          ticketId: result.ticket.id,
+          column: result.ticket.column,
+          status: result.ticket.status,
+          action: result.action,
+          followup: result.followup,
+          archived: result.archived,
+          blockedAfterReject: result.blockedAfterReject,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Resolve taskboard review', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
   }
 }
 
@@ -1909,5 +2260,13 @@ const WORKER_DENIED_TOOLS = [
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
   'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
 ] as const
+
+/**
+ * Administrative review tools denied to report-mode reviewers: the reviewer
+ * only inspects and returns a structured verdict — the master resolves the
+ * card with taskboard_resolve_review. Names must be registered in the global
+ * tool registry (tools.restrict() rejects unknown names loudly).
+ */
+const REVIEWER_DENIED_TOOLS = ['taskboard_approve', 'taskboard_reject'] as const
 
 export default TaskboardService

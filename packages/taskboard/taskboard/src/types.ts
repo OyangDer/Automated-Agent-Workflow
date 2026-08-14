@@ -59,6 +59,18 @@ export interface TicketReview {
   at: number
 }
 
+/** One structured reviewer report written back from a report-mode reviewer run. */
+export interface TicketReviewOutcome {
+  /** The reviewer's conclusion; the master acts on it through taskboard_resolve_review. */
+  verdict: 'approve' | 'reject'
+  /** What the reviewer inspected and concluded. */
+  summary: string
+  /** Concrete rework problems; empty on approval. */
+  problems: string[]
+  /** Unix epoch milliseconds when the report was recorded. */
+  at: number
+}
+
 /** One display-only history row kept on the ticket. */
 export interface TicketHistoryEntry {
   at: number
@@ -98,6 +110,8 @@ export interface TicketView {
   /** Completed review rounds; increments on every approve/reject decision. */
   reviewAttempts: number
   lastReview: TicketReview | null
+  /** The latest structured reviewer report (report mode); null outside report-mode review. */
+  reviewOutcome: TicketReviewOutcome | null
   /** Developer's completion notes, filled when the ticket enters testing. */
   devNotes: string
   /** Hard ordering constraints: every listed ticket must be in Done before claim. */
@@ -131,7 +145,7 @@ export interface BoardSnapshot {
 export type TaskboardOperation =
   | 'create' | 'move' | 'edit' | 'remove'
   | 'claim' | 'complete' | 'approve' | 'reject' | 'review-claim'
-  | 'assign' | 'report' | 'fail' | 'reassign'
+  | 'assign' | 'report' | 'fail' | 'reassign' | 'resolve-review'
 
 /** The durable-change notification forwarded to the browser. */
 export interface TaskboardChanged {

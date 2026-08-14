@@ -52,10 +52,12 @@ function stubAgent(rawId: string): Agent {
 /** How the stubbed subagent seam answers one spawn. */
 type SpawnBehavior = 'spawn' | 'fail' | 'absent'
 
-/** A minimal controllable run result for failure-reclamation tests. */
+/** A minimal controllable run result for failure-reclamation and review write-back tests. */
 interface RunResultStub {
   output: never[]
   stopReason: string
+  /** Structured value a report-mode reviewer run settles with. */
+  structured?: unknown
 }
 
 interface Harness {
@@ -81,6 +83,14 @@ interface HarnessOptions {
   root?: string
   /** When set, worker spawns return a run carrying this result promise. */
   workerRunResult?: Promise<RunResultStub>
+  /** When set, reviewer spawns return a run carrying this result promise. */
+  reviewerRunResult?: Promise<RunResultStub>
+  /** The review protocol; defaults to "report". */
+  reviewMode?: 'report' | 'direct'
+  /** When set, the stubbed subagent seam also exposes followup. */
+  followup?: ReturnType<typeof vi.fn>
+  /** When set, a stubbed workspace registry archives session ids through this fn. */
+  archive?: ReturnType<typeof vi.fn>
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -103,23 +113,36 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
       const id = request.label?.startsWith('review ')
         ? spawnedReviewerId
         : spawnedWorkerId
+      const result = id === spawnedReviewerId
+        ? options.reviewerRunResult
+        : options.workerRunResult
       return {
         id,
-        ...(options.workerRunResult === undefined ? {} : { result: options.workerRunResult }),
+        ...(result === undefined ? {} : { result }),
       }
     })
-    ctx.provide('subagents', { start: subagentsStart } as never)
+    ctx.provide('subagents', {
+      start: subagentsStart,
+      ...(options.followup === undefined ? {} : { followup: options.followup }),
+    } as never)
   } else if (spawn === 'fail') {
     subagentsStart = vi.fn(async () => {
       throw new Error('spawn exploded')
     })
-    ctx.provide('subagents', { start: subagentsStart } as never)
+    ctx.provide('subagents', {
+      start: subagentsStart,
+      ...(options.followup === undefined ? {} : { followup: options.followup }),
+    } as never)
   } else {
     subagentsStart = vi.fn()
+  }
+  if (options.archive !== undefined) {
+    ctx.provide('workspaceRegistry', { archiveSession: options.archive } as never)
   }
   await ctx.plugin(TaskboardService, {
     maxInProgress,
     ...(options.masterSeatTimeoutMs === undefined ? {} : { masterSeatTimeoutMs: options.masterSeatTimeoutMs }),
+    ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -500,6 +523,177 @@ describe('TaskboardService workflow', () => {
     expect(rows.map(ticket => ticket.id)).toEqual([second.id, first.id, third.id])
     expect(rows[1]!.position).toBeGreaterThan(rows[0]!.position)
     expect(rows[1]!.position).toBeLessThan(rows[2]!.position)
+  })
+
+  it('report mode spawns a reporting reviewer with outputSchema, tool filter and the flash model', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({ reviewMode: 'report' })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'report-mode card')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    expect(reported.review).toBe('spawned')
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    expect(reviewCall[1].agentOptions?.model).toBe('deepseek-v4-flash')
+    expect(reviewCall[1].outputSchema).toEqual({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        verdict: { type: 'string', enum: ['approve', 'reject'] },
+        summary: { type: 'string' },
+        problems: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['verdict', 'summary', 'problems'],
+    })
+    expect(reviewCall[1].toolFilter?.deny).toContain('taskboard_approve')
+    expect(reviewCall[1].toolFilter?.deny).toContain('taskboard_reject')
+  })
+
+  it('direct mode keeps the v1 reviewer contract without structured output', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({ reviewMode: 'direct' })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'direct-mode card')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    await service.report(workerChild, ticket.id, 'implemented')
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    expect(reviewCall[1].outputSchema).toBeUndefined()
+    expect(reviewCall[1].toolFilter).toBeUndefined()
+  })
+
+  it('writes back the structured reviewer report onto the card', async () => {
+    let settle!: (result: RunResultStub) => void
+    const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+    const { service, devA, workerChild, changes } = await harness({ reviewerRunResult: runResult })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'structured review')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    expect(reported.ticket.reviewer?.agentId).toBe('reviewer-child-agent')
+    expect(reported.ticket.reviewOutcome).toBeNull()
+    settle({
+      output: [],
+      stopReason: 'completed',
+      structured: { verdict: 'reject', summary: 'inspected the changes', problems: ['parse() lacks error handling'] },
+    })
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(ticket.id)
+      expect(current.reviewOutcome).toMatchObject({
+        verdict: 'reject',
+        summary: 'inspected the changes',
+        problems: ['parse() lacks error handling'],
+      })
+    })
+    expect(changes.some(change => change.operation === 'review-claim' && change.ticket?.reviewOutcome !== null)).toBe(true)
+  })
+
+  it('ignores a settled reviewer run without a valid structured report', async () => {
+    let settle!: (result: RunResultStub) => void
+    const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+    const { service, devA, workerChild } = await harness({ reviewerRunResult: runResult })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'no structured report')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    await service.report(workerChild, ticket.id, 'implemented')
+    settle({ output: [], stopReason: 'completed', structured: { verdict: 'maybe' } })
+    await new Promise(resolve => setTimeout(resolve, 25))
+    const current = await service.viewTicket(ticket.id)
+    expect(current.reviewOutcome).toBeNull()
+  })
+
+  it('resolveReview approve lands in Done and archives the worker session', async () => {
+    const archive = vi.fn(async () => {})
+    const { service, devA, workerChild } = await harness({ archive })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'approve me')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    const result = await service.resolveReview(devA, reported.ticket.id, 'approve', 'verified the implementation', [])
+    expect(result.action).toBe('approved')
+    expect(result.archived).toBe(true)
+    expect(result.ticket.column).toBe('done')
+    expect(result.ticket.reviewAttempts).toBe(1)
+    expect(result.ticket.lastReview).toMatchObject({ outcome: 'approved', feedback: 'verified the implementation', attempt: 1 })
+    expect(result.ticket.lastReview?.reviewer.agentId).toBe('reviewer-child-agent')
+    expect(archive).toHaveBeenCalledWith('worker-child-agent')
+  })
+
+  it('requires the master seat for resolveReview', async () => {
+    const { service, devA, devB, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'guarded review')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    await expect(service.resolveReview(devB, reported.ticket.id, 'approve', 'ok', []))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+  })
+
+  it('resolveReview reject returns the card for rework with the reviewer problems', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'rework me')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    const result = await service.resolveReview(devA, reported.ticket.id, 'reject', 'reviewed the change', [
+      'missing error handling in parse()',
+      'tests do not cover the edge case',
+    ])
+    expect(result.action).toBe('rejected')
+    // A one-shot worker session cannot receive a continuation followup.
+    expect(result.followup).toBe('unavailable')
+    expect(result.blockedAfterReject).toBe(false)
+    expect(result.ticket.column).toBe('in_progress')
+    expect(result.ticket.status).toBe('running')
+    expect(result.ticket.reviewAttempts).toBe(1)
+    expect(result.ticket.lastReview).toMatchObject({ outcome: 'rejected', attempt: 1 })
+    expect(result.ticket.lastReview?.feedback).toContain('missing error handling in parse()')
+    expect(result.ticket.lastReview?.feedback).toContain('tests do not cover the edge case')
+    expect(result.ticket.reviewer).toBeNull()
+    expect(result.ticket.failure).toBeNull()
+  })
+
+  it('follows up the original worker when the subagent seam supports it', async () => {
+    const followup = vi.fn(async () => 'msg-1')
+    const { service, devA, workerChild } = await harness({ followup })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'rework window')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    const result = await service.resolveReview(devA, reported.ticket.id, 'reject', 'reviewed', ['fix the parse() path'])
+    expect(result.followup).toBe('sent')
+    expect(followup).toHaveBeenCalledTimes(1)
+    const call = followup.mock.calls[0] as unknown[]
+    expect((call[0] as { id: string }).id).toBe(devA.id)
+    expect(call[1]).toBe('worker-child-agent')
+    const text = (call[2] as { type: string; text: string }[])[0]!.text
+    expect(text).toContain(ticket.id)
+    expect(text).toContain('fix the parse() path')
+  })
+
+  it('marks the card blocked after the third consecutive reject', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'three strikes')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const first = await service.report(workerChild, ticket.id, 'attempt one')
+    await service.resolveReview(devA, first.ticket.id, 'reject', 'reviewed', ['problem one'])
+    const second = await service.report(workerChild, ticket.id, 'attempt two')
+    await service.resolveReview(devA, second.ticket.id, 'reject', 'reviewed', ['problem two'])
+    const third = await service.report(workerChild, ticket.id, 'attempt three')
+    const result = await service.resolveReview(devA, third.ticket.id, 'reject', 'reviewed', ['problem three'])
+    expect(result.blockedAfterReject).toBe(true)
+    expect(result.ticket.column).toBe('in_progress')
+    expect(result.ticket.status).toBe('blocked')
+    expect(result.ticket.failure).toMatchObject({ reason: 'rejected 3 times, awaiting user decision' })
+    expect(result.ticket.reviewAttempts).toBe(3)
+    expect(result.ticket.lastReview?.outcome).toBe('rejected')
   })
 
   it('loads v1-shaped records from a seeded storage root with zod defaults', async () => {
