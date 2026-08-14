@@ -8,9 +8,9 @@ import { useMemo, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { InjectFace, PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
-  BoardView, ColumnId, MoveTicketRequest, TicketView,
+  ColumnId, MoveTicketRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
-import type { TaskboardInjected } from './contract.ts'
+import type { BoardScope, BoardView, TaskboardInjected } from './contract.ts'
 import { createTaskboardStore } from './stores.ts'
 import { TicketCard } from './TicketCard.tsx'
 import { TicketDetail } from './TicketDetail.tsx'
@@ -41,6 +41,7 @@ export function TaskboardView({
   const [formOpen, setFormOpen] = useState(false)
   const [newBoardOpen, setNewBoardOpen] = useState(false)
   const [boardName, setBoardName] = useState('')
+  const [boardScope, setBoardScope] = useState<BoardScope>('session')
   const [confirmArchive, setConfirmArchive] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
@@ -61,24 +62,36 @@ export function TaskboardView({
   const ticketCount = board?.tickets.length ?? 0
 
   /**
-   * Active boards for the selector; archived ones collapse into a group.
-   * Only the current project's boards render (the host already filters, so
-   * this is defense-in-depth): a board owned by another workspace is never
-   * selectable here, while unowned boards stay shared across workspaces.
+   * Active boards for the selector, grouped by scope; archived ones collapse
+   * into a group. Only the current project's boards render (the host already
+   * filters, so this is defense-in-depth): a board owned by another workspace
+   * is never selectable here, while unowned boards stay shared. A session-
+   * private board (scope 'session') is shown only through its own session's
+   * list; anything without a scope marker reads as project-shared.
    */
   const workspaceId = boardState.workspaceId
   const inWorkspace = (item: BoardView): boolean => item.workspaceId === workspaceId || item.workspaceId === ''
   const activeBoards = boardState.boards.filter(item => item.archivedAt === null && inWorkspace(item))
   const archivedBoards = boardState.boards.filter(item => item.archivedAt !== null && inWorkspace(item))
+  const sessionBoards = activeBoards.filter(item => item.scope === 'session')
+  const projectBoards = activeBoards.filter(item => item.scope !== 'session')
 
-  /** Create one board from the inline name field and open it. */
+  /** One option label: the board name plus its scope badge. */
+  const boardLabel = (item: BoardView): string => {
+    const name = item.name || item.boardId
+    const scopeKey = item.scope === 'session' ? 'session' : 'project'
+    return name + '（' + t(('board.scope.' + scopeKey) as never) + '）'
+  }
+
+  /** Create one board from the inline name and scope fields and open it. */
   const handleCreateBoard = async (): Promise<void> => {
     const name = boardName.trim()
     if (name === '') return
     try {
-      await createBoard(name)
+      await createBoard(name, boardScope)
       setNewBoardOpen(false)
       setBoardName('')
+      setBoardScope('session')
       setError(null)
     } catch {
       setError(t('error.generic'))
@@ -129,21 +142,37 @@ export function TaskboardView({
             value={boardState.boardId}
             onChange={(event) => { void selectBoard(event.target.value) }}
           >
-            {activeBoards.map(boardRow => (
-              <option key={boardRow.boardId} value={boardRow.boardId}>
-                {boardRow.name || boardRow.boardId}
-              </option>
-            ))}
+            {sessionBoards.length > 0 && (
+              <optgroup label={t('board.group.session')}>
+                {sessionBoards.map(boardRow => (
+                  <option key={boardRow.boardId} value={boardRow.boardId}>
+                    {boardLabel(boardRow)}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {projectBoards.length > 0 && (
+              <optgroup label={t('board.group.project')}>
+                {projectBoards.map(boardRow => (
+                  <option key={boardRow.boardId} value={boardRow.boardId}>
+                    {boardLabel(boardRow)}
+                  </option>
+                ))}
+              </optgroup>
+            )}
             {archivedBoards.length > 0 && (
               <optgroup label={t('board.archived')}>
                 {archivedBoards.map(boardRow => (
                   <option key={boardRow.boardId} value={boardRow.boardId} disabled>
-                    {boardRow.name || boardRow.boardId}
+                    {boardLabel(boardRow)}
                   </option>
                 ))}
               </optgroup>
             )}
           </select>
+          <span className={css.scopeBadge} data-scope={boardState.scope}>
+            {t(('board.scope.' + boardState.scope) as never)}
+          </span>
           {!confirmArchive ? (
             <button type="button" className={css.archiveButton} onClick={() => setConfirmArchive(true)}>
               {t('board.archive')}
@@ -181,10 +210,19 @@ export function TaskboardView({
             placeholder={t('board.newName')}
             aria-label={t('board.newName')}
           />
+          <select
+            className={css.boardScopeSelect}
+            value={boardScope}
+            onChange={(event) => { setBoardScope(event.target.value as BoardScope) }}
+            aria-label={t('board.scope')}
+          >
+            <option value="session">{t('board.scope.session')}</option>
+            <option value="project">{t('board.scope.project')}</option>
+          </select>
           <button type="submit" className={css.createButton} disabled={boardName.trim() === ''}>
             {t('board.create')}
           </button>
-          <button type="button" className={css.cancelButton} onClick={() => { setNewBoardOpen(false); setBoardName('') }}>
+          <button type="button" className={css.cancelButton} onClick={() => { setNewBoardOpen(false); setBoardName(''); setBoardScope('session') }}>
             {t('action.cancel')}
           </button>
         </form>

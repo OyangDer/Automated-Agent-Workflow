@@ -54,6 +54,17 @@
   max-width: 180px;
 }
 
+.scopeBadge {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
 .archiveButton,
 .createButton,
 .confirmButton,
@@ -114,6 +125,16 @@
 .boardNameInput {
   flex: 1;
   min-width: 160px;
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+}
+
+.boardScopeSelect {
   background: var(--dsw-alias-bg-layer-1);
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 6px;

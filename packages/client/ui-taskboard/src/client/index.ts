@@ -18,13 +18,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { BoardSnapshot, BoardView } from '@deepseek-ai/dsh-taskboard/client'
+import type { BoardSnapshot } from '@deepseek-ai/dsh-taskboard/client'
 import { createTaskboardStore } from './stores.ts'
 import { TaskboardView } from './TaskboardView.tsx'
-import type { BoardState, TaskboardInjected } from './contract.ts'
+import type { BoardScope, BoardState, BoardView, CreateBoardRequest, TaskboardInjected } from './contract.ts'
 import { en, zh, type TaskboardKey } from './locales.ts'
 
-export type { TaskboardInjected } from './contract.ts'
+export type { BoardScope, BoardView, CreateBoardRequest, TaskboardInjected } from './contract.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -50,7 +50,7 @@ interface BoardSource {
   board: HostObservable<BoardState>
   refresh(): Promise<void>
   selectBoard(boardId: string): Promise<void>
-  createBoard(name: string): Promise<BoardView>
+  createBoard(name: string, scope?: BoardScope): Promise<BoardView>
   archiveBoard(boardId: string): Promise<BoardView>
 }
 
@@ -86,6 +86,10 @@ export function apply(ctx: ClientContext): void {
       boards: [],
       snapshot: null,
       workspaceId: workspaceOf(sessionId),
+      // The default fallback before the first fetch lands: the legacy
+      // unowned default board reads as project-shared.
+      scope: 'project',
+      ownerSessionId: null,
     }
     const listeners = new Set<() => void>()
     const publish = (): void => {
@@ -95,7 +99,9 @@ export function apply(ctx: ClientContext): void {
     /** Fetch the board list and one board's snapshot in one round trip. */
     const fetchBoardState = async (boardId: string): Promise<{ boards: BoardView[]; snapshot: BoardSnapshot }> => {
       const [boards, snapshot] = await Promise.all([
-        unwrap(await ctx.remote.taskboard.listBoards(sessionId)),
+        // The host lands scope/ownerSessionId with the incremental contract;
+        // the cast pins the client's forward view of the wire rows.
+        unwrap(await ctx.remote.taskboard.listBoards(sessionId)) as BoardView[],
         unwrap(await ctx.remote.taskboard.snapshot(sessionId, boardId)),
       ])
       return { boards, snapshot }
@@ -108,7 +114,14 @@ export function apply(ctx: ClientContext): void {
         const next = await fetchBoardState(boardId)
         // A selection made while this fetch was in flight wins; drop the stale state.
         if (current.boardId !== boardId) return
-        current = { boardId, ...next, workspaceId: workspaceOf(sessionId) }
+        const active = next.boards.find(board => board.boardId === boardId)
+        current = {
+          boardId,
+          ...next,
+          workspaceId: workspaceOf(sessionId),
+          scope: active?.scope ?? 'project',
+          ownerSessionId: active?.ownerSessionId ?? null,
+        }
       } catch {
         // Keep the last good state; a first load that fails falls back to an
         // empty snapshot so the tab renders something.
@@ -118,6 +131,8 @@ export function apply(ctx: ClientContext): void {
             boards: current.boards,
             snapshot: { boardId, name: boardId, tickets: [] },
             workspaceId: current.workspaceId,
+            scope: current.scope,
+            ownerSessionId: current.ownerSessionId,
           }
         }
       }
@@ -134,16 +149,19 @@ export function apply(ctx: ClientContext): void {
       void refresh()
     }
 
-    /** Create one board from its display name, then open it. */
-    const createBoard = async (name: string): Promise<BoardView> => {
-      const created = unwrap(await ctx.remote.taskboard.createBoard(sessionId, { name }))
+    /** Create one board from its display name and scope, then open it. */
+    const createBoard = async (name: string, scope: BoardScope = 'session'): Promise<BoardView> => {
+      const request: CreateBoardRequest = { name, scope }
+      // The request's scope rides the wire to the host; the return row is
+      // pinned to the client view the host contract will provide.
+      const created = unwrap(await ctx.remote.taskboard.createBoard(sessionId, request)) as BoardView
       await selectBoard(created.boardId)
       return created
     }
 
     /** Archive one board; archiving the active board falls back to default. */
     const archiveBoard = async (boardId: string): Promise<BoardView> => {
-      const archived = unwrap(await ctx.remote.taskboard.archiveBoard({ boardId }))
+      const archived = unwrap(await ctx.remote.taskboard.archiveBoard(sessionId, { boardId })) as BoardView
       if (archived.boardId === current.boardId) {
         await selectBoard('default')
       } else {
@@ -189,10 +207,10 @@ export function apply(ctx: ClientContext): void {
         void source.refresh()
       }
       return {
-        create: async request => unwrap(await ctx.remote.taskboard.create(request)),
+        create: async request => unwrap(await ctx.remote.taskboard.create(sessionId, request)),
         move: async request => unwrap(await ctx.remote.taskboard.move(sessionId, request)),
-        edit: async request => unwrap(await ctx.remote.taskboard.edit(request)),
-        remove: async request => unwrap(await ctx.remote.taskboard.delete(request)),
+        edit: async request => unwrap(await ctx.remote.taskboard.edit(sessionId, request)),
+        remove: async request => unwrap(await ctx.remote.taskboard.delete(sessionId, request)),
         requestReview: async request => unwrap(await ctx.remote.taskboard.requestReview(sessionId, request)),
         refresh: () => { void source.refresh() },
         selectBoard: source.selectBoard,

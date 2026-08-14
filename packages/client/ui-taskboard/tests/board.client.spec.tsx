@@ -8,7 +8,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
-import type { BoardView, TicketView } from '@deepseek-ai/dsh-taskboard/client'
+import type { TicketView } from '@deepseek-ai/dsh-taskboard/client'
+import type { BoardScope, BoardView } from '../src/client/contract.ts'
 import { TaskboardView, type TaskboardViewProps } from '../src/client/TaskboardView.tsx'
 import { zh } from '../src/client/locales.ts'
 
@@ -50,28 +51,49 @@ interface StubProps {
   boardId?: string
   /** Owning workspace of the session this board list belongs to. */
   workspaceId?: string
+  /** Active board's scope; derived from the board list when omitted. */
+  scope?: BoardScope
+  /** Active board's owning session id; derived when omitted. */
+  ownerSessionId?: string | null
   selectedId?: string | null
   create?: (request: unknown) => Promise<TicketView>
   move?: (request: unknown) => Promise<TicketView>
   selectBoard?: (boardId: string) => Promise<void>
-  createBoard?: (name: string) => Promise<BoardView>
+  createBoard?: (name: string, scope?: BoardScope) => Promise<BoardView>
   archiveBoard?: (boardId: string) => Promise<BoardView>
 }
 
-/** One board row fixture; unowned (workspaceId '') unless overridden. */
-function boardRow(boardId: string, name: string, workspaceId = ''): BoardView {
+/**
+ * One board row fixture; project-shared (workspaceId '', scope 'project')
+ * unless overridden. A session-private board passes its owning session id.
+ */
+function boardRow(
+  boardId: string,
+  name: string,
+  workspaceId = '',
+  scope: BoardScope = 'project',
+  ownerSessionId: string | null = null,
+): BoardView {
   return {
-    boardId, name, workspaceId,
+    boardId, name, workspaceId, scope, ownerSessionId,
     masterAgentId: null, masterClaimedAt: null, handoverNotes: '', archivedAt: null,
   }
 }
 
 /** Assemble the four shares the component destructures. */
 function propsOf({
-  board, boards = [], boardId = 'default', workspaceId = '', selectedId = null,
-  create, move, selectBoard, createBoard, archiveBoard,
+  board, boards = [], boardId = 'default', workspaceId = '', scope, ownerSessionId,
+  selectedId = null, create, move, selectBoard, createBoard, archiveBoard,
 }: StubProps): TaskboardViewProps {
-  const state = { boardId, boards, snapshot: { boardId, name: boardId, tickets: board }, workspaceId }
+  const active = boards.find(item => item.boardId === boardId)
+  const state = {
+    boardId,
+    boards,
+    snapshot: { boardId, name: boardId, tickets: board },
+    workspaceId,
+    scope: scope ?? active?.scope ?? 'project',
+    ownerSessionId: ownerSessionId !== undefined ? ownerSessionId : (active?.ownerSessionId ?? null),
+  }
   const storeState = { selectedId }
   return {
     useBoard: (selector: (value: typeof state) => typeof state) => selector(state),
@@ -84,7 +106,8 @@ function propsOf({
     requestReview: async () => ticket(),
     refresh: () => {},
     selectBoard: selectBoard ?? (async () => {}),
-    createBoard: createBoard ?? (async () => boardRow('board-new', 'new')),
+    createBoard: createBoard ?? (async (name: string, picked: BoardScope = 'session') =>
+      boardRow('board-new', name, picked === 'session' ? '' : 'workspace-1', picked)),
     archiveBoard: archiveBoard ?? (async () => boardRow('default', 'default')),
     hooks: { board: { getSnapshot: () => state, subscribe: () => () => {} } },
     t,
@@ -211,7 +234,10 @@ describe('TaskboardView', () => {
     expect(select.value).toBe('board-1')
     const values = Array.from(select.options).map(option => option.value)
     expect(values).toEqual(['default', 'board-1', 'board-2'])
-    expect(select.querySelector('optgroup')?.getAttribute('label')).toBe('已归档')
+    // Active project-shared boards land in the project group; the archived
+    // one collapses into its own group.
+    const groupLabels = Array.from(select.querySelectorAll('optgroup')).map(group => group.getAttribute('label'))
+    expect(groupLabels).toEqual(['项目共享板', '已归档'])
   })
 
   it('filters the board selector to the current workspace', () => {
@@ -231,7 +257,8 @@ describe('TaskboardView', () => {
     expect(select.value).toBe('board-own')
     const values = Array.from(select.options).map(option => option.value)
     expect(values).toEqual(['default', 'board-own', 'board-own-archived'])
-    expect(select.querySelector('optgroup')?.getAttribute('label')).toBe('已归档')
+    const groupLabels = Array.from(select.querySelectorAll('optgroup')).map(group => group.getAttribute('label'))
+    expect(groupLabels).toEqual(['项目共享板', '已归档'])
     // Other workspaces' boards never appear, not even as archived labels.
     expect(screen.queryByText('他项目的板')).toBeNull()
     expect(screen.queryByText('他项目已归档')).toBeNull()
@@ -247,14 +274,71 @@ describe('TaskboardView', () => {
   })
 
   it('creates a board through the inline form', async () => {
-    const createBoard = vi.fn(async (name: string) => boardRow('board-9', name))
+    const createBoard = vi.fn(async (name: string, scope: BoardScope = 'session') =>
+      boardRow('board-9', name, scope === 'session' ? '' : 'workspace-1', scope))
     render(createElement(TaskboardView, propsOf({ board: [], createBoard })))
     fireEvent.click(screen.getByText('新建板'))
     const input = screen.getByLabelText('看板名称') as HTMLInputElement
     fireEvent.change(input, { target: { value: '新看板' } })
     fireEvent.click(screen.getByText('创建'))
     await vi.waitFor(() => {
-      expect(createBoard).toHaveBeenCalledWith('新看板')
+      expect(createBoard).toHaveBeenCalledWith('新看板', 'session')
+    })
+  })
+
+  it('groups the board selector by scope with badges', () => {
+    const boards: BoardView[] = [
+      boardRow('default', 'default'),
+      boardRow('board-private', '草稿板', '', 'session', 'session-1'),
+      boardRow('board-shared', '团队板', 'workspace-1'),
+      { ...boardRow('board-private-archived', '旧草稿', '', 'session', 'session-1'), archivedAt: 9 },
+    ]
+    render(createElement(TaskboardView, propsOf({
+      board: [], boards, boardId: 'board-private', workspaceId: 'workspace-1',
+    })))
+    const select = screen.getByLabelText('选择看板') as HTMLSelectElement
+    const groups = Array.from(select.querySelectorAll('optgroup'))
+    expect(groups.map(group => group.getAttribute('label'))).toEqual(['本会话私有板', '项目共享板', '已归档'])
+    // Session-private boards under the session group, project boards under
+    // the project group, archived ones collapsed at the end.
+    expect(Array.from(groups[0]!.querySelectorAll('option')).map(option => option.value)).toEqual(['board-private'])
+    expect(Array.from(groups[1]!.querySelectorAll('option')).map(option => option.value)).toEqual(['default', 'board-shared'])
+    expect(Array.from(groups[2]!.querySelectorAll('option')).map(option => option.value)).toEqual(['board-private-archived'])
+    // Every option carries a scope badge next to its name.
+    expect(select.querySelector('option[value="board-private"]')?.textContent).toContain('（本会话私有）')
+    expect(select.querySelector('option[value="board-shared"]')?.textContent).toContain('（项目共享）')
+    expect(select.querySelector('option[value="default"]')?.textContent).toContain('（项目共享）')
+  })
+
+  it('shows the active board scope badge', () => {
+    const boards: BoardView[] = [
+      boardRow('default', 'default'),
+      boardRow('board-private', '草稿板', '', 'session', 'session-1'),
+    ]
+    const { rerender } = render(createElement(TaskboardView, propsOf({
+      board: [], boards, boardId: 'board-private',
+    })))
+    // The active session-private board reads its scope in the header badge.
+    const badge = screen.getByText('本会话私有')
+    expect(badge.getAttribute('data-scope')).toBe('session')
+    rerender(createElement(TaskboardView, propsOf({ board: [], boards, boardId: 'default' })))
+    expect(screen.getByText('项目共享').getAttribute('data-scope')).toBe('project')
+  })
+
+  it('creates a board with the chosen scope through the inline form', async () => {
+    const createBoard = vi.fn(async (name: string, scope: BoardScope = 'session') =>
+      boardRow('board-9', name, scope === 'session' ? '' : 'workspace-1', scope))
+    render(createElement(TaskboardView, propsOf({ board: [], createBoard })))
+    fireEvent.click(screen.getByText('新建板'))
+    // The scope picker defaults to the session scope.
+    const scopeSelect = screen.getByLabelText('作用域') as HTMLSelectElement
+    expect(scopeSelect.value).toBe('session')
+    const input = screen.getByLabelText('看板名称') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '团队板' } })
+    fireEvent.change(scopeSelect, { target: { value: 'project' } })
+    fireEvent.click(screen.getByText('创建'))
+    await vi.waitFor(() => {
+      expect(createBoard).toHaveBeenCalledWith('团队板', 'project')
     })
   })
 
