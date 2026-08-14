@@ -38,6 +38,7 @@ export function TicketDetail({
   const [description, setDescription] = useState(ticket.description)
   const [priority, setPriority] = useState<Priority>(ticket.priority)
   const [dependsOn, setDependsOn] = useState<string[]>(ticket.dependsOn)
+  const [filesScope, setFilesScope] = useState(ticket.filesScope)
   const [pending, setPending] = useState(false)
 
   const columnIndex = COLUMNS.indexOf(ticket.column)
@@ -51,7 +52,7 @@ export function TicketDetail({
     }
     setPending(true)
     try {
-      await onEdit({ ticketId: ticket.id, title, description, priority, dependsOn })
+      await onEdit({ ticketId: ticket.id, title, description, priority, dependsOn, filesScope })
       setEditing(false)
     } catch {
       onError(t('error.generic'))
@@ -113,6 +114,10 @@ export function TicketDetail({
             <dt>{t('form.priority')}</dt>
             <dd>{t(('priority.' + ticket.priority) as never)}</dd>
           </div>
+          <div className={css.fact}>
+            <dt>{t('detail.filesScope')}</dt>
+            <dd>{ticket.filesScope.trim() === '' ? '—' : ticket.filesScope}</dd>
+          </div>
         </dl>
 
         {!editing && (
@@ -152,6 +157,15 @@ export function TicketDetail({
                   <option key={value} value={value}>{t(('priority.' + value) as never)}</option>
                 ))}
               </select>
+            </label>
+            <label className={css.field}>
+              <span className={css.fieldLabel}>{t('form.filesScope')}</span>
+              <textarea
+                className={css.textarea}
+                value={filesScope}
+                placeholder={t('form.filesScope.placeholder')}
+                onChange={(event) => { setFilesScope(event.target.value) }}
+              />
             </label>
             <div className={css.field}>
               <span className={css.fieldLabel}>{t('form.dependsOn')}</span>

@@ -23,13 +23,14 @@ export function NewTicketForm({ board, t, onSubmit, onCancel }: NewTicketFormPro
   const [description, setDescription] = useState('')
   const [priority, setPriority] = useState<Priority>('normal')
   const [dependsOn, setDependsOn] = useState<string[]>([])
+  const [filesScope, setFilesScope] = useState('')
   const [pending, setPending] = useState(false)
 
   const submit = async (): Promise<void> => {
     if (title.trim() === '') return
     setPending(true)
     try {
-      await onSubmit({ title, description, priority, dependsOn })
+      await onSubmit({ title, description, priority, dependsOn, filesScope })
     } finally {
       setPending(false)
     }
@@ -57,6 +58,15 @@ export function NewTicketForm({ board, t, onSubmit, onCancel }: NewTicketFormPro
                 <option key={value} value={value}>{t(('priority.' + value) as never)}</option>
               ))}
             </select>
+          </label>
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{t('form.filesScope')}</span>
+            <textarea
+              className={css.textarea}
+              value={filesScope}
+              placeholder={t('form.filesScope.placeholder')}
+              onChange={(event) => { setFilesScope(event.target.value) }}
+            />
           </label>
           <div className={css.field}>
             <span className={css.fieldLabel}>{t('form.dependsOn')}</span>

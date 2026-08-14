@@ -408,7 +408,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:311`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:314`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -431,5 +431,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:276`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:287`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

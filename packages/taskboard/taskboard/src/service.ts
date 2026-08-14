@@ -88,6 +88,7 @@ const ticketSchema = zod.object({
   ]).default(null),
   devNotes: zod.string(),
   targetBranch: zod.string().default(''),
+  filesScope: zod.string().default(''),
   dependsOn: zod.array(zod.string()),
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
 })
@@ -243,6 +244,8 @@ export interface TicketRow {
   reviewer: TicketAssignee | null
   reviewAttempts: number
   lastReviewOutcome: 'approved' | 'rejected' | null
+  /** Declared file scope, for the master's parallel-safety judgment at dispatch. */
+  filesScope: string
   dependsOn: string[]
 }
 
@@ -898,7 +901,10 @@ export class TaskboardService extends TypertRemoteService {
       const cwd = parent.session.header.cwd
       const request: SubagentStartRequest = {
         label: workerLabel ?? ticket.title,
-        prompt: [{ type: 'text', text: buildWorkerPrompt(ticket, cwd) }],
+        // The master session id names the worker's independent branch
+        // (taskboard/<session-short-id>/<ticket-id>), keeping parallel
+        // workers in a shared workspace from colliding.
+        prompt: [{ type: 'text', text: buildWorkerPrompt(ticket, cwd, parent.id) }],
         parent,
         signal: new AbortController().signal,
         agentOptions: { model: this.resolved.workerModel },
@@ -1182,6 +1188,7 @@ export class TaskboardService extends TypertRemoteService {
       reviewOutcome: null,
       devNotes: '',
       targetBranch: typeof request.targetBranch === 'string' ? request.targetBranch : '',
+      filesScope: typeof request.filesScope === 'string' ? request.filesScope : '',
       dependsOn: Array.isArray(request.dependsOn) ? request.dependsOn : [],
       history: [] as TicketView['history'],
     }
@@ -1244,6 +1251,7 @@ export class TaskboardService extends TypertRemoteService {
         priority,
         dependsOn: request.dependsOn,
         targetBranch: typeof request.targetBranch === 'string' ? request.targetBranch : edited.targetBranch,
+        filesScope: typeof request.filesScope === 'string' ? request.filesScope : edited.filesScope,
         updatedAt: Date.now(),
       },
       'edit',
@@ -2157,6 +2165,7 @@ export class TaskboardService extends TypertRemoteService {
         reviewer: ticket.reviewer,
         reviewAttempts: ticket.reviewAttempts,
         lastReviewOutcome: ticket.lastReview?.outcome ?? null,
+        filesScope: ticket.filesScope,
         dependsOn: ticket.dependsOn,
       })
     }
@@ -2248,6 +2257,7 @@ export class TaskboardService extends TypertRemoteService {
             { type: 'null' as const },
           ] as const, required: true as const,
         },
+        filesScope: { type: 'string' as const, required: true as const },
         dependsOn: { type: 'array' as const, required: true as const, items: { type: 'string' as const } },
       },
     }
@@ -2353,6 +2363,7 @@ export class TaskboardService extends TypertRemoteService {
             },
             devNotes: { type: 'string', required: true },
             targetBranch: { type: 'string', required: true },
+            filesScope: { type: 'string', required: true },
             dependsOn: { type: 'array', required: true, items: { type: 'string' } },
             history: {
               type: 'array', required: true,
@@ -2392,6 +2403,7 @@ export class TaskboardService extends TypertRemoteService {
           reviewOutcome: ticket.reviewOutcome,
           devNotes: ticket.devNotes,
           targetBranch: ticket.targetBranch,
+          filesScope: ticket.filesScope,
           dependsOn: ticket.dependsOn,
           history: ticket.history,
         }
@@ -2872,6 +2884,10 @@ export class TaskboardService extends TypertRemoteService {
           items: { type: 'string' as const },
           description: 'Ticket ids this ticket waits for; all must exist and be open to completion.',
         },
+        filesScope: {
+          type: 'string' as const,
+          description: 'Declared file scope: the paths (files or directories) this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards.',
+        },
       },
       output: {
         schema: {
@@ -2893,6 +2909,7 @@ export class TaskboardService extends TypertRemoteService {
         type?: TicketType
         priority?: Priority
         dependsOn?: string[]
+        filesScope?: string
       }, exec) => {
         const agent = TaskboardService.agentOf(exec)
         const ticket = await this.createAsMaster(agent, {
@@ -2902,6 +2919,7 @@ export class TaskboardService extends TypertRemoteService {
           dependsOn: args.dependsOn ?? [],
           ...(args.boardId === undefined ? {} : { boardId: args.boardId }),
           ...(args.type === undefined ? {} : { type: args.type }),
+          ...(args.filesScope === undefined ? {} : { filesScope: args.filesScope }),
         })
         return { id: ticket.id, title: ticket.title, column: ticket.column, type: ticket.type, boardId: ticket.boardId }
       },

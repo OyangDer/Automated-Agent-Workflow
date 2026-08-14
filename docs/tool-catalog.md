@@ -1224,6 +1224,10 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
       "items": {
         "type": "string"
       }
+    },
+    "filesScope": {
+      "type": "string",
+      "description": "Declared file scope: the paths (files or directories) this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards."
     }
   },
   "required": [

@@ -24,7 +24,9 @@ import { CallId } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
-import { buildHandoverNotes } from '../src/domain.ts'
+import {
+  branchNameFor, buildHandoverNotes, buildWorkerPrompt, MASTER_SECTION,
+} from '../src/domain.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
 function stubAgentForSession(session: Session): Agent {
@@ -1207,6 +1209,7 @@ describe('TaskboardService workflow', () => {
     expect(loaded.status).toBe('claimed')
     expect(loaded.failure).toBeNull()
     expect(loaded.workerAgentId).toBeUndefined()
+    expect(loaded.filesScope).toBe('')
     // The v1 board row loads with the new dual-scope defaults intact.
     const boards = await service.listBoards(devA)
     const loadedBoard = boards.find(board => board.boardId === 'default')!
@@ -1255,6 +1258,125 @@ describe('TaskboardService workflow', () => {
     expect(workspaceBoards.map(board => board.boardId)).not.toContain('orphan-board')
     await expect(service.snapshot(workspaceAgent, 'orphan-board')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
     await expect(service.claimMaster('orphan-board', workspaceAgent)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+  })
+
+  it('teaches the shared-workspace branch convention and filesScope in the master prompt', () => {
+    expect(MASTER_SECTION).toContain('taskboard/<session-short-id>/<ticket-id>')
+    expect(MASTER_SECTION).toContain('git status')
+    expect(MASTER_SECTION).toContain('branch --show-current')
+    expect(MASTER_SECTION).toContain('filesScope')
+    expect(MASTER_SECTION).toContain('taskboard_assign')
+    expect(MASTER_SECTION).toContain('taskboard/<session-short-id>/<ticket-id>')
+    // The branch helper follows the documented convention.
+    expect(branchNameFor('abc12345def', 'ticket-xyz')).toBe('taskboard/abc12345/ticket-xyz')
+  })
+
+  it('writes and reads the declared filesScope on cards', async () => {
+    const { service, devA } = await harness()
+    // Declared at create: read back through the Remote surface and the view.
+    const scoped = await service.createRemote(devA, {
+      title: 'scoped card', description: '', priority: 'normal', dependsOn: [],
+      filesScope: 'src/parser.ts, tests/parser.spec.ts',
+    })
+    expect(scoped.filesScope).toBe('src/parser.ts, tests/parser.spec.ts')
+    expect((await service.viewTicket(scoped.id)).filesScope).toBe('src/parser.ts, tests/parser.spec.ts')
+    expect((await service.snapshot(devA)).tickets.find(ticket => ticket.id === scoped.id)!.filesScope)
+      .toBe('src/parser.ts, tests/parser.spec.ts')
+    // Undeclared cards default to ''.
+    const bare = await createTicket(service, 'bare card')
+    expect(bare.filesScope).toBe('')
+    // Edit replaces the scope; omitting filesScope keeps the current one.
+    const edited = await service.editRemote(devA, {
+      ticketId: scoped.id, title: 'scoped card', description: '', priority: 'normal', dependsOn: [], filesScope: 'src/parser.ts',
+    })
+    expect(edited.filesScope).toBe('src/parser.ts')
+    const kept = await service.editRemote(devA, {
+      ticketId: scoped.id, title: 'scoped card', description: '', priority: 'normal', dependsOn: [],
+    })
+    expect(kept.filesScope).toBe('src/parser.ts')
+  })
+
+  it('records filesScope through the master create tool and surfaces it in the list rows', async () => {
+    const { ctx, service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    const result = await ctx.tools.execute({
+      callId: CallId('tool-create-scope'),
+      name: 'taskboard_create',
+      arguments: { title: 'tool scoped', description: '', priority: 'normal', filesScope: 'packages/client/ui-taskboard/src' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(result.isError).toBe(false)
+    const value = (result as { value: { id: string } }).value
+    expect((await service.viewTicket(value.id)).filesScope).toBe('packages/client/ui-taskboard/src')
+    // The dispatch surface (taskboard_list rows) carries the scope for the
+    // master's parallel-safety judgment.
+    const list = await ctx.tools.execute({
+      callId: CallId('tool-list-scope'),
+      name: 'taskboard_list',
+      arguments: {},
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(list.isError).toBe(false)
+    const listValue = (list as { value: { tickets: Array<{ id: string; filesScope: string }> } }).value
+    const row = listValue.tickets.find(ticket => ticket.id === value.id)!
+    expect(row.filesScope).toBe('packages/client/ui-taskboard/src')
+    // The view tool also carries the scope.
+    const view = await ctx.tools.execute({
+      callId: CallId('tool-view-scope'),
+      name: 'taskboard_view',
+      arguments: { ticketId: value.id },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(view.isError).toBe(false)
+    const viewValue = (view as { value: { filesScope: string } }).value
+    expect(viewValue.filesScope).toBe('packages/client/ui-taskboard/src')
+  })
+
+  it('injects the session branch and filesScope into the spawned worker prompt', async () => {
+    const { service, devA, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await service.createRemote(devA, {
+      title: 'branch card', description: '', priority: 'normal', dependsOn: [], filesScope: 'src/only-this.ts',
+    })
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('Shared-workspace branch convention')
+    expect(prompt).toContain(branchNameFor(devA.id, ticket.id))
+    expect(prompt).toContain('git status')
+    expect(prompt).toContain('Declared file scope: src/only-this.ts')
+    // Without a session id the prompt omits the branch but keeps the scope.
+    const bare = buildWorkerPrompt({ ...ticket, filesScope: '' })
+    expect(bare).not.toContain('Shared-workspace branch convention')
+    expect(bare).toContain('Declared file scope: (not declared)')
+  })
+
+  it('surfaces the declared file scope in the review prompt', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await service.createRemote(devA, {
+      title: 'scoped review', description: '', priority: 'normal', dependsOn: [], filesScope: 'src/parser.ts',
+    })
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    await service.report(workerChild, ticket.id, 'implemented')
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    const prompt = (reviewCall[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('Declared file scope: src/parser.ts')
+    expect(prompt).toContain('stays inside the declared file scope')
+    // An undeclared scope prompts no scope-check step.
+    const plain = await service.createAsMaster(devA, { title: 'plain', description: '', priority: 'normal', dependsOn: [] })
+    await service.moveAsMaster(devA, { ticketId: plain.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+    await service.assign(devA, plain.id)
+    await service.report(workerChild, plain.id, 'done')
+    const plainCall = subagentsStart.mock.calls[3] as [string, SubagentStartRequest]
+    const plainPrompt = (plainCall[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(plainPrompt).toContain('Declared file scope: (not declared)')
+    expect(plainPrompt).not.toContain('stays inside the declared file scope')
   })
 })
 
@@ -1525,7 +1647,7 @@ it('builds handover notes covering every card state and the empty history', () =
     boardId: 'default', type: 'feature', status: 'ready', failure: null,
     createdAt: at, updatedAt: at, position: 0, assignee: null, reviewer: null,
     reviewAttempts: 0, lastReview: null, reviewOutcome: null, devNotes: '',
-    targetBranch: '', dependsOn: [], history: [],
+    targetBranch: '', filesScope: '', dependsOn: [], history: [],
   }
   const backlog = { ...base, id: 'ticket-backlog', title: 'planned', column: 'backlog' as const, dependsOn: ['ticket-done'] }
   const notStarted = { ...base, id: 'ticket-next', title: 'next up', column: 'not_started' as const, dependsOn: ['ticket-done'] }

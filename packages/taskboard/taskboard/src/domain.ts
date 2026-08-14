@@ -84,6 +84,20 @@ export function workerLabel(childAgentId: string): string {
   return ['worker', childAgentId.slice(0, 8)].join(' ')
 }
 
+/**
+ * The independent git branch one session's worker works on for one ticket,
+ * following the shared-workspace conflict convention: every session stays on
+ * its own branch (taskboard/<session-short-id>/<ticket-id>) so parallel
+ * workers in the same working directory never stage/commit over each other;
+ * the master aggregates the branches when the work lands.
+ * @param sessionId - the master session id (its short form names the branch).
+ * @param ticketId - the ticket the worker implements.
+ * @returns the branch name, e.g. "taskboard/abc12345/ticket-xyz".
+ */
+export function branchNameFor(sessionId: string, ticketId: string): string {
+  return 'taskboard/' + sessionId.slice(0, 8) + '/' + ticketId
+}
+
 /** Message attribution for master-seat notifications injected into the seat
  * holder's live inbox (worker report/fail, review verdict landed). Mirrors the
  * goal-round driver's inbox-injection precedent: the master's agent loop
@@ -122,11 +136,15 @@ export function buildReviewPrompt(ticket: TicketView): string {
     '  Developer: ' + assignee,
     '  Review attempt: ' + String(ticket.reviewAttempts + 1),
     '  Developer notes: ' + devNotes,
+    '  Declared file scope: ' + (ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope),
     '',
     'Review the implementation against the description and acceptance criteria:',
     '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
     '2. Run the relevant tests and builds where the ticket concerns code.',
     '3. Check edge cases and error paths named in the description, not just the happy path.',
+    ...(ticket.filesScope.trim() === '' ? [] : [
+      '4. Check the change stays inside the declared file scope: flag any edit outside "' + ticket.filesScope + '".',
+    ]),
     ...(ticket.type === 'merge' ? [
       '',
       'Merge ticket specifics — also verify:',
@@ -168,11 +186,15 @@ export function buildReviewReportPrompt(ticket: TicketView): string {
     '  Developer: ' + assignee,
     '  Review attempt: ' + String(ticket.reviewAttempts + 1),
     '  Developer notes: ' + devNotes,
+    '  Declared file scope: ' + (ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope),
     '',
     'Review the implementation against the description and acceptance criteria:',
     '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
     '2. Run the relevant tests and builds where the ticket concerns code.',
     '3. Check edge cases and error paths named in the description, not just the happy path.',
+    ...(ticket.filesScope.trim() === '' ? [] : [
+      '4. Check the change stays inside the declared file scope: flag any edit outside "' + ticket.filesScope + '".',
+    ]),
     ...(ticket.type === 'merge' ? [
       '',
       'Merge ticket specifics — also verify:',
@@ -193,17 +215,21 @@ export function buildReviewReportPrompt(ticket: TicketView): string {
 /**
  * The prompt a freshly spawned worker runs with. Self-contained: the spawned
  * child has no shared conversation with the master, so the ticket content,
- * the working directory, and the exact finishing contract are all inlined.
+ * the working directory, the shared-workspace branch convention, and the
+ * exact finishing contract are all inlined.
  * @param ticket - the ticket to implement.
  * @param cwd - the master session's working directory, when known.
+ * @param sessionId - the master session id; its short form names the worker branch.
  * @returns the child's user prompt text.
  */
-export function buildWorkerPrompt(ticket: TicketView, cwd?: string): string {
+export function buildWorkerPrompt(ticket: TicketView, cwd?: string, sessionId?: string): string {
   const description = ticket.description.trim() === '' ? '(none)' : ticket.description
   const dependsOn = ticket.dependsOn.length === 0
     ? '(none)'
     : ticket.dependsOn.map(dependencyId => '  - ' + dependencyId).join('\n')
   const workspace = cwd === undefined ? '(inherited from the spawning session)' : cwd
+  const branch = sessionId === undefined ? undefined : branchNameFor(sessionId, ticket.id)
+  const filesScope = ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope
   return [
     ['You are the worker assigned to taskboard ticket', ticket.id, '("' + ticket.title + '").'].join(' '),
     '',
@@ -216,6 +242,17 @@ export function buildWorkerPrompt(ticket: TicketView, cwd?: string): string {
     '  Depends on: ' + dependsOn,
     '',
     'Working directory: ' + workspace,
+    '',
+    ...(branch === undefined ? [] : [
+      'Shared-workspace branch convention (parallel sessions must not clash):',
+      '  - Before starting, check the git status and the current branch in the working directory.',
+      '  - Work on the session branch "' + branch + '": create it if missing (git switch -c ' + branch + ' from the current base) and keep every change of this ticket on it.',
+      '  - Do not merge, push, or rebase: the master aggregates the branches when the work is done.',
+      '  - If the working tree is not clean or another branch is checked out, switch to the session branch without touching the other session\'s changes.',
+      '',
+    ]),
+    'Declared file scope: ' + filesScope,
+    '  The card declares which files/directories it affects; stay inside that scope and do not edit files outside it (other parallel workers may own them). An undeclared scope means you are responsible for reporting exactly which paths you touched in devNotes.',
     '',
     'Implement the ticket end to end against its description and acceptance criteria:',
     '1. Inspect the workspace (git status / diff / log) and read the relevant files.',
@@ -327,7 +364,9 @@ export const WORKFLOW_SECTION = [
  * compaction rather than handoff, a real handover first records handover
  * notes (board state and per-card worker identities) on the board so the
  * successor can continue after taskboard_claim_master, and dispatched
- * workers finish their current card without cross-session followup.
+ * workers finish their current card without cross-session followup, and
+ * parallel sessions in a shared workspace keep apart through the per-session
+ * branch convention plus each card's declared file scope.
  */
 export const MASTER_SECTION = [
   '# Taskboard master',
@@ -339,4 +378,17 @@ export const MASTER_SECTION = [
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
+  '',
+  '# Shared-workspace branch convention (parallel sessions)',
+  '',
+  'Parallel sessions may share one working directory; to keep them from stepping on each other\'s files and git state:',
+  '- Before starting work on the repo — and again before dispatching — check the git status and the current branch (git status / git branch --show-current). A dirty tree or an unexpected branch changes what workers may touch safely.',
+  '- Each session works on its own independent branch: taskboard/<session-short-id>/<ticket-id> (e.g. taskboard/abc12345/ticket-xyz). When you dispatch a card, the worker prompt carries that branch; spawned workers create/switch to it and keep their changes there.',
+  '- Workers do not merge or push: when the work is done the master aggregates the session branches (review the diff, merge into the shared base), then reports completion. Never let two sessions commit to the same branch.',
+  '',
+  '# File-scope declarations (filesScope)',
+  '',
+  '- Every card carries a filesScope field (\'\' by default): the paths (files or directories) the card affects. Declare it when creating or editing a card — during planning you and the user agree on which files the work touches.',
+  '- When dispatching with taskboard_assign, read the filesScope of every In-flight and Not started card before starting new workers: two workers whose scopes overlap must not run in parallel (serialize them or tighten the scopes), and a card whose scope depends on another card\'s output is a soft dependency — order it after that card even without a dependsOn edge.',
+  '- When a card has no filesScope declared, ask the user or record one before dispatching so parallel safety is judged on facts, not guesses.',
 ].join('\n')

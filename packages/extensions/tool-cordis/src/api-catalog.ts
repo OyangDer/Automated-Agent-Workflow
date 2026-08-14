@@ -3124,7 +3124,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CreateTicketRequest',
-    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n}',
+    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n}',
   },
   {
     name: 'CredentialInfo',
@@ -3240,7 +3240,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'EditTicketRequest',
-    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n}',
+    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n}',
   },
   {
     name: 'EpochHeader',
@@ -4600,7 +4600,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketRow',
-    declaration: 'export interface TicketRow {\n    id: string;\n    title: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId: string | null;\n    failure: TicketFailure | null;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReviewOutcome: \'approved\' | \'rejected\' | null;\n    dependsOn: string[];\n}',
+    declaration: 'export interface TicketRow {\n    id: string;\n    title: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId: string | null;\n    failure: TicketFailure | null;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReviewOutcome: \'approved\' | \'rejected\' | null;\n    filesScope: string;\n    dependsOn: string[];\n}',
   },
   {
     name: 'TicketType',
@@ -4608,7 +4608,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketView',
-    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TicketWorkerStatus',

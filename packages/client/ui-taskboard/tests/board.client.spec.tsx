@@ -39,6 +39,7 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     reviewOutcome: null,
     devNotes: '',
     targetBranch: '',
+    filesScope: '',
     dependsOn: [],
     history: [],
     ...overrides,
@@ -361,7 +362,7 @@ describe('TaskboardView', () => {
   })
 
   it('shows the vacant seat banner with a copy-takeover button', async () => {
-    const writeText = vi.fn(async () => {})
+    const writeText = vi.fn(async (_text: string) => {})
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
     const boards = [boardRow('default', 'default')]
     render(createElement(TaskboardView, propsOf({ board: [], boards })))
@@ -370,7 +371,7 @@ describe('TaskboardView', () => {
     await vi.waitFor(() => {
       expect(writeText).toHaveBeenCalledTimes(1)
     })
-    const script = writeText.mock.calls[0]![0] as string
+    const script = writeText.mock.calls[0]![0]
     expect(script).toContain('taskboard_claim_master')
     expect(script).toContain('boardId "default"')
     expect(script).toContain('taskboard_assign')

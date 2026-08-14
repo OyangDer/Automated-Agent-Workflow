@@ -116,6 +116,13 @@ export interface TicketView {
   devNotes: string
   /** Master-confirmed target branch for merge tickets; empty for other types. */
   targetBranch: string
+  /**
+   * Declared scope of files/directories this card touches ('' when not
+   * declared). The master reads it when dispatching to judge whether two
+   * parallel workers may run in the same shared workspace without stepping
+   * on each other, and to spot soft (file-level) dependencies between cards.
+   */
+  filesScope: string
   /** Hard ordering constraints: every listed ticket must be in Done before claim. */
   dependsOn: string[]
   history: TicketHistoryEntry[]
@@ -200,6 +207,8 @@ export interface CreateTicketRequest {
   boardId?: string
   /** Master-confirmed target branch for a merge ticket. */
   targetBranch?: string
+  /** Declared file scope (paths this card touches); '' when not declared. */
+  filesScope?: string
 }
 
 /** User drags a ticket to another column, optionally next to an anchor. */
@@ -225,6 +234,8 @@ export interface EditTicketRequest {
   boardId?: string
   /** Master-confirmed target branch for a merge ticket. */
   targetBranch?: string
+  /** Declared file scope (paths this card touches); omitted keeps the current scope. */
+  filesScope?: string
 }
 
 /** User deletes a ticket from the board. */
