@@ -27,7 +27,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`, `grep` | `ctx.tools`, `ctx.subprocess`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | glob and grep are unconditional discovery tools that spawn the packaged ripgrep binary (`@vscode/ripgrep`) through ctx.subprocess as ordinary foreground calls (never background jobs) — no host `rg` install and no shell layer. The catalog uses `sampleOverCapGlobResults: true`; deployments must choose that behavior explicitly. Capped results save the complete formatted list through the optional ctx.spillStore backend; returned locators are follow-up-readable/searchable when the backend exposes local paths in co-located deployments. |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`, `terminal_list`, `terminal_open`, `terminal_read`, `terminal_send`, `terminal_signal` | `ctx.tools`, `ctx.terminals`, `ctx.systemPrompt`, `ctx.jobs at call time for run_in_background` | `tool/call`, `tool/result` | - | The six terminal tools are opt-in and complement one-shot shell/filesystem tools. `terminal_send(run_in_background: true)` registers with `ctx.jobs`; TUI, named key sequences, BEL, resize, auto-start, and cross-agent sharing are absent from the schema. |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`, `get_goal`, `update_goal` | `ctx.tools`, `ctx.agents`, `ctx.goals`, `ctx.systemPrompt`, `a calling Agent in an authorized open turn` | `tool/call`, `goal/change for mutations`, `tool/result` | - | create, edit, pause, and resume require direct-human root authority; complete and blocked also accept the exact current goal round. The default blocked lower bound is three admitted rounds. |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_claim`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_list`, `taskboard_reject`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_fail`, `taskboard_list`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`, `schedule_delete`, `schedule_list` | `ctx.tools`, `ctx.sessions`, `Session persistence`, `a future live root Agent` | `tool/call`, `schedule/change create or delete`, `tool/result` | - | Registered only inside live root Agent scopes created after the opt-in Schedule plugin loads. Version 1 accepts after_seconds, explicit absolute at, and bounded fixed-rate every_seconds, and discloses session-local delivery; management reads and mutations require the shared Session persistence barrier. |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`, `ctx.lsp`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | The lsp tool keeps provider selection and language-server subprocesses behind ctx.lsp, so its model-visible schema stays stable across providers. Requires a registered provider (e.g. `@deepseek-ai/dsh-lsp-stdio`) at runtime; without one, a query returns the structured `LSP_UNAVAILABLE` error rather than changing the schema. |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`, `ctx.workflowEngine`, `ctx.subagents`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents every fresh round)` | `tool/call`, `tool/result`, `workflow and child session events during execution` | - | A fixed foreground workflow starts one fresh structured child per round; the model selects only the immutable objective and an optional round cap. |
@@ -1063,6 +1063,31 @@ Approve an In testing taskboard ticket you are the designated reviewer of: the c
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_assign`
+
+Dispatch a Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The Not started ticket to dispatch."
+    },
+    "workerLabel": {
+      "type": "string",
+      "description": "Optional display label for the worker subagent; defaults to the ticket title."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_claim`
 
 Claim a Not started taskboard ticket for the calling agent: the card moves to In progress and this agent becomes its owner. Rejected when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Claim the oldest (lowest position) ready ticket first; use parallel subagents to claim several independent tickets at once.
@@ -1079,6 +1104,24 @@ Claim a Not started taskboard ticket for the calling agent: the card moves to In
   "required": [
     "ticketId"
   ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_claim_master`
+
+Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to claim. Omit for the default board."
+    }
+  }
 }
 ```
 
@@ -1131,6 +1174,32 @@ Mark an owned In progress ticket as development-complete: the card moves to In t
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_fail`
+
+Report a taskboard ticket as failed (assigned worker only): the card stays In progress but is marked blocked with your failure reason so the master can re-dispatch it.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this worker was assigned."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Concrete failure reason (blocked, missing access, irrecoverable error)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "reason"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_list`
 
 List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up.
@@ -1160,6 +1229,40 @@ List taskboard tickets. Tickets come back sorted by implementation order (positi
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_reassign`
+
+Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In progress card to re-dispatch."
+    },
+    "action": {
+      "type": "string",
+      "description": "retry spawns a new worker; backlog returns the card to Not started.",
+      "enum": [
+        "retry",
+        "backlog"
+      ]
+    },
+    "workerLabel": {
+      "type": "string",
+      "description": "Optional display label for a retry worker subagent."
+    }
+  },
+  "required": [
+    "ticketId",
+    "action"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_reject`
 
 Reject an In testing taskboard ticket you are the designated reviewer of: the card returns to In progress (打回) with your feedback for the developer to rework. Feedback must list concrete, actionable problems. Do not fix the code yourself.
@@ -1180,6 +1283,93 @@ Reject an In testing taskboard ticket you are the designated reviewer of: the ca
   "required": [
     "ticketId",
     "feedback"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_release_master`
+
+Release the master seat of a taskboard board (default board "default"); only the current master may release. After release, another agent may claim the seat.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to release. Omit for the default board."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_report`
+
+Report taskboard ticket development as complete (assigned worker only): the card moves to In testing and the board automatically assigns a fresh reviewer agent. devNotes summarizes what changed, which files were touched, and how it was verified — the reviewer reads exactly that.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this worker was assigned."
+    },
+    "devNotes": {
+      "type": "string",
+      "description": "What was implemented, files/areas touched, and how it was verified (tests run, manual checks)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "devNotes"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_resolve_review`
+
+Resolve a report-mode review (master only): apply the reviewer-reported verdict for an In testing taskboard ticket. approve moves the card to Done and archives the worker session; reject returns the card for rework with the reviewer's problems as feedback. The master applies the verdict as reported and may not overturn a rejection. After the third consecutive reject the card is marked blocked, awaiting the user's decision.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In testing ticket under review."
+    },
+    "verdict": {
+      "type": "string",
+      "description": "The reviewer-reported conclusion to apply.",
+      "enum": [
+        "approve",
+        "reject"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "What the reviewer inspected and concluded."
+    },
+    "problems": {
+      "type": "array",
+      "description": "Concrete rework items reported by the reviewer (empty when approving).",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "ticketId",
+    "verdict",
+    "summary",
+    "problems"
   ]
 }
 ```

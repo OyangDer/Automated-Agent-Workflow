@@ -88,18 +88,40 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 
 ### `ctx.taskboard` — `TaskboardService`
 
-The taskboard service (ctx.taskboard): storage-backed tickets, workflow transitions, the browser Remote surface, and the model-facing tools.
+The taskboard service (ctx.taskboard): storage-backed tickets and boards, the master seat, workflow transitions, the browser Remote surface, and the model-facing tools.
 
 ```ts cordis-catalog
 /**
- * Whole-board snapshot, sorted by column then position.
+ * Whole-board snapshot, sorted by column then position, scoped to one
+ * board (default "default").
+ * @param boardId - the board to snapshot, or undefined for the default board.
  * @returns the live board snapshot.
  */
-@Remote('snapshot') async snapshot(): Promise<BoardSnapshot>
+@Remote('snapshot') async snapshot(boardId?: string): Promise<BoardSnapshot>
+
+/**
+ * List every board, the implicit "default" board first when absent.
+ * @returns the live board rows.
+ */
+@Remote('listBoards') async listBoards(): Promise<BoardView[]>
+
+/**
+ * Create one board through the Remote boundary.
+ * @param request - the board name and owning workspace.
+ * @returns the created board.
+ */
+@Remote('createBoard') async createBoardRemote(request: CreateBoardRequest): Promise<BoardView>
+
+/**
+ * Archive one board through the Remote boundary.
+ * @param request - the board to archive.
+ * @returns the archived board.
+ */
+@Remote('archiveBoard') async archiveBoardRemote(request: ArchiveBoardRequest): Promise<BoardView>
 
 /**
  * Create one ticket in Backlog through the Remote boundary.
- * @param request - title, description, priority, and ordering dependencies.
+ * @param request - title, description, priority, ordering dependencies, and optional boardId.
  * @returns the created ticket.
  */
 @Remote('create') createRemote(request: CreateTicketRequest): Promise<TicketView>
@@ -137,7 +159,77 @@ The taskboard service (ctx.taskboard): storage-backed tickets, workflow transiti
 @Remote('requestReview') async requestReviewRemote(agent: Agent, request: RequestReviewRequest): Promise<TicketView>
 
 /**
- * Agent claims a Not started ticket and becomes its owner.
+ * Claim the master seat of one board; a stale seat (past the lease) can be
+ * preempted, and an unclaimed board is claimed by this agent.
+ * @param boardId - the board to claim.
+ * @param agent - the claiming session agent.
+ * @returns the board with its fresh master.
+ */
+async claimMaster(boardId: string, agent: Agent): Promise<BoardView>
+
+/**
+ * Release the master seat of one board; only the current master may.
+ * @param boardId - the board to release.
+ * @param agent - the current master.
+ * @returns the board with an empty seat.
+ */
+async releaseMaster(boardId: string, agent: Agent): Promise<BoardView>
+
+/**
+ * Transfer the master seat to another session agent with handover notes.
+ * @param boardId - the board to transfer.
+ * @param fromAgent - the current master.
+ * @param toAgentId - the receiving session agent id.
+ * @param handoverNotes - notes for the next master.
+ * @returns the board with the new master.
+ */
+async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView>
+
+/**
+ * Master assigns a Not started ticket to a freshly spawned worker: the
+ * card moves to In progress, status running, and a worker subagent is
+ * spawned immediately; on success its id is recorded on the card.
+ * @param agent - the master session agent.
+ * @param ticketId - the Not started ticket to dispatch.
+ * @param workerLabel - optional display label for the worker child.
+ * @returns the card plus the worker-spawn outcome.
+ */
+async assign(agent: Agent, ticketId: string, workerLabel?: string): Promise<AssignTicketResult>
+
+/**
+ * The assigned worker reports development done; the ticket enters In
+ * testing and a reviewer (same worker model) is spawned.
+ * @param agent - the assigned worker session agent.
+ * @param ticketId - the owned In progress ticket.
+ * @param devNotes - what changed and how it was verified.
+ * @returns the In testing ticket plus the reviewer-spawn outcome.
+ */
+async report(agent: Agent, ticketId: string, devNotes: string): Promise<CompleteTicketResult>
+
+/**
+ * The assigned worker reports failure; the card stays In progress but is
+ * marked blocked with a durable failure record.
+ * @param agent - the assigned worker session agent.
+ * @param ticketId - the owned In progress ticket.
+ * @param reason - the concrete failure reason.
+ * @returns the blocked ticket.
+ */
+async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView>
+
+/**
+ * Master re-dispatches one card: "retry" spawns a fresh worker (card back
+ * to running, failure cleared), "backlog" returns the card to Not started.
+ * @param agent - the master session agent.
+ * @param ticketId - the In progress card to re-dispatch.
+ * @param action - retry or backlog.
+ * @param workerLabel - optional display label for a retry worker.
+ * @returns the re-dispatched card plus the worker-spawn outcome.
+ */
+async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult>
+
+/**
+ * Agent claims a Not started ticket and becomes its owner (v1 path, kept
+ * for boards without a master seat).
  * @param agent - the claiming agent.
  * @param ticketId - the Not started ticket to claim.
  * @returns the claimed ticket, now In progress.
@@ -154,7 +246,7 @@ async claimReview(agent: Agent, ticketId: string): Promise<TicketView>
 
 /**
  * Owner marks development done; the ticket enters In testing and gets a
- * reviewer.
+ * reviewer (v1 path).
  * @param agent - the owning developer agent.
  * @param ticketId - the owned In progress ticket.
  * @param devNotes - what changed and how it was verified.
@@ -179,6 +271,22 @@ async approve(agent: Agent, ticketId: string, summary: string): Promise<TicketVi
  * @returns the rejected ticket, back In progress.
  */
 async reject(agent: Agent, ticketId: string, feedback: string): Promise<TicketView>
+
+/**
+ * The master resolves a report-mode review against the reviewer-reported
+ * verdict (taskboard_resolve_review). Approve lands the card in Done and
+ * archives the worker session; reject returns the card for rework, tries to
+ * follow up the original worker, and marks the card blocked on the third
+ * consecutive reject for the user to decide. The master may not overturn a
+ * rejection into an approval — the verdict is applied as reported.
+ * @param agent - the master session agent.
+ * @param ticketId - the In testing ticket under review.
+ * @param verdict - the reviewer-reported conclusion to apply.
+ * @param summary - what the reviewer inspected and concluded.
+ * @param problems - concrete rework items (empty on approval).
+ * @returns the resolved card plus the followup/archive outcomes.
+ */
+async resolveReview( agent: Agent, ticketId: string, verdict: string, summary: string, problems: string[], ): Promise<ResolveReviewResult>
 
 /**
  * Edit own-ticket content through the model-facing surface.
@@ -210,7 +318,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:151`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:286`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -220,18 +328,18 @@ Source: [`packages/taskboard/taskboard/src/service.ts:151`](../../packages/taskb
 
 #### `taskboard/changed` — emit
 
-One durable taskboard mutation has committed. Forwarded to the browser verbatim; the payload is the fresh post-mutation ticket (null on removal).
+One durable taskboard mutation has committed. Forwarded to the browser verbatim; the payload is the fresh post-mutation ticket (null on removal) and the board the mutation targeted.
 
 ```ts cordis-catalog
 /**
  * One durable taskboard mutation has committed. Forwarded to the browser
  * verbatim; the payload is the fresh post-mutation ticket (null on
- * removal).
+ * removal) and the board the mutation targeted.
  * @param change - the committed mutation with its post-state ticket.
  * @mode emit
  */
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:146`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:233`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->
