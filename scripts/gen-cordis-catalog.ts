@@ -51,6 +51,7 @@ export { REGION_BEGIN, REGION_END }
  */
 export const SERVICE_PAGE: Record<string, string> = {
   agentLoop: 'core.md',
+  taskboard: 'taskboard.md',
   agentDefaultModel: 'core.md',
   agentPresets: 'core.md',
   agents: 'core.md',
@@ -179,6 +180,7 @@ export const EVENT_SCOPE_PAGE: Record<string, string> = {
   'skills': 'skills.md',
   'subagent': 'subagent.md',
   'system-prompt': 'system-prompt.md',
+  'taskboard': 'taskboard.md',
   'session-telemetry': 'session-telemetry.md',
   'tools': 'tools.md',
   'workflow': 'workflow.md',
@@ -506,6 +508,18 @@ export const FOUNDATION_TYPE_NAMES: ReadonlySet<string> = new Set([
 /** Project types deliberately documented outside the subsystems catalog. */
 export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   z: 'schemastery schema constructor is owned by vendor/schemastery (vendored upstream)',
+  TaskboardChanged: 'taskboard change payload is owned by packages/taskboard/taskboard/README.md',
+  BoardSnapshot: 'taskboard board snapshot is owned by packages/taskboard/taskboard/src/types.ts',
+  ColumnId: 'taskboard column id is owned by packages/taskboard/taskboard/src/types.ts',
+  CreateTicketRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  TicketView: 'taskboard ticket view is owned by packages/taskboard/taskboard/src/types.ts',
+  MoveTicketRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  EditTicketRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  RemoveTicketRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  RemoveTicketResult: 'taskboard removal receipt is owned by packages/taskboard/taskboard/src/types.ts',
+  RequestReviewRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  CompleteTicketResult: 'taskboard completion receipt is owned by packages/taskboard/taskboard/src/service.ts',
+  TicketRow: 'taskboard list row is owned by packages/taskboard/taskboard/src/service.ts',
   BeginCommandRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   InsertReferenceRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',
   ConsumeTokenRequest: 'event-local request contract is owned by packages/client/ui-input-trigger/src/types.ts',

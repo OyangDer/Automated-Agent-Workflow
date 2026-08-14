@@ -6,8 +6,9 @@
  * `.agents/notes/implemented/process/2026-07-02-tool-schema-catalog.md`.
  */
 
-import { globSync, readFileSync, writeFileSync } from 'node:fs'
-import { basename, resolve } from 'node:path'
+import { globSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -17,6 +18,10 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import GoalService from '@deepseek-ai/dsh-goal'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as storageJson from '@deepseek-ai/dsh-storage-json'
+import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
+import TaskboardService from '@deepseek-ai/dsh-taskboard'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { type Config as ToolsConfig } from '@deepseek-ai/dsh-tools'
 import LocalBashExecutor from '@deepseek-ai/dsh-bash-local'
@@ -354,6 +359,23 @@ const TOOL_PACKAGES: ToolPackage[] = [
     },
     note:
       'create, edit, pause, and resume require direct-human root authority; complete and blocked also accept the exact current goal round. The default blocked lower bound is three admitted rounds.',
+  },
+  {
+    pkg: '@deepseek-ai/dsh-taskboard',
+    dir: 'taskboard',
+    source: 'packages/taskboard/taskboard/src/service.ts',
+    requires: ['ctx.tools', 'ctx.storageDomain', 'ctx.systemPrompt', 'a calling Agent for claim/complete/review tools'],
+    writes: ['taskboard/changed', 'storage-domain ticket records'],
+    async mount(ctx) {
+      const rootDir = mkdtempSync(join(tmpdir(), 'tool-catalog-taskboard-'))
+      await ctx.plugin(AgentRegistry)
+      await ctx.plugin(Storage)
+      await ctx.plugin(storageJson, { root: rootDir })
+      await ctx.plugin(storageDomain, { backend: 'json' })
+      await ctx.plugin(TaskboardService)
+    },
+    note:
+      'The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates.',
   },
   {
     pkg: '@deepseek-ai/dsh-schedule',

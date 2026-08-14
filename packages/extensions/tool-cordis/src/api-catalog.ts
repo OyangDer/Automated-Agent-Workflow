@@ -1737,6 +1737,97 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'taskboard',
+    summary: 'The taskboard service (ctx.taskboard): storage-backed tickets, workflow transitions, the browser Remote surface, and the model-facing tools.',
+    description: 'The taskboard service (ctx.taskboard): storage-backed tickets, workflow transitions, the browser Remote surface, and the model-facing tools.',
+    methods: [
+      {
+        signature: '@Remote(\'snapshot\') async snapshot(): Promise<BoardSnapshot>',
+        description: 'Whole-board snapshot, sorted by column then position.',
+        parameters: [],
+        returns: 'the live board snapshot.',
+      },
+      {
+        signature: '@Remote(\'create\') createRemote(request: CreateTicketRequest): Promise<TicketView>',
+        description: 'Create one ticket in Backlog through the Remote boundary.',
+        parameters: [{ name: 'request', description: 'title, description, priority, and ordering dependencies.' }],
+        returns: 'the created ticket.',
+      },
+      {
+        signature: '@Remote(\'move\') moveRemote(agent: Agent, request: MoveTicketRequest): Promise<TicketView>',
+        description: 'Move one ticket through the Remote boundary; entering In testing also assigns a fresh reviewer through the subagent seam.',
+        parameters: [{ name: 'agent', description: 'the session agent driving the move (reviewer parent).' }, { name: 'request', description: 'target column and optional position anchors.' }],
+        returns: 'the moved ticket.',
+      },
+      {
+        signature: '@Remote(\'edit\') async editRemote(request: EditTicketRequest): Promise<TicketView>',
+        description: 'Edit one ticket through the Remote boundary.',
+        parameters: [{ name: 'request', description: 'replacement content and dependency edges.' }],
+        returns: 'the edited ticket.',
+      },
+      {
+        signature: '@Remote(\'delete\') async removeRemote(request: RemoveTicketRequest): Promise<RemoveTicketResult>',
+        description: 'Remove one ticket through the Remote boundary.',
+        parameters: [{ name: 'request', description: 'the ticket to remove.' }],
+        returns: 'the removal receipt.',
+      },
+      {
+        signature: '@Remote(\'requestReview\') async requestReviewRemote(agent: Agent, request: RequestReviewRequest): Promise<TicketView>',
+        description: '(Re)assign a reviewer for one In testing ticket through the Remote boundary.',
+        parameters: [{ name: 'agent', description: 'the session agent spawning the reviewer child.' }, { name: 'request', description: 'the In testing ticket to review.' }],
+        returns: 'the ticket with its fresh reviewer attached.',
+      },
+      {
+        signature: 'async claim(agent: Agent, ticketId: string): Promise<TicketView>',
+        description: 'Agent claims a Not started ticket and becomes its owner.',
+        parameters: [{ name: 'agent', description: 'the claiming agent.' }, { name: 'ticketId', description: 'the Not started ticket to claim.' }],
+        returns: 'the claimed ticket, now In progress.',
+      },
+      {
+        signature: 'async claimReview(agent: Agent, ticketId: string): Promise<TicketView>',
+        description: 'Agent takes the empty review seat of one In testing ticket.',
+        parameters: [{ name: 'agent', description: 'the reviewing agent.' }, { name: 'ticketId', description: 'the In testing ticket with no reviewer.' }],
+        returns: 'the ticket with the reviewer attached.',
+      },
+      {
+        signature: 'async complete(agent: Agent, ticketId: string, devNotes: string): Promise<CompleteTicketResult>',
+        description: 'Owner marks development done; the ticket enters In testing and gets a reviewer.',
+        parameters: [{ name: 'agent', description: 'the owning developer agent.' }, { name: 'ticketId', description: 'the owned In progress ticket.' }, { name: 'devNotes', description: 'what changed and how it was verified.' }],
+        returns: 'the In testing ticket plus the reviewer-spawn outcome.',
+      },
+      {
+        signature: 'async approve(agent: Agent, ticketId: string, summary: string): Promise<TicketView>',
+        description: 'The designated reviewer approves; the ticket lands in Done.',
+        parameters: [{ name: 'agent', description: 'the designated reviewer agent.' }, { name: 'ticketId', description: 'the In testing ticket under review.' }, { name: 'summary', description: 'what was inspected and why it passes.' }],
+        returns: 'the approved Done ticket.',
+      },
+      {
+        signature: 'async reject(agent: Agent, ticketId: string, feedback: string): Promise<TicketView>',
+        description: 'The designated reviewer rejects; the ticket is returned for rework.',
+        parameters: [{ name: 'agent', description: 'the designated reviewer agent.' }, { name: 'ticketId', description: 'the In testing ticket under review.' }, { name: 'feedback', description: 'concrete, actionable rework feedback.' }],
+        returns: 'the rejected ticket, back In progress.',
+      },
+      {
+        signature: 'async updateOwn( agent: Agent, ticketId: string, title: string | undefined, description: string | undefined, devNotes: string | undefined, ): Promise<TicketView>',
+        description: 'Edit own-ticket content through the model-facing surface.',
+        parameters: [{ name: 'agent', description: 'the owning developer agent.' }, { name: 'ticketId', description: 'the owned ticket.' }, { name: 'title', description: 'replacement title, or undefined to keep it.' }, { name: 'description', description: 'replacement description, or undefined to keep it.' }, { name: 'devNotes', description: 'replacement notes, or undefined to keep them.' }],
+        returns: 'the updated ticket.',
+      },
+      {
+        signature: 'async listRows(column: ColumnId | null, mine: boolean, agentId: string): Promise<TicketRow[]>',
+        description: 'Whole-board rows for the model, optionally filtered.',
+        parameters: [{ name: 'column', description: 'column filter, or null for every column.' }, { name: 'mine', description: 'when true, only rows assigned to agentId.' }, { name: 'agentId', description: 'the calling agent\'s id.' }],
+        returns: 'the matching rows in position order.',
+      },
+      {
+        signature: 'async viewTicket(ticketId: string): Promise<TicketView>',
+        description: 'One full ticket for the model.',
+        parameters: [{ name: 'ticketId', description: 'the ticket to read.' }],
+        returns: 'the full ticket view.',
+      },
+    ],
+  },
+  {
     key: 'terminals',
     summary: 'In-process registry for replaceable PTY backends and exact-Agent sessions.',
     description: 'In-process registry for replaceable PTY backends and exact-Agent sessions.',
@@ -2510,6 +2601,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [],
   },
   {
+    name: 'taskboard/changed',
+    mode: 'emit',
+    signature: '\'taskboard/changed\'(change: TaskboardChanged): void',
+    summary: 'One durable taskboard mutation has committed.',
+    description: 'One durable taskboard mutation has committed. Forwarded to the browser verbatim; the payload is the fresh post-mutation ticket (null on removal).',
+    parameters: [{ name: 'change', description: 'the committed mutation with its post-state ticket.' }],
+  },
+  {
     name: 'tools/change',
     mode: 'emit',
     signature: '\'tools/change\'(): void',
@@ -2730,6 +2829,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface BashEnvVariableInfo extends BashEnvVariable {\n    contributor: string;\n    key: DshEnvironmentKey;\n}',
   },
   {
+    name: 'BoardSnapshot',
+    declaration: 'export interface BoardSnapshot {\n    tickets: TicketView[];\n}',
+  },
+  {
     name: 'Branded',
     declaration: 'export type Branded<B extends string> = string & {\n    readonly [BRAND]: B;\n};',
   },
@@ -2778,6 +2881,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CollectedOutput {\n    text: string;\n    truncated: boolean;\n    spillPath?: string;\n}',
   },
   {
+    name: 'ColumnId',
+    declaration: 'export type ColumnId = typeof TASKBOARD_COLUMNS[number];',
+  },
+  {
     name: 'CommandDefinition',
     declaration: 'export interface CommandDefinition {\n    readonly name: string;\n    readonly description: string;\n    readonly input?: CommandInputDescriptor;\n    readonly recordInput?: boolean;\n    readonly handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>;\n}',
   },
@@ -2820,6 +2927,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CompactionTrigger',
     declaration: 'export type CompactionTrigger = \'pressure\' | \'context-overflow\';',
+  },
+  {
+    name: 'CompleteTicketResult',
+    declaration: 'export interface CompleteTicketResult {\n    ticket: TicketView;\n    review: \'spawned\' | \'unavailable\' | \'failed\';\n    reviewerAgentId: string | null;\n}',
   },
   {
     name: 'ConfinedArgv',
@@ -2912,6 +3023,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'CreateSessionOptions',
     declaration: 'export interface CreateSessionOptions {\n    readonly seed?: readonly SessionEvent[];\n    readonly meta?: {\n        readonly cwd?: string;\n        readonly parentSession?: SessionId;\n        readonly createdAt?: number;\n        readonly seedLength?: number;\n        readonly origin?: \'subagent\';\n        readonly delegationDepth?: number;\n        readonly agentPreset?: string;\n    };\n}',
+  },
+  {
+    name: 'CreateTicketRequest',
+    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n}',
   },
   {
     name: 'CredentialInfo',
@@ -3024,6 +3139,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'EditGoalRequest',
     declaration: 'export interface EditGoalRequest {\n    readonly objective?: string;\n    readonly maxGoalRounds?: number;\n}',
+  },
+  {
+    name: 'EditTicketRequest',
+    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n}',
   },
   {
     name: 'EpochHeader',
@@ -3466,6 +3585,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ModelModalityMap {\n    text: \'text\';\n    image: \'image\';\n}',
   },
   {
+    name: 'MoveTicketRequest',
+    declaration: 'export interface MoveTicketRequest {\n    ticketId: string;\n    column: ColumnId;\n    beforeTicketId: string | null;\n    afterTicketId: string | null;\n}',
+  },
+  {
     name: 'ObjectJsonSchema',
     declaration: 'export type ObjectJsonSchema = JsonSchemaNode & {\n    type: \'object\';\n};',
   },
@@ -3512,6 +3635,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'PreToolDecision',
     declaration: 'export type PreToolDecision = {\n    kind: \'allow\';\n} | {\n    kind: \'deny\';\n    reason: string;\n} | {\n    kind: \'ask\';\n    reason?: string;\n};',
+  },
+  {
+    name: 'Priority',
+    declaration: 'export type Priority = typeof TASKBOARD_PRIORITIES[number];',
   },
   {
     name: 'ProjectionChangeListener',
@@ -3578,6 +3705,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface RedactedSecret {\n    path: string[];\n    set: boolean;\n}',
   },
   {
+    name: 'RemoveTicketRequest',
+    declaration: 'export interface RemoveTicketRequest {\n    ticketId: string;\n}',
+  },
+  {
+    name: 'RemoveTicketResult',
+    declaration: 'export interface RemoveTicketResult {\n    removedId: string;\n}',
+  },
+  {
     name: 'RequestContext',
     declaration: 'export interface RequestContext {\n    provider: string;\n    model: string;\n    contextWindow?: number;\n}',
   },
@@ -3588,6 +3723,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RequestHeaderReason',
     declaration: 'export type RequestHeaderReason = \'initial\' | \'resume\' | \'change\';',
+  },
+  {
+    name: 'RequestReviewRequest',
+    declaration: 'export interface RequestReviewRequest {\n    ticketId: string;\n}',
   },
   {
     name: 'RequestRunOutcome',
@@ -4242,6 +4381,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type TableValueOf<S extends DomainSpec, N extends keyof S[\'tables\']> = S[\'tables\'][N] extends DomainTableSpec<string, infer V> ? V : never;',
   },
   {
+    name: 'TaskboardChanged',
+    declaration: 'export interface TaskboardChanged {\n    operation: TaskboardOperation;\n    ticketId: string;\n    ticket: TicketView | null;\n}',
+  },
+  {
+    name: 'TaskboardOperation',
+    declaration: 'export type TaskboardOperation = \'create\' | \'move\' | \'edit\' | \'remove\' | \'claim\' | \'complete\' | \'approve\' | \'reject\' | \'review-claim\';',
+  },
+  {
     name: 'TerminalBackend',
     declaration: 'export interface TerminalBackend {\n    readonly type: string;\n    spawn(spec: TerminalBackendSpawnSpec): Promise<TerminalBackendSession>;\n}',
   },
@@ -4320,6 +4467,26 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'TerminalWaitReason',
     declaration: 'export type TerminalWaitReason = \'stdin_read\' | \'inferred_idle\' | \'timeout\' | \'session_exit\';',
+  },
+  {
+    name: 'TicketAssignee',
+    declaration: 'export interface TicketAssignee {\n    agentId: string;\n    label: string;\n}',
+  },
+  {
+    name: 'TicketHistoryEntry',
+    declaration: 'export interface TicketHistoryEntry {\n    at: number;\n    kind: string;\n    detail: string;\n}',
+  },
+  {
+    name: 'TicketReview',
+    declaration: 'export interface TicketReview {\n    outcome: \'approved\' | \'rejected\';\n    feedback: string;\n    reviewer: TicketAssignee;\n    attempt: number;\n    at: number;\n}',
+  },
+  {
+    name: 'TicketRow',
+    declaration: 'export interface TicketRow {\n    id: string;\n    title: string;\n    column: ColumnId;\n    priority: Priority;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReviewOutcome: \'approved\' | \'rejected\' | null;\n    dependsOn: string[];\n}',
+  },
+  {
+    name: 'TicketView',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    devNotes: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TodoItem',

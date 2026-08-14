@@ -355,6 +355,13 @@ const SERVICE_ROLES: ServiceRole[] = [
     note: 'Folds revisioned objective state from the session log and keeps live continuation activation process-local.',
   },
   {
+    key: 'taskboard',
+    pkg: 'taskboard',
+    title: 'Five-column kanban ticket domain',
+    mode: 'core',
+    note: 'Persists tickets through a storage domain, gates claims by dependencies and capacity, and hands In testing tickets to a spawned reviewer agent.',
+  },
+  {
     key: 'e2b',
     pkg: 'e2b',
     title: 'E2B sandbox lifecycle owner',

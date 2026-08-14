@@ -72,6 +72,8 @@
       "@deepseek-ai/dsh-cordis-host-runner/types": ["./packages/extensions/cordis-host-runner/src/types.ts"],
       "@deepseek-ai/dsh-goal/types": ["./packages/goal/goal/src/types.ts"],
       "@deepseek-ai/dsh-goal/client": ["./packages/goal/goal/src/client.ts"],
+      "@deepseek-ai/dsh-taskboard/types": ["./packages/taskboard/taskboard/src/types.ts"],
+      "@deepseek-ai/dsh-taskboard/client": ["./packages/taskboard/taskboard/src/client.ts"],
       "@deepseek-ai/dsh-llm/types": ["./packages/llm/llm/src/types.ts"],
       "@deepseek-ai/dsh-llm/brand": ["./packages/llm/llm/src/brand.ts"],
       "@deepseek-ai/dsh-llm-retry/types": ["./packages/llm/llm-retry/src/types.ts"],
@@ -122,6 +124,8 @@
         "./packages/attachment/*/src/invariant.ts",
         "./packages/spill/*/src/invariant.ts",
         "./packages/todo/*/src/invariant.ts",
+        "./packages/taskboard/*/src/invariant.ts",
+
         "./packages/bundle/*/src/invariant.ts",
         "./packages/extensions/*/src/invariant.ts",
         "./packages/sandbox/*/src/invariant.ts",
@@ -252,6 +256,8 @@
         "./packages/attachment/*/src",
         "./packages/spill/*/src",
         "./packages/todo/*/src",
+        "./packages/taskboard/*/src",
+
         "./packages/bundle/*/src",
         "./packages/extensions/*/src",
         "./packages/sandbox/*/src",

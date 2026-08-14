@@ -1,0 +1,104 @@
+.card {
+  background: var(--dsw-alias-bg-module-platform);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-left: 3px solid var(--taskboard-card-accent, var(--dsw-alias-border-l2));
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: grab;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.card:hover {
+  border-color: var(--dsw-alias-interactive-bg-hover-solid);
+}
+
+.cardSelected {
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: var(--dsw-shadow-lv3);
+}
+
+.cardDragging {
+  opacity: 0.5;
+}
+
+.cardTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.priority {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--taskboard-card-accent, var(--dsw-alias-label-secondary));
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.id {
+  font-family: var(--dsw-font-mono);
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--dsw-alias-label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cardTitle {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  margin: 0;
+  word-break: break-word;
+}
+
+.cardDescription {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  margin: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.cardMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.metaLabel {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.badge {
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.badgeReviewing {
+  color: var(--dsw-alias-state-warn-label);
+  background: var(--dsw-alias-state-warn-tertiary);
+}
+
+.badgeRejected {
+  color: var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-state-error-secondary);
+}
+
+.badgeApproved {
+  color: var(--dsw-alias-state-success-primary);
+  background: var(--dsw-alias-state-success-tertiary);
+}
