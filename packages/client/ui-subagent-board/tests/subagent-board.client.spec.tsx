@@ -39,6 +39,7 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     reviewAttempts: 0,
     lastReview: null,
     devNotes: '',
+    targetBranch: '',
     dependsOn: [],
     history: [],
     ...overrides,
