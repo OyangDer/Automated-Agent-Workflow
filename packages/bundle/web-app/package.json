@@ -75,6 +75,7 @@
     "@deepseek-ai/dsh-client-ui-sidebar": "workspace:^",
     "@deepseek-ai/dsh-client-ui-skill": "workspace:^",
     "@deepseek-ai/dsh-client-ui-subagent": "workspace:^",
+    "@deepseek-ai/dsh-client-ui-subagent-board": "workspace:^",
     "@deepseek-ai/dsh-client-ui-taskboard": "workspace:^",
     "@deepseek-ai/dsh-client-ui-theme": "workspace:^",
     "@deepseek-ai/dsh-client-ui-tool": "workspace:^",

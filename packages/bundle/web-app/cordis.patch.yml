@@ -251,6 +251,11 @@
     - id: ui-taskboard
       name: '@deepseek-ai/dsh-client-ui-taskboard'
 
+    # Subagent classification tab: this session's children grouped by their
+    # taskboard lifecycle (In progress / In testing / unassigned).
+    - id: ui-subagent-board
+      name: '@deepseek-ai/dsh-client-ui-subagent-board'
+
     # Per-message feedback: Like/Dislike plus an optional note in the
     # assistant-message action strip, over the messageFeedback Remote.
     - id: ui-message-feedback
