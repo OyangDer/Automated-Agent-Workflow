@@ -1,8 +1,10 @@
 /**
- * The taskboard domain service: durable five-column ticket storage, the
- * agent-facing workflow tools (list/claim/complete/approve/reject), the
- * browser Remote API, and automatic reviewer spawning when a ticket enters
- * In testing. Tickets persist through the storage-domain seam; every
+ * The taskboard domain service: durable five-column ticket storage across
+ * multiple boards, the master seat, the agent-facing workflow tools
+ * (list/claim/assign/report/fail/reassign/complete/approve/reject), the
+ * browser Remote API, automatic worker/reviewer spawning with a fixed worker
+ * model, and failure reclamation when a worker session ends without
+ * reporting. Tickets persist through the storage-domain seam; every
  * committed mutation emits the forwarded taskboard/changed event.
  * @module @deepseek-ai/dsh-taskboard
  */
@@ -21,18 +23,18 @@ import {
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 // Type-only: resolves ctx.get('subagents') through the subagent seam augmentation.
 import type {} from '@deepseek-ai/dsh-subagent'
-import type { SubagentStartRequest, SubagentRun } from '@deepseek-ai/dsh-subagent'
+import type { SubagentResult, SubagentStartRequest, SubagentRun } from '@deepseek-ai/dsh-subagent'
 import {
-  TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES,
+  TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
 import type {
-  BoardSnapshot, ColumnId, CreateTicketRequest, EditTicketRequest,
-  MoveTicketRequest, Priority, RemoveTicketRequest, RemoveTicketResult,
-  RequestReviewRequest, TaskboardChanged, TaskboardOperation, TicketAssignee,
-  TicketView,
+  ArchiveBoardRequest, BoardSnapshot, BoardView, ColumnId, CreateBoardRequest,
+  CreateTicketRequest, EditTicketRequest, MoveTicketRequest, Priority, RemoveTicketRequest,
+  RemoveTicketResult, RequestReviewRequest, TaskboardChanged, TaskboardOperation,
+  TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
-  agentLabel, appendHistory, buildReviewPrompt, reviewerLabel,
+  agentLabel, appendHistory, buildReviewPrompt, buildWorkerPrompt, reviewerLabel,
   TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 
@@ -43,6 +45,12 @@ const ticketSchema = zod.object({
   description: zod.string(),
   column: zod.enum(TASKBOARD_COLUMNS),
   priority: zod.enum(TASKBOARD_PRIORITIES),
+  boardId: zod.string().default('default'),
+  type: zod.enum(TASKBOARD_TYPES).default('feature'),
+  status: zod.enum(TASKBOARD_WORKER_STATUSES).default('claimed'),
+  workerAgentId: zod.string().optional(),
+  workerSessionId: zod.string().optional(),
+  failure: zod.object({ reason: zod.string(), at: zod.number() }).nullable().default(null),
   createdAt: zod.number(),
   updatedAt: zod.number(),
   position: zod.number(),
@@ -70,28 +78,57 @@ const ticketSchema = zod.object({
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
 })
 
-/** The taskboard storage domain declaration: one tickets table, no global. */
+/** The stored board record shape; validated at the durable boundary. */
+const boardSchema = zod.object({
+  boardId: zod.string().min(1),
+  name: zod.string(),
+  workspaceId: zod.string(),
+  masterAgentId: zod.string().nullable().default(null),
+  masterClaimedAt: zod.number().nullable().default(null),
+  handoverNotes: zod.string().default(''),
+  archivedAt: zod.number().nullable().default(null),
+})
+
+/** The taskboard storage domain declaration: tickets plus boards tables. */
 const TASKBOARD_DOMAIN = defineDomain({
   name: 'taskboard',
   version: 1,
   tables: {
     tickets: domainTable<string, TicketView>(ticketSchema),
+    boards: domainTable<string, BoardView>(boardSchema),
   },
 })
 
 /** Deployment knobs for the taskboard workflow. */
 export interface Config {
-  /** How many tickets may be In progress at once (parallel developer cap). */
+  /** How many tickets may be In progress at once (parallel developer cap for the v1 claim path). */
   maxInProgress?: number
   /** Subagent provider name used to spawn reviewer agents. */
   reviewProvider?: string
+  /** Model id for the master session (informational knob; the session's own model is authoritative). */
+  masterModel?: string
+  /** Model id used for every spawned worker and reviewer child. */
+  workerModel?: string
+  /** Subagent provider name used to spawn worker agents. */
+  workerProvider?: string
+  /** Master seat lease in milliseconds; a stale seat can be preempted. */
+  masterSeatTimeoutMs?: number
 }
 
 /** Schemastery configuration for the taskboard consumer. */
 export const Config: z<Config> = z.object({
   maxInProgress: z.number().default(4),
   reviewProvider: z.string().default('spawn'),
+  masterModel: z.string().default('deepseek-v4-pro-max'),
+  workerModel: z.string().default('deepseek-v4-flash'),
+  workerProvider: z.string().default('spawn'),
+  masterSeatTimeoutMs: z.number().default(900000),
 })
+
+/** One worker-spawn outcome. */
+export type WorkerSpawnResult =
+  | { ok: true; sessionId: string; run: SubagentRun }
+  | { ok: false; reason: 'unavailable' | 'failed' }
 
 /** One reviewer-spawn outcome. */
 export type ReviewSpawnResult =
@@ -105,12 +142,31 @@ export interface CompleteTicketResult {
   reviewerAgentId: string | null
 }
 
+/** Tool payload: the card plus what happened to the worker spawn. */
+export interface AssignTicketResult {
+  ticket: TicketView
+  worker: 'spawned' | 'unavailable' | 'failed'
+  workerAgentId: string | null
+}
+
+/** Tool payload: the card plus what happened to a re-dispatch worker spawn. */
+export interface ReassignTicketResult {
+  ticket: TicketView
+  worker: 'spawned' | 'unavailable' | 'failed' | null
+  workerAgentId: string | null
+}
+
 /** The compact row taskboard_list returns per ticket. */
 export interface TicketRow {
   id: string
   title: string
   column: ColumnId
   priority: Priority
+  boardId: string
+  type: TicketType
+  status: TicketWorkerStatus
+  workerAgentId: string | null
+  failure: TicketFailure | null
   position: number
   assignee: TicketAssignee | null
   reviewer: TicketAssignee | null
@@ -123,6 +179,14 @@ export interface TicketRow {
 function resolveMaxInProgress(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error('taskboard: maxInProgress must be a positive safe integer')
+  }
+  return value
+}
+
+/** Validate one explicit master-seat lease. */
+function resolveMasterSeatTimeout(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: masterSeatTimeoutMs must be a non-negative safe integer')
   }
   return value
 }
@@ -144,16 +208,42 @@ function resolveTitle(value: string): string {
   return title
 }
 
+/** Normalize a user-supplied board name at the domain boundary. */
+function resolveBoardName(value: string): string {
+  const name = typeof value === 'string' ? value.trim() : ''
+  if (name.length === 0) {
+    throw new TaskboardError('board name must be a non-empty string', 'TASKBOARD_INVALID_INPUT')
+  }
+  return name
+}
+
+/** Normalize a required free-text input at the domain boundary. */
+function resolveRequiredText(value: string, subject: string): string {
+  const text = typeof value === 'string' ? value.trim() : ''
+  if (text.length === 0) {
+    throw new TaskboardError(subject + ' must be a non-empty string', 'TASKBOARD_INVALID_INPUT')
+  }
+  return text
+}
+
 /**
- * The taskboard service (ctx.taskboard): storage-backed tickets, workflow
- * transitions, the browser Remote surface, and the model-facing tools.
+ * The taskboard service (ctx.taskboard): storage-backed tickets and boards,
+ * the master seat, workflow transitions, the browser Remote surface, and the
+ * model-facing tools.
  */
 export class TaskboardService extends TypertRemoteService {
   static inject = ['storageDomain', 'systemPrompt', 'tools']
 
   static Config = Config
 
-  private readonly resolved: { maxInProgress: number; reviewProvider: string }
+  private readonly resolved: {
+    maxInProgress: number
+    reviewProvider: string
+    masterModel: string
+    workerModel: string
+    workerProvider: string
+    masterSeatTimeoutMs: number
+  }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
   constructor(ctx: Context, config: Config = {}) {
@@ -161,6 +251,10 @@ export class TaskboardService extends TypertRemoteService {
     this.resolved = {
       maxInProgress: resolveMaxInProgress(config.maxInProgress ?? 4),
       reviewProvider: config.reviewProvider ?? 'spawn',
+      masterModel: config.masterModel ?? 'deepseek-v4-pro-max',
+      workerModel: config.workerModel ?? 'deepseek-v4-flash',
+      workerProvider: config.workerProvider ?? 'spawn',
+      masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
     }
     this.domain = ctx.storageDomain.open(TASKBOARD_DOMAIN)
     // The open races shutdown when the host unmounts before it resolves;
@@ -185,6 +279,11 @@ export class TaskboardService extends TypertRemoteService {
     return (await this.domain).table('tickets')
   }
 
+  /** Resolve the opened boards table. */
+  private async boards(): Promise<KvTable<string, BoardView>> {
+    return (await this.domain).table('boards')
+  }
+
   /** Translate storage-layer failures into domain errors. */
   private static translate(error: unknown, ticketId: string): never {
     if (error instanceof TaskboardError) throw error
@@ -206,13 +305,80 @@ export class TaskboardService extends TypertRemoteService {
     const table = await this.tickets()
     try {
       const next = await table.update(ticketId, fn)
-      const change: TaskboardChanged = { operation, ticketId, ticket: next }
+      const change: TaskboardChanged = { operation, ticketId, boardId: next.boardId, ticket: next }
       this.ctx.emit('taskboard/changed', change)
       return next
     } catch (error) {
       TaskboardService.translate(error, ticketId)
       /* v8 ignore next -- translate always throws */
       throw error
+    }
+  }
+
+  /** Atomically transform one board record; a missing board fails loudly. */
+  private async mutateBoard(boardId: string, fn: (current: BoardView) => BoardView): Promise<BoardView> {
+    const table = await this.boards()
+    try {
+      return await table.update(boardId, fn)
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'missing-key') {
+        throw new TaskboardError('board "' + boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Read one board record, lazily materializing the implicit record when the
+   * board is absent (the "default" board always exists implicitly).
+   */
+  private async ensureBoard(boardId: string, seed?: { name?: string; workspaceId?: string }): Promise<BoardView> {
+    const table = await this.boards()
+    const existing = table.get(boardId)
+    if (existing !== undefined) return existing
+    const record: BoardView = {
+      boardId,
+      name: seed?.name ?? boardId,
+      workspaceId: seed?.workspaceId ?? '',
+      masterAgentId: null,
+      masterClaimedAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+    }
+    await table.put(boardId, record)
+    return record
+  }
+
+  /** The display name of one board (the boardId itself while implicit). */
+  private async boardName(boardId: string): Promise<string> {
+    const table = await this.boards()
+    return table.get(boardId)?.name ?? boardId
+  }
+
+  /**
+   * Validate the board context of one ticket operation: the requested board
+   * (default "default") must be the ticket's own board.
+   */
+  private static boardContextOf(requestBoardId: string | undefined, ticket: TicketView): string {
+    const requested = requestBoardId ?? 'default'
+    if (ticket.boardId !== requested) {
+      throw new TaskboardError(
+        'ticket "' + ticket.id + '" is on board "' + ticket.boardId + '", not "' + requested + '"',
+        'TASKBOARD_INVALID_INPUT',
+      )
+    }
+    return ticket.boardId
+  }
+
+  /** Require the caller to be the current master of the ticket's board. */
+  private async assertMasterOfTicket(ticket: TicketView, agent: Agent): Promise<void> {
+    const table = await this.boards()
+    const board = table.get(ticket.boardId)
+    if (board === undefined || board.masterAgentId !== agent.id) {
+      throw new TaskboardError(
+        'only the master of board "' + ticket.boardId + '" may perform this action',
+        'TASKBOARD_NOT_MASTER',
+      )
     }
   }
 
@@ -298,12 +464,73 @@ export class TaskboardService extends TypertRemoteService {
         prompt,
         parent,
         signal: new AbortController().signal,
+        agentOptions: { model: this.resolved.workerModel },
       }
       const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
       return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) } }
     } catch {
       return { spawned: false, reason: 'failed' }
     }
+  }
+
+  /**
+   * Spawn the worker child for one ticket and attach termination
+   * reclamation to its run result.
+   */
+  private async spawnWorker(parent: Agent, ticket: TicketView, workerLabel?: string): Promise<WorkerSpawnResult> {
+    const subagents = this.ctx.get('subagents')
+    if (subagents === undefined) {
+      return { ok: false, reason: 'unavailable' }
+    }
+    try {
+      const cwd = parent.session.header.cwd
+      const request: SubagentStartRequest = {
+        label: workerLabel ?? ticket.title,
+        prompt: [{ type: 'text', text: buildWorkerPrompt(ticket, cwd) }],
+        parent,
+        signal: new AbortController().signal,
+        agentOptions: { model: this.resolved.workerModel },
+        toolFilter: { deny: WORKER_DENIED_TOOLS },
+      }
+      const run: SubagentRun = await subagents.start(this.resolved.workerProvider, request)
+      return { ok: true, sessionId: run.id, run }
+    } catch {
+      return { ok: false, reason: 'failed' }
+    }
+  }
+
+  /**
+   * Reclaim a card whose worker session settled without reporting: the card
+   * is still In progress and still owned by that session, so the worker was
+   * terminated mid-flight.
+   */
+  private trackWorkerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
+    const result: Promise<SubagentResult> | undefined = run.result
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- typed required, but seam stubs may omit result.
+    if (result === undefined) return
+    void result.then(
+      (outcome) => { void this.reclaimTerminatedWorker(ticketId, sessionId, outcome.stopReason).catch(() => {}) },
+      () => { void this.reclaimTerminatedWorker(ticketId, sessionId, 'error').catch(() => {}) },
+    )
+  }
+
+  /** Mark a card blocked when its worker session ended without reporting. */
+  private async reclaimTerminatedWorker(ticketId: string, sessionId: string, stopReason: string): Promise<void> {
+    await this.mutate(ticketId, 'fail', (current) => {
+      if (current.workerSessionId !== sessionId) return current
+      if (current.column !== 'in_progress' || current.status !== 'running') return current
+      const detail = 'worker terminated (' + stopReason + ')'
+      return appendHistory(
+        {
+          ...current,
+          status: 'blocked',
+          failure: { reason: detail, at: Date.now() },
+          updatedAt: Date.now(),
+        },
+        'fail',
+        detail,
+      )
+    })
   }
 
   /** Attach the designated reviewer to an In testing ticket. */
@@ -327,13 +554,18 @@ export class TaskboardService extends TypertRemoteService {
       throw new TaskboardError('unknown column "' + String(request.column) + '"', 'TASKBOARD_INVALID_COLUMN')
     }
     const table = await this.tickets()
+    const current = table.get(request.ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    TaskboardService.boardContextOf(request.boardId, current)
     const position = this.positionBetween(table, request.column, request.beforeTicketId, request.afterTicketId)
-    const ticket = await this.mutate(request.ticketId, 'move', current => appendHistory(
+    const ticket = await this.mutate(request.ticketId, 'move', moved => appendHistory(
       {
-        ...current,
+        ...moved,
         column: request.column,
         position,
-        reviewer: request.column === 'in_testing' ? current.reviewer : null,
+        reviewer: request.column === 'in_testing' ? moved.reviewer : null,
         updatedAt: Date.now(),
       },
       'move',
@@ -349,26 +581,84 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Whole-board snapshot, sorted by column then position.
+   * Whole-board snapshot, sorted by column then position, scoped to one
+   * board (default "default").
+   * @param boardId - the board to snapshot, or undefined for the default board.
    * @returns the live board snapshot.
    */
   @Remote('snapshot')
-  async snapshot(): Promise<BoardSnapshot> {
+  async snapshot(boardId?: string): Promise<BoardSnapshot> {
+    const board = boardId ?? 'default'
     const table = await this.openedTable()
     const rows: TicketView[] = []
-    for (const [, ticket] of table.entries()) rows.push(ticket)
+    for (const [, ticket] of table.entries()) {
+      if (ticket.boardId === board) rows.push(ticket)
+    }
     const tickets = rows.sort((a, b) => {
       const columnOrder = TASKBOARD_COLUMNS.indexOf(a.column) - TASKBOARD_COLUMNS.indexOf(b.column)
       return columnOrder !== 0 ? columnOrder : a.position - b.position
     })
-    return { tickets }
+    return { boardId: board, name: await this.boardName(board), tickets }
   }
 
   private openTable: KvTable<string, TicketView> | null = null
 
   /**
+   * List every board, the implicit "default" board first when absent.
+   * @returns the live board rows.
+   */
+  @Remote('listBoards')
+  async listBoards(): Promise<BoardView[]> {
+    const table = await this.boards()
+    const boards: BoardView[] = []
+    for (const [, board] of table.entries()) boards.push(board)
+    if (!boards.some(board => board.boardId === 'default')) {
+      boards.unshift({
+        boardId: 'default',
+        name: 'default',
+        workspaceId: '',
+        masterAgentId: null,
+        masterClaimedAt: null,
+        handoverNotes: '',
+        archivedAt: null,
+      })
+    }
+    return boards
+  }
+
+  /**
+   * Create one board through the Remote boundary.
+   * @param request - the board name and owning workspace.
+   * @returns the created board.
+   */
+  @Remote('createBoard')
+  async createBoardRemote(request: CreateBoardRequest): Promise<BoardView> {
+    const record: BoardView = {
+      boardId: 'board-' + randomUUID(),
+      name: resolveBoardName(request.name),
+      workspaceId: typeof request.workspaceId === 'string' ? request.workspaceId : '',
+      masterAgentId: null,
+      masterClaimedAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+    }
+    await (await this.boards()).put(record.boardId, record)
+    return record
+  }
+
+  /**
+   * Archive one board through the Remote boundary.
+   * @param request - the board to archive.
+   * @returns the archived board.
+   */
+  @Remote('archiveBoard')
+  async archiveBoardRemote(request: ArchiveBoardRequest): Promise<BoardView> {
+    return this.mutateBoard(request.boardId, current => ({ ...current, archivedAt: Date.now() }))
+  }
+
+  /**
    * Create one ticket in Backlog through the Remote boundary.
-   * @param request - title, description, priority, and ordering dependencies.
+   * @param request - title, description, priority, ordering dependencies, and optional boardId.
    * @returns the created ticket.
    */
   @Remote('create')
@@ -382,6 +672,10 @@ export class TaskboardService extends TypertRemoteService {
       description: typeof request.description === 'string' ? request.description : '',
       column: 'backlog' as ColumnId,
       priority,
+      boardId: request.boardId ?? 'default',
+      type: 'feature' as TicketType,
+      status: 'ready' as TicketWorkerStatus,
+      failure: null,
       createdAt: now,
       updatedAt: now,
       assignee: null,
@@ -406,7 +700,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     const stored = appendHistory({ ...record, position: max }, 'create', 'created in backlog', now)
     await table.put(stored.id, stored)
-    const change: TaskboardChanged = { operation: 'create', ticketId: stored.id, ticket: stored }
+    const change: TaskboardChanged = { operation: 'create', ticketId: stored.id, boardId: stored.boardId, ticket: stored }
     this.ctx.emit('taskboard/changed', change)
     return stored
   }
@@ -433,12 +727,17 @@ export class TaskboardService extends TypertRemoteService {
     const title = resolveTitle(request.title)
     const priority = TASKBOARD_PRIORITIES.includes(request.priority) ? request.priority : 'normal'
     const table = await this.openedTable()
+    const current = table.get(request.ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    TaskboardService.boardContextOf(request.boardId, current)
     this.validateDependencies(table, request.ticketId, request.dependsOn)
-    return this.mutate(request.ticketId, 'edit', current => appendHistory(
+    return this.mutate(request.ticketId, 'edit', edited => appendHistory(
       {
-        ...current,
+        ...edited,
         title,
-        description: typeof request.description === 'string' ? request.description : current.description,
+        description: typeof request.description === 'string' ? request.description : edited.description,
         priority,
         dependsOn: request.dependsOn,
         updatedAt: Date.now(),
@@ -456,11 +755,16 @@ export class TaskboardService extends TypertRemoteService {
   @Remote('delete')
   async removeRemote(request: RemoveTicketRequest): Promise<RemoveTicketResult> {
     const table = await this.tickets()
+    const current = table.get(request.ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    const boardId = TaskboardService.boardContextOf(request.boardId, current)
     const removed = await table.delete(request.ticketId)
     if (!removed) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
-    const change: TaskboardChanged = { operation: 'remove', ticketId: request.ticketId, ticket: null }
+    const change: TaskboardChanged = { operation: 'remove', ticketId: request.ticketId, boardId, ticket: null }
     this.ctx.emit('taskboard/changed', change)
     return { removedId: request.ticketId }
   }
@@ -479,6 +783,7 @@ export class TaskboardService extends TypertRemoteService {
     if (current === undefined) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
+    TaskboardService.boardContextOf(request.boardId, current)
     if (current.column !== 'in_testing') {
       throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
     }
@@ -490,7 +795,271 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Agent claims a Not started ticket and becomes its owner.
+   * Claim the master seat of one board; a stale seat (past the lease) can be
+   * preempted, and an unclaimed board is claimed by this agent.
+   * @param boardId - the board to claim.
+   * @param agent - the claiming session agent.
+   * @returns the board with its fresh master.
+   */
+  async claimMaster(boardId: string, agent: Agent): Promise<BoardView> {
+    await this.ensureBoard(boardId)
+    const now = Date.now()
+    return this.mutateBoard(boardId, (current) => {
+      if (current.masterAgentId !== null && current.masterAgentId !== agent.id) {
+        const stale = current.masterClaimedAt !== null
+          && now - current.masterClaimedAt >= this.resolved.masterSeatTimeoutMs
+        if (!stale) {
+          throw new TaskboardError(
+            'board "' + boardId + '" master seat is held by ' + current.masterAgentId,
+            'TASKBOARD_MASTER_HELD',
+          )
+        }
+      }
+      return { ...current, masterAgentId: agent.id, masterClaimedAt: now }
+    })
+  }
+
+  /**
+   * Release the master seat of one board; only the current master may.
+   * @param boardId - the board to release.
+   * @param agent - the current master.
+   * @returns the board with an empty seat.
+   */
+  async releaseMaster(boardId: string, agent: Agent): Promise<BoardView> {
+    return this.mutateBoard(boardId, (current) => {
+      if (current.masterAgentId !== agent.id) {
+        throw new TaskboardError('only the current master may release the seat', 'TASKBOARD_NOT_MASTER')
+      }
+      return { ...current, masterAgentId: null, masterClaimedAt: null }
+    })
+  }
+
+  /**
+   * Transfer the master seat to another session agent with handover notes.
+   * @param boardId - the board to transfer.
+   * @param fromAgent - the current master.
+   * @param toAgentId - the receiving session agent id.
+   * @param handoverNotes - notes for the next master.
+   * @returns the board with the new master.
+   */
+  async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView> {
+    return this.mutateBoard(boardId, (current) => {
+      if (current.masterAgentId !== fromAgent.id) {
+        throw new TaskboardError('only the current master may transfer the seat', 'TASKBOARD_NOT_MASTER')
+      }
+      if (typeof toAgentId !== 'string' || toAgentId.trim() === '') {
+        throw new TaskboardError('transfer target agent id must be a non-empty string', 'TASKBOARD_INVALID_INPUT')
+      }
+      return {
+        ...current,
+        masterAgentId: toAgentId,
+        masterClaimedAt: Date.now(),
+        handoverNotes: typeof handoverNotes === 'string' ? handoverNotes : '',
+      }
+    })
+  }
+
+  /**
+   * Master assigns a Not started ticket to a freshly spawned worker: the
+   * card moves to In progress, status running, and a worker subagent is
+   * spawned immediately; on success its id is recorded on the card.
+   * @param agent - the master session agent.
+   * @param ticketId - the Not started ticket to dispatch.
+   * @param workerLabel - optional display label for the worker child.
+   * @returns the card plus the worker-spawn outcome.
+   */
+  async assign(agent: Agent, ticketId: string, workerLabel?: string): Promise<AssignTicketResult> {
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    const running = await this.mutate(ticketId, 'assign', (ticket) => {
+      if (ticket.column !== 'not_started') {
+        throw new TaskboardError(
+          'ticket "' + ticket.id + '" is in "' + ticket.column + '" (assign requires Not started)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      return appendHistory(
+        {
+          ...ticket,
+          column: 'in_progress',
+          status: 'running',
+          assignee: { agentId: agent.id, label: agentLabel(agent) },
+          failure: null,
+          updatedAt: Date.now(),
+        },
+        'assign',
+        'assigned to a worker by master ' + agentLabel(agent),
+      )
+    })
+    const spawn = await this.spawnWorker(agent, running, workerLabel)
+    if (!spawn.ok) {
+      const blocked = await this.mutate(ticketId, 'fail', ticket => ({
+        ...ticket,
+        status: 'blocked',
+        failure: { reason: 'worker spawn ' + spawn.reason, at: Date.now() },
+        updatedAt: Date.now(),
+      })).catch(() => running)
+      return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
+    }
+    const withWorker = await this.mutate(ticketId, 'assign', ticket => ({
+      ...ticket,
+      workerAgentId: spawn.sessionId,
+      workerSessionId: spawn.sessionId,
+      updatedAt: Date.now(),
+    }))
+    // Attach termination reclamation only after the worker identity is durable:
+    // an already-settled run (e.g. an infrastructure rejection) fires its
+    // settlement callback immediately, and the reclaim must see the card's
+    // workerSessionId to avoid a spurious no-op.
+    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run)
+    return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
+  }
+
+  /**
+   * The assigned worker reports development done; the ticket enters In
+   * testing and a reviewer (same worker model) is spawned.
+   * @param agent - the assigned worker session agent.
+   * @param ticketId - the owned In progress ticket.
+   * @param devNotes - what changed and how it was verified.
+   * @returns the In testing ticket plus the reviewer-spawn outcome.
+   */
+  async report(agent: Agent, ticketId: string, devNotes: string): Promise<CompleteTicketResult> {
+    const notes = resolveRequiredText(devNotes, 'report devNotes')
+    const ticket = await this.mutate(ticketId, 'report', (current) => {
+      if (current.workerAgentId !== agent.id) {
+        throw new TaskboardError('only the assigned worker may report the ticket', 'TASKBOARD_NOT_WORKER')
+      }
+      if (current.column !== 'in_progress') {
+        throw new TaskboardError(
+          'ticket "' + current.id + '" is in "' + current.column + '" (report requires In progress)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      return appendHistory(
+        { ...current, column: 'in_testing', status: 'claimed', devNotes: notes, updatedAt: Date.now() },
+        'report',
+        'worker reported development done, waiting for review',
+      )
+    })
+    const spawn = await this.spawnReviewer(agent, ticket)
+    if (!spawn.spawned) {
+      return { ticket, review: spawn.reason, reviewerAgentId: null }
+    }
+    const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
+    return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
+  }
+
+  /**
+   * The assigned worker reports failure; the card stays In progress but is
+   * marked blocked with a durable failure record.
+   * @param agent - the assigned worker session agent.
+   * @param ticketId - the owned In progress ticket.
+   * @param reason - the concrete failure reason.
+   * @returns the blocked ticket.
+   */
+  async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView> {
+    const notes = resolveRequiredText(reason, 'fail reason')
+    return this.mutate(ticketId, 'fail', (current) => {
+      if (current.workerAgentId !== agent.id) {
+        throw new TaskboardError('only the assigned worker may report failure', 'TASKBOARD_NOT_WORKER')
+      }
+      if (current.column !== 'in_progress') {
+        throw new TaskboardError(
+          'ticket "' + current.id + '" is in "' + current.column + '" (fail requires In progress)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      return appendHistory(
+        { ...current, status: 'blocked', failure: { reason: notes, at: Date.now() }, updatedAt: Date.now() },
+        'fail',
+        'worker reported failure',
+      )
+    })
+  }
+
+  /**
+   * Master re-dispatches one card: "retry" spawns a fresh worker (card back
+   * to running, failure cleared), "backlog" returns the card to Not started.
+   * @param agent - the master session agent.
+   * @param ticketId - the In progress card to re-dispatch.
+   * @param action - retry or backlog.
+   * @param workerLabel - optional display label for a retry worker.
+   * @returns the re-dispatched card plus the worker-spawn outcome.
+   */
+  async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult> {
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    if (action === 'backlog') {
+      const ticket = await this.mutate(ticketId, 'reassign', (returned) => {
+        if (returned.column !== 'in_progress') {
+          throw new TaskboardError(
+            'ticket "' + returned.id + '" is in "' + returned.column + '" (backlog requires In progress)',
+            'TASKBOARD_INVALID_TRANSITION',
+          )
+        }
+        const reset: TicketView = {
+          ...returned,
+          column: 'not_started',
+          status: 'ready',
+          assignee: null,
+          failure: null,
+          reviewer: null,
+          updatedAt: Date.now(),
+        }
+        delete reset.workerAgentId
+        delete reset.workerSessionId
+        return appendHistory(
+          reset,
+          'reassign',
+          'returned to Not started by master',
+        )
+      })
+      return { ticket, worker: null, workerAgentId: null }
+    }
+    const running = await this.mutate(ticketId, 'reassign', (retried) => {
+      if (retried.column !== 'in_progress') {
+        throw new TaskboardError(
+          'ticket "' + retried.id + '" is in "' + retried.column + '" (retry requires In progress)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      return appendHistory(
+        { ...retried, status: 'running', failure: null, updatedAt: Date.now() },
+        'reassign',
+        're-dispatched by master',
+      )
+    })
+    const spawn = await this.spawnWorker(agent, running, workerLabel)
+    if (!spawn.ok) {
+      const blocked = await this.mutate(ticketId, 'fail', ticket => ({
+        ...ticket,
+        status: 'blocked',
+        failure: { reason: 'worker spawn ' + spawn.reason, at: Date.now() },
+        updatedAt: Date.now(),
+      })).catch(() => running)
+      return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
+    }
+    const withWorker = await this.mutate(ticketId, 'reassign', ticket => ({
+      ...ticket,
+      workerAgentId: spawn.sessionId,
+      workerSessionId: spawn.sessionId,
+      updatedAt: Date.now(),
+    }))
+    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run)
+    return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
+  }
+
+  /**
+   * Agent claims a Not started ticket and becomes its owner (v1 path, kept
+   * for boards without a master seat).
    * @param agent - the claiming agent.
    * @param ticketId - the Not started ticket to claim.
    * @returns the claimed ticket, now In progress.
@@ -534,6 +1103,7 @@ export class TaskboardService extends TypertRemoteService {
         {
           ...current,
           column: 'in_progress',
+          status: 'claimed',
           assignee: { agentId: agent.id, label },
           reviewer: null,
           updatedAt: Date.now(),
@@ -566,7 +1136,7 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Owner marks development done; the ticket enters In testing and gets a
-   * reviewer.
+   * reviewer (v1 path).
    * @param agent - the owning developer agent.
    * @param ticketId - the owned In progress ticket.
    * @param devNotes - what changed and how it was verified.
@@ -617,6 +1187,7 @@ export class TaskboardService extends TypertRemoteService {
         {
           ...current,
           column: 'done',
+          status: 'claimed',
           reviewAttempts: current.reviewAttempts + 1,
           lastReview: {
             outcome: 'approved',
@@ -656,6 +1227,7 @@ export class TaskboardService extends TypertRemoteService {
         {
           ...current,
           column: 'in_progress',
+          status: 'claimed',
           reviewAttempts: current.reviewAttempts + 1,
           lastReview: {
             outcome: 'rejected',
@@ -725,6 +1297,11 @@ export class TaskboardService extends TypertRemoteService {
         title: ticket.title,
         column: ticket.column,
         priority: ticket.priority,
+        boardId: ticket.boardId,
+        type: ticket.type,
+        status: ticket.status,
+        workerAgentId: ticket.workerAgentId ?? null,
+        failure: ticket.failure,
         position: ticket.position,
         assignee: ticket.assignee,
         reviewer: ticket.reviewer,
@@ -776,6 +1353,24 @@ export class TaskboardService extends TypertRemoteService {
         title: { type: 'string' as const, required: true as const },
         column: { type: 'string' as const, required: true as const, enum: [...TASKBOARD_COLUMNS] },
         priority: { type: 'string' as const, required: true as const, enum: [...TASKBOARD_PRIORITIES] },
+        boardId: { type: 'string' as const, required: true as const },
+        type: { type: 'string' as const, required: true as const, enum: [...TASKBOARD_TYPES] },
+        status: { type: 'string' as const, required: true as const, enum: [...TASKBOARD_WORKER_STATUSES] },
+        workerAgentId: {
+          oneOf: [
+            { type: 'string' as const },
+            { type: 'null' as const },
+          ] as const, required: true as const,
+        },
+        failure: {
+          oneOf: [
+            { type: 'object' as const, additionalProperties: false, properties: {
+              reason: { type: 'string' as const, required: true as const },
+              at: { type: 'number' as const, required: true as const },
+            } },
+            { type: 'null' as const },
+          ] as const, required: true as const,
+        },
         position: { type: 'number' as const, required: true as const },
         assignee: {
           oneOf: [
@@ -863,6 +1458,11 @@ export class TaskboardService extends TypertRemoteService {
             description: { type: 'string', required: true },
             column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
             priority: { type: 'string', required: true, enum: [...TASKBOARD_PRIORITIES] },
+            boardId: { type: 'string', required: true },
+            type: { type: 'string', required: true, enum: [...TASKBOARD_TYPES] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+            workerAgentId: TaskboardService.ticketRowSchema().properties.workerAgentId,
+            failure: TaskboardService.ticketRowSchema().properties.failure,
             createdAt: { type: 'number', required: true },
             updatedAt: { type: 'number', required: true },
             position: { type: 'number', required: true },
@@ -889,11 +1489,46 @@ export class TaskboardService extends TypertRemoteService {
             },
             devNotes: { type: 'string', required: true },
             dependsOn: { type: 'array', required: true, items: { type: 'string' } },
+            history: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  at: { type: 'number', required: true },
+                  kind: { type: 'string', required: true },
+                  detail: { type: 'string', required: true },
+                },
+              },
+            },
           },
         },
-        render: (_args, value: TicketView) => [{ type: 'text' as const, text: 'ticket ' + value.id + ': ' + value.title }],
+        render: (_args, value: { id: string; title: string }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ': ' + value.title }],
       },
-      execute: async (args: { ticketId: string }) => this.viewTicket(args.ticketId),
+      execute: async (args: { ticketId: string }) => {
+        const ticket = await this.viewTicket(args.ticketId)
+        return {
+          id: ticket.id,
+          title: ticket.title,
+          description: ticket.description,
+          column: ticket.column,
+          priority: ticket.priority,
+          boardId: ticket.boardId,
+          type: ticket.type,
+          status: ticket.status,
+          workerAgentId: ticket.workerAgentId ?? null,
+          failure: ticket.failure,
+          createdAt: ticket.createdAt,
+          updatedAt: ticket.updatedAt,
+          position: ticket.position,
+          assignee: ticket.assignee,
+          reviewer: ticket.reviewer,
+          reviewAttempts: ticket.reviewAttempts,
+          lastReview: ticket.lastReview,
+          devNotes: ticket.devNotes,
+          dependsOn: ticket.dependsOn,
+          history: ticket.history,
+        }
+      },
       presentCall: args => ({ card: 'generic' as const, title: 'View taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
     }))
 
@@ -1057,7 +1692,222 @@ export class TaskboardService extends TypertRemoteService {
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Update taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
     }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_claim_master',
+      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to claim. Omit for the default board.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            name: { type: 'string', required: true },
+            masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+          },
+        },
+        render: (_args, value: { boardId: string; masterAgentId: string | null }) => [{
+          type: 'text' as const,
+          text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId),
+        }],
+      },
+      execute: async (args: { boardId?: string }, exec) => {
+        const board = await this.claimMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        return { boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Claim taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_release_master',
+      description: 'Release the master seat of a taskboard board (default board "default"); only the current master may release. After release, another agent may claim the seat.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to release. Omit for the default board.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+          },
+        },
+        render: (_args, value: { boardId: string }) => [{ type: 'text' as const, text: 'master seat of board ' + value.boardId + ' released' }],
+      },
+      execute: async (args: { boardId?: string }, exec) => {
+        const board = await this.releaseMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        return { boardId: board.boardId, masterAgentId: board.masterAgentId }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Release taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_assign',
+      description: 'Dispatch a Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The Not started ticket to dispatch.' },
+        workerLabel: {
+          type: 'string' as const,
+          description: 'Optional display label for the worker subagent; defaults to the ticket title.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ticketId: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+            worker: { type: 'string', required: true, enum: ['spawned', 'unavailable', 'failed'] },
+            workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+          },
+        },
+        render: (_args, value: { ticketId: string; worker: string; workerAgentId: string | null }) => [{
+          type: 'text' as const,
+          text: value.worker === 'spawned'
+            ? 'ticket ' + value.ticketId + ' dispatched; worker ' + String(value.workerAgentId) + ' started'
+            : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker,
+        }],
+      },
+      execute: async (args: { ticketId: string; workerLabel?: string }, exec) => {
+        const result = await this.assign(TaskboardService.agentOf(exec), args.ticketId, args.workerLabel)
+        return {
+          ticketId: result.ticket.id,
+          column: result.ticket.column,
+          status: result.ticket.status,
+          worker: result.worker,
+          workerAgentId: result.workerAgentId,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Assign taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_report',
+      description: 'Report taskboard ticket development as complete (assigned worker only): the card moves to In testing and the board automatically assigns a fresh reviewer agent. devNotes summarizes what changed, which files were touched, and how it was verified — the reviewer reads exactly that.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The ticket this worker was assigned.' },
+        devNotes: {
+          type: 'string' as const, required: true,
+          description: 'What was implemented, files/areas touched, and how it was verified (tests run, manual checks).',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ticketId: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            review: { type: 'string', required: true, enum: ['spawned', 'unavailable', 'failed'] },
+            reviewerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+          },
+        },
+        render: (_args, value: { ticketId: string; review: string; reviewerAgentId: string | null }) => [{
+          type: 'text' as const,
+          text: value.review === 'spawned'
+            ? 'ticket ' + value.ticketId + ' reported done; reviewer ' + String(value.reviewerAgentId) + ' assigned'
+            : 'ticket ' + value.ticketId + ' reported done but reviewer spawn ' + value.review,
+        }],
+      },
+      execute: async (args: { ticketId: string; devNotes: string }, exec) => {
+        const result = await this.report(TaskboardService.agentOf(exec), args.ticketId, args.devNotes)
+        return { ticketId: result.ticket.id, column: result.ticket.column, review: result.review, reviewerAgentId: result.reviewerAgentId }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Report taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_fail',
+      description: 'Report a taskboard ticket as failed (assigned worker only): the card stays In progress but is marked blocked with your failure reason so the master can re-dispatch it.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The ticket this worker was assigned.' },
+        reason: { type: 'string' as const, required: true, description: 'Concrete failure reason (blocked, missing access, irrecoverable error).' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+            failure: TaskboardService.ticketRowSchema().properties.failure,
+          },
+        },
+        render: (_args, value: { id: string }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' marked blocked' }],
+      },
+      execute: async (args: { ticketId: string; reason: string }, exec) => {
+        const value = await this.fail(TaskboardService.agentOf(exec), args.ticketId, args.reason)
+        return { id: value.id, column: value.column, status: value.status, failure: value.failure }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Fail taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_reassign',
+      description: 'Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The In progress card to re-dispatch.' },
+        action: {
+          type: 'string' as const, required: true, enum: ['retry', 'backlog'],
+          description: 'retry spawns a new worker; backlog returns the card to Not started.',
+        },
+        workerLabel: {
+          type: 'string' as const,
+          description: 'Optional display label for a retry worker subagent.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ticketId: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+            worker: { oneOf: [{ type: 'string', enum: ['spawned', 'unavailable', 'failed'] }, { type: 'null' }] as const, required: true },
+            workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+          },
+        },
+        render: (_args, value: { ticketId: string; worker: string | null }) => [{
+          type: 'text' as const,
+          text: value.worker === 'spawned'
+            ? 'ticket ' + value.ticketId + ' re-dispatched; new worker started'
+            : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker),
+        }],
+      },
+      execute: async (args: { ticketId: string; action: 'retry' | 'backlog'; workerLabel?: string }, exec) => {
+        const result = await this.reassign(TaskboardService.agentOf(exec), args.ticketId, args.action, args.workerLabel)
+        return {
+          ticketId: result.ticket.id,
+          column: result.ticket.column,
+          status: result.ticket.status,
+          worker: result.worker,
+          workerAgentId: result.workerAgentId,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Reassign taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
   }
 }
+
+/**
+ * Administrative taskboard tools denied to spawned workers: the worker only
+ * reports (taskboard_report) or fails (taskboard_fail); everything else on
+ * the board belongs to the master. Only names registered in the global tool
+ * registry may be denied — tools.restrict() rejects unknown names loudly, so
+ * future administrative tools must be appended here when they land.
+ */
+const WORKER_DENIED_TOOLS = [
+  'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
+  'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
+  'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
+] as const
 
 export default TaskboardService

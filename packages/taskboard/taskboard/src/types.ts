@@ -20,6 +20,26 @@ export const TASKBOARD_PRIORITIES = ['low', 'normal', 'high'] as const
 /** One ticket priority. */
 export type Priority = typeof TASKBOARD_PRIORITIES[number]
 
+/** The ticket kind vocabulary, shown as a badge on the card. */
+export const TASKBOARD_TYPES = ['feature', 'bugfix', 'refactor', 'docs', 'test', 'merge', 'infra', 'chore', 'spike'] as const
+
+/** One ticket kind. */
+export type TicketType = typeof TASKBOARD_TYPES[number]
+
+/** The worker lifecycle of one card (v2 dispatch protocol). */
+export const TASKBOARD_WORKER_STATUSES = ['ready', 'claimed', 'running', 'blocked'] as const
+
+/** One worker lifecycle state. */
+export type TicketWorkerStatus = typeof TASKBOARD_WORKER_STATUSES[number]
+
+/** One durable worker-failure record, written by taskboard_fail or auto-reclamation. */
+export interface TicketFailure {
+  /** Human-readable failure reason. */
+  reason: string
+  /** Unix epoch milliseconds when the failure was recorded. */
+  at: number
+}
+
 /** Compact attribution of a card to one agent (developer or reviewer). */
 export interface TicketAssignee {
   /** The owning agent/session id. */
@@ -55,6 +75,18 @@ export interface TicketView {
   description: string
   column: ColumnId
   priority: Priority
+  /** The board this ticket belongs to; one Sprint one board. */
+  boardId: string
+  /** Ticket kind badge. */
+  type: TicketType
+  /** Worker lifecycle; blocked marks a failed/terminated worker (card stays In progress). */
+  status: TicketWorkerStatus
+  /** The spawned worker agent/session id; absent until taskboard_assign spawns one. */
+  workerAgentId?: string | undefined
+  /** The spawned worker run session id (equals workerAgentId for in-process spawns). */
+  workerSessionId?: string | undefined
+  /** Last worker failure; null while the card is healthy. */
+  failure: TicketFailure | null
   createdAt: number
   updatedAt: number
   /** Sort key inside a column; lower sorts first. */
@@ -73,8 +105,25 @@ export interface TicketView {
   history: TicketHistoryEntry[]
 }
 
+/** One board row surfaced by the Remote API and the master-seat domain operations. */
+export interface BoardView {
+  boardId: string
+  name: string
+  workspaceId: string
+  /** The session agent holding the master seat, or null when unclaimed. */
+  masterAgentId: string | null
+  /** When the master seat was claimed; null while unclaimed. */
+  masterClaimedAt: number | null
+  /** Handover notes written on transferMaster, for the next master. */
+  handoverNotes: string
+  /** When the board was archived; null while active. */
+  archivedAt: number | null
+}
+
 /** Whole-board snapshot returned by the Remote API. */
 export interface BoardSnapshot {
+  boardId: string
+  name: string
   tickets: TicketView[]
 }
 
@@ -82,11 +131,14 @@ export interface BoardSnapshot {
 export type TaskboardOperation =
   | 'create' | 'move' | 'edit' | 'remove'
   | 'claim' | 'complete' | 'approve' | 'reject' | 'review-claim'
+  | 'assign' | 'report' | 'fail' | 'reassign'
 
 /** The durable-change notification forwarded to the browser. */
 export interface TaskboardChanged {
   operation: TaskboardOperation
   ticketId: string
+  /** The board the mutation targeted. */
+  boardId: string
   /** Full post-mutation view; null only for a removal. */
   ticket: TicketView | null
 }
@@ -98,6 +150,8 @@ export interface CreateTicketRequest {
   priority: Priority
   /** Ticket ids this ticket waits for; all must exist and be open to completion. */
   dependsOn: string[]
+  /** Target board; defaults to "default" for v1 compatibility. */
+  boardId?: string
 }
 
 /** User drags a ticket to another column, optionally next to an anchor. */
@@ -108,6 +162,8 @@ export interface MoveTicketRequest {
   beforeTicketId: string | null
   /** Insert immediately after this ticket's position; used when before is null. */
   afterTicketId: string | null
+  /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
+  boardId?: string
 }
 
 /** User edits ticket content and ordering constraints. */
@@ -117,16 +173,33 @@ export interface EditTicketRequest {
   description: string
   priority: Priority
   dependsOn: string[]
+  /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
+  boardId?: string
 }
 
 /** User deletes a ticket from the board. */
 export interface RemoveTicketRequest {
   ticketId: string
+  /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
+  boardId?: string
 }
 
 /** User asks the board to (re)assign a reviewer for an In testing ticket. */
 export interface RequestReviewRequest {
   ticketId: string
+  /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
+  boardId?: string
+}
+
+/** User creates a board through the Remote API. */
+export interface CreateBoardRequest {
+  name: string
+  workspaceId: string
+}
+
+/** User archives a board through the Remote API. */
+export interface ArchiveBoardRequest {
+  boardId: string
 }
 
 /** Result of a removal. */
@@ -139,7 +212,7 @@ declare module '@deepseek-ai/cordis' {
     /**
      * One durable taskboard mutation has committed. Forwarded to the browser
      * verbatim; the payload is the fresh post-mutation ticket (null on
-     * removal).
+     * removal) and the board the mutation targeted.
      * @param change - the committed mutation with its post-state ticket.
      * @mode emit
      */

@@ -17,7 +17,8 @@ export { TaskboardError } from './domain.ts'
 export type { TaskboardErrorCode } from './domain.ts'
 import TaskboardService from './service.ts'
 export type {
-  ReviewSpawnResult, CompleteTicketResult, TicketRow, Config,
+  ReviewSpawnResult, WorkerSpawnResult, CompleteTicketResult, AssignTicketResult,
+  ReassignTicketResult, TicketRow, Config,
 } from './service.ts'
 export { default } from './service.ts'
 
