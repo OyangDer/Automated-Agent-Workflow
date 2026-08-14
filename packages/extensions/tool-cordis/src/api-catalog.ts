@@ -1742,21 +1742,21 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'The taskboard service (ctx.taskboard): storage-backed tickets and boards, the master seat, workflow transitions, the browser Remote surface, and the model-facing tools.',
     methods: [
       {
-        signature: '@Remote(\'snapshot\') async snapshot(boardId?: string): Promise<BoardSnapshot>',
-        description: 'Whole-board snapshot, sorted by column then position, scoped to one board (default "default").',
-        parameters: [{ name: 'boardId', description: 'the board to snapshot, or undefined for the default board.' }],
+        signature: '@Remote(\'snapshot\') async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot>',
+        description: 'Whole-board snapshot, sorted by column then position, scoped to one board the caller may see: its own workspace\'s boards plus the unowned ones. A board owned by another workspace is denied as not found.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace scopes the board.' }, { name: 'boardId', description: 'the board to snapshot, or undefined for the caller\'s default board.' }],
         returns: 'the live board snapshot.',
       },
       {
-        signature: '@Remote(\'listBoards\') async listBoards(): Promise<BoardView[]>',
-        description: 'List every board, the implicit "default" board first when absent.',
-        parameters: [],
-        returns: 'the live board rows.',
+        signature: '@Remote(\'listBoards\') async listBoards(agent: Agent): Promise<BoardView[]>',
+        description: 'List every board the caller may see: its own workspace\'s boards plus the unowned ones. The implicit unowned "default" board row is reported first when no record exists for it yet (v1 compatibility).',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace scopes the listing.' }],
+        returns: 'the visible board rows.',
       },
       {
-        signature: '@Remote(\'createBoard\') async createBoardRemote(request: CreateBoardRequest): Promise<BoardView>',
-        description: 'Create one board through the Remote boundary.',
-        parameters: [{ name: 'request', description: 'the board name and owning workspace.' }],
+        signature: '@Remote(\'createBoard\') async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView>',
+        description: 'Create one board through the Remote boundary. The board is stamped with the caller\'s workspace (\'\' when unowned); any workspaceId in the request is ignored.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its workspace owns the board.' }, { name: 'request', description: 'the board name.' }],
         returns: 'the created board.',
       },
       {
@@ -3110,7 +3110,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'CreateBoardRequest',
-    declaration: 'export interface CreateBoardRequest {\n    name: string;\n    workspaceId: string;\n}',
+    declaration: 'export interface CreateBoardRequest {\n    name: string;\n    workspaceId?: string;\n}',
   },
   {
     name: 'CreateGoalRequest',

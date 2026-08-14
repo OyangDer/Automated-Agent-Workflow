@@ -125,6 +125,7 @@ export interface TicketView {
 export interface BoardView {
   boardId: string
   name: string
+  /** The owning workspace id; empty when the board is unowned (shared across workspaces). */
   workspaceId: string
   /** The session agent holding the master seat, or null when unclaimed. */
   masterAgentId: string | null
@@ -214,7 +215,8 @@ export interface RequestReviewRequest {
 /** User creates a board through the Remote API. */
 export interface CreateBoardRequest {
   name: string
-  workspaceId: string
+  /** Ignored by the host: the board's workspace is stamped from the caller's session cwd. */
+  workspaceId?: string
 }
 
 /** User archives a board through the Remote API. */

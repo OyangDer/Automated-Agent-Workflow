@@ -93,24 +93,32 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 ```ts cordis-catalog
 /**
  * Whole-board snapshot, sorted by column then position, scoped to one
- * board (default "default").
- * @param boardId - the board to snapshot, or undefined for the default board.
+ * board the caller may see: its own workspace's boards plus the unowned
+ * ones. A board owned by another workspace is denied as not found.
+ * @param agent - the calling session agent; its workspace scopes the board.
+ * @param boardId - the board to snapshot, or undefined for the caller's default board.
  * @returns the live board snapshot.
  */
-@Remote('snapshot') async snapshot(boardId?: string): Promise<BoardSnapshot>
+@Remote('snapshot') async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot>
 
 /**
- * List every board, the implicit "default" board first when absent.
- * @returns the live board rows.
+ * List every board the caller may see: its own workspace's boards plus the
+ * unowned ones. The implicit unowned "default" board row is reported first
+ * when no record exists for it yet (v1 compatibility).
+ * @param agent - the calling session agent; its workspace scopes the listing.
+ * @returns the visible board rows.
  */
-@Remote('listBoards') async listBoards(): Promise<BoardView[]>
+@Remote('listBoards') async listBoards(agent: Agent): Promise<BoardView[]>
 
 /**
- * Create one board through the Remote boundary.
- * @param request - the board name and owning workspace.
+ * Create one board through the Remote boundary. The board is stamped with
+ * the caller's workspace ('' when unowned); any workspaceId in the request
+ * is ignored.
+ * @param agent - the calling session agent; its workspace owns the board.
+ * @param request - the board name.
  * @returns the created board.
  */
-@Remote('createBoard') async createBoardRemote(request: CreateBoardRequest): Promise<BoardView>
+@Remote('createBoard') async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView>
 
 /**
  * Archive one board through the Remote boundary.
@@ -353,7 +361,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:287`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:288`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -376,5 +384,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:239`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:241`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

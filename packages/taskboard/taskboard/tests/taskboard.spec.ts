@@ -49,6 +49,23 @@ function stubAgent(rawId: string): Agent {
   return stubAgentForSession(Session.create(SessionId(rawId)))
 }
 
+/** A fresh agent whose session header carries an absolute cwd. */
+function stubAgentWithCwd(rawId: string, cwd: string): Agent {
+  const id = SessionId(rawId)
+  const session = Session.create(id, undefined, {
+    version: 0,
+    id,
+    createdAt: Date.now(),
+    cwd,
+  })
+  return stubAgentForSession(session)
+}
+
+/** One stubbed workspace-registry resolution result. */
+function workspaceStub(id: string, path: string): { id: string; path: string } {
+  return { id, path }
+}
+
 /** How the stubbed subagent seam answers one spawn. */
 type SpawnBehavior = 'spawn' | 'fail' | 'absent'
 
@@ -91,6 +108,8 @@ interface HarnessOptions {
   followup?: ReturnType<typeof vi.fn>
   /** When set, a stubbed workspace registry archives session ids through this fn. */
   archive?: ReturnType<typeof vi.fn>
+  /** When set, the stubbed workspace registry resolves cwds through this fn. */
+  resolveByPath?: (path: string) => Promise<{ id: string; path: string } | undefined>
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -136,8 +155,11 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   } else {
     subagentsStart = vi.fn()
   }
-  if (options.archive !== undefined) {
-    ctx.provide('workspaceRegistry', { archiveSession: options.archive } as never)
+  if (options.resolveByPath !== undefined || options.archive !== undefined) {
+    ctx.provide('workspaceRegistry', {
+      ...(options.resolveByPath === undefined ? {} : { resolveByPath: options.resolveByPath }),
+      ...(options.archive === undefined ? {} : { archiveSession: options.archive }),
+    } as never)
   }
   await ctx.plugin(TaskboardService, {
     maxInProgress,
@@ -188,10 +210,10 @@ async function completeTicket(service: TaskboardService, agent: Agent, ticket: T
 
 describe('TaskboardService workflow', () => {
   it('creates tickets in Backlog and serves a column-sorted snapshot', async () => {
-    const { service } = await harness()
+    const { service, devA } = await harness()
     const first = await createTicket(service, 'first feature')
     const second = await createTicket(service, 'second feature')
-    const snapshot = await service.snapshot()
+    const snapshot = await service.snapshot(devA)
     expect(snapshot.boardId).toBe('default')
     expect(snapshot.tickets.map(ticket => ticket.column)).toEqual(['backlog', 'backlog'])
     expect(snapshot.tickets.map(ticket => ticket.id)).toEqual([first.id, second.id])
@@ -203,16 +225,16 @@ describe('TaskboardService workflow', () => {
   })
 
   it('isolates tickets per board in the snapshot', async () => {
-    const { service } = await harness()
+    const { service, devA } = await harness()
     const onDefault = await createTicket(service, 'default board card')
     const onAlpha = await createTicket(service, 'alpha card', [], 'alpha')
     const onBeta = await createTicket(service, 'beta card', [], 'beta')
-    const defaultSnapshot = await service.snapshot()
+    const defaultSnapshot = await service.snapshot(devA)
     expect(defaultSnapshot.tickets.map(ticket => ticket.id)).toEqual([onDefault.id])
-    const alphaSnapshot = await service.snapshot('alpha')
+    const alphaSnapshot = await service.snapshot(devA, 'alpha')
     expect(alphaSnapshot.boardId).toBe('alpha')
     expect(alphaSnapshot.tickets.map(ticket => ticket.id)).toEqual([onAlpha.id])
-    const betaSnapshot = await service.snapshot('beta')
+    const betaSnapshot = await service.snapshot(devA, 'beta')
     expect(betaSnapshot.tickets.map(ticket => ticket.id)).toEqual([onBeta.id])
     // Legacy endpoints reject a mismatched boardId.
     await expect(service.moveRemote(devAgent(onDefault), { ticketId: onDefault.id, column: 'not_started', beforeTicketId: null, afterTicketId: null, boardId: 'alpha' }))
@@ -220,15 +242,17 @@ describe('TaskboardService workflow', () => {
   })
 
   it('lists, creates and archives boards through the Remote surface', async () => {
-    const { service } = await harness()
-    const boards = await service.listBoards()
+    const { service, devA } = await harness()
+    const boards = await service.listBoards(devA)
     expect(boards).toHaveLength(1)
     expect(boards[0]!.boardId).toBe('default')
-    const created = await service.createBoardRemote({ name: 'Sprint 42', workspaceId: 'ws-1' })
+    const created = await service.createBoardRemote(devA, { name: 'Sprint 42', workspaceId: 'ws-1' })
     expect(created.boardId).toMatch(/^board-/)
     expect(created.name).toBe('Sprint 42')
+    // The caller's workspace stamps the board; an unowned caller creates unowned boards.
+    expect(created.workspaceId).toBe('')
     expect(created.masterAgentId).toBeNull()
-    const listed = await service.listBoards()
+    const listed = await service.listBoards(devA)
     expect(listed.map(board => board.boardId).sort()).toEqual([created.boardId, 'default'].sort())
     const archived = await service.archiveBoardRemote({ boardId: created.boardId })
     expect(archived.archivedAt).not.toBeNull()
@@ -519,7 +543,7 @@ describe('TaskboardService workflow', () => {
       ticketId: first.id, column: 'not_started', beforeTicketId: third.id, afterTicketId: null,
     })
     expect(moved.column).toBe('not_started')
-    const rows = (await service.snapshot()).tickets.filter(ticket => ticket.column === 'not_started')
+    const rows = (await service.snapshot(devA)).tickets.filter(ticket => ticket.column === 'not_started')
     expect(rows.map(ticket => ticket.id)).toEqual([second.id, first.id, third.id])
     expect(rows[1]!.position).toBeGreaterThan(rows[0]!.position)
     expect(rows[1]!.position).toBeLessThan(rows[2]!.position)
@@ -805,7 +829,7 @@ describe('TaskboardService workflow', () => {
     const { service, devA, devB } = await harness()
     await service.claimMaster('default', devA)
     await service.transferMaster('default', devA, devB.id, 'board state: 3 cards; worker w1 on card A, worker w2 on card B; review pending on card C')
-    const boards = await service.listBoards()
+    const boards = await service.listBoards(devA)
     const board = boards.find(candidate => candidate.boardId === 'default')!
     expect(board.masterAgentId).toBe(devB.id)
     expect(board.handoverNotes).toContain('worker w1 on card A')
@@ -813,6 +837,89 @@ describe('TaskboardService workflow', () => {
     const again = await service.transferMaster('default', devB, devA.id, 'round two')
     expect(again.masterAgentId).toBe(devA.id)
     expect(again.handoverNotes).toBe('round two')
+  })
+
+  it('isolates boards and tickets per workspace through the Remote surface', async () => {
+    const cwdA = 'C:\\work\\project-alpha'
+    const cwdB = 'C:\\work\\project-beta'
+    const wsA = workspaceStub('ws-alpha', cwdA)
+    const wsB = workspaceStub('ws-beta', cwdB)
+    const resolveByPath = vi.fn(async (path: string) => path === cwdA ? wsA : path === cwdB ? wsB : undefined)
+    const { service } = await harness({ resolveByPath })
+    const agentA = stubAgentWithCwd('ws-agent-a', cwdA)
+    const agentB = stubAgentWithCwd('ws-agent-b', cwdB)
+    // First access auto-creates a per-workspace default board named after the directory basename.
+    const boardsA = await service.listBoards(agentA)
+    expect(boardsA).toHaveLength(1)
+    expect(boardsA[0]).toMatchObject({ boardId: 'default', workspaceId: 'ws-alpha', name: 'project-alpha' })
+    const boardsB = await service.listBoards(agentB)
+    expect(boardsB).toHaveLength(1)
+    expect(boardsB[0]).toMatchObject({ workspaceId: 'ws-beta', name: 'project-beta' })
+    expect(boardsB[0]!.boardId).not.toBe('default')
+    // Tickets created on a workspace's default board stay invisible to the other workspace.
+    const ticketA = await service.createRemote({ title: 'alpha card', description: '', priority: 'normal', dependsOn: [], boardId: boardsA[0]!.boardId })
+    const ticketB = await service.createRemote({ title: 'beta card', description: '', priority: 'normal', dependsOn: [], boardId: boardsB[0]!.boardId })
+    const snapA = await service.snapshot(agentA, boardsA[0]!.boardId)
+    expect(snapA.tickets.map(ticket => ticket.id)).toEqual([ticketA.id])
+    const snapB = await service.snapshot(agentB, boardsB[0]!.boardId)
+    expect(snapB.tickets.map(ticket => ticket.id)).toEqual([ticketB.id])
+    // Cross-workspace boards are denied as not found and never listed.
+    await expect(service.snapshot(agentA, boardsB[0]!.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    await expect(service.snapshot(agentB, boardsA[0]!.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    expect((await service.listBoards(agentA)).map(board => board.boardId)).not.toContain(boardsB[0]!.boardId)
+    expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(boardsA[0]!.boardId)
+    // createBoard stamps the caller's workspace over any requested value.
+    const createdA = await service.createBoardRemote(agentA, { name: 'Sprint A', workspaceId: 'ws-beta' })
+    expect(createdA.workspaceId).toBe('ws-alpha')
+    expect((await service.listBoards(agentB)).map(board => board.boardId)).not.toContain(createdA.boardId)
+    await expect(service.snapshot(agentB, createdA.boardId)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+  })
+
+  it('lazily adopts the legacy unowned default board to the first real workspace', async () => {
+    const cwdA = 'C:\\work\\legacy-project'
+    const cwdB = 'C:\\work\\other-project'
+    const wsA = workspaceStub('ws-legacy', cwdA)
+    const wsB = workspaceStub('ws-other', cwdB)
+    const resolveByPath = vi.fn(async (path: string) => path === cwdA ? wsA : path === cwdB ? wsB : undefined)
+    const { service } = await harness({ resolveByPath })
+    // v1-shaped data lives on the unowned default board before any real-workspace access.
+    const unowned = stubAgent('legacy-unowned')
+    const legacyTicket = await service.createRemote({ title: 'legacy card', description: '', priority: 'normal', dependsOn: [], boardId: 'default' })
+    expect((await service.snapshot(unowned, 'default')).tickets.map(ticket => ticket.id)).toEqual([legacyTicket.id])
+    // The first real-workspace access adopts the default board and names it after the directory.
+    const owner = stubAgentWithCwd('legacy-owner', cwdA)
+    const boards = await service.listBoards(owner)
+    expect(boards).toHaveLength(1)
+    expect(boards[0]).toMatchObject({ boardId: 'default', workspaceId: 'ws-legacy', name: 'legacy-project' })
+    // The adopted board still serves the legacy tickets.
+    expect((await service.snapshot(owner, 'default')).tickets.map(ticket => ticket.id)).toEqual([legacyTicket.id])
+    // The unowned session loses the adopted board.
+    await expect(service.snapshot(unowned, 'default')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+    expect((await service.listBoards(unowned)).map(board => board.boardId)).not.toContain('default')
+    // A second real workspace cannot see the adopted default board either.
+    const other = stubAgentWithCwd('legacy-other', cwdB)
+    const boardsB = await service.listBoards(other)
+    expect(boardsB).toHaveLength(1)
+    expect(boardsB[0]).toMatchObject({ workspaceId: 'ws-other', name: 'other-project' })
+    expect(boardsB[0]!.boardId).not.toBe('default')
+    await expect(service.snapshot(other, 'default')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+  })
+
+  it('falls back to unowned when the session cwd cannot be resolved to a workspace', async () => {
+    const resolveByPath = vi.fn(async () => { throw new Error('path does not exist') })
+    const { service } = await harness({ resolveByPath })
+    const agent = stubAgentWithCwd('unresolved-agent', 'C:\\work\\missing-project')
+    // A resolving failure falls back to unowned: the legacy default board remains shared.
+    const boards = await service.listBoards(agent)
+    expect(boards).toHaveLength(1)
+    expect(boards[0]).toMatchObject({ boardId: 'default', workspaceId: '' })
+    // createBoard stamps the unowned caller with the empty workspace id.
+    const created = await service.createBoardRemote(agent, { name: 'Unowned board' })
+    expect(created.workspaceId).toBe('')
+    // A session without any cwd sees the same unowned boards.
+    const other = stubAgent('no-cwd-agent')
+    expect((await service.listBoards(other)).map(board => board.boardId)).toContain(created.boardId)
+    await expect(service.snapshot(other, created.boardId)).resolves.toMatchObject({ boardId: created.boardId })
   })
 
   it('loads v1-shaped records from a seeded storage root with zod defaults', async () => {
@@ -843,8 +950,8 @@ describe('TaskboardService workflow', () => {
         tables: { tickets: { [v1Ticket.id]: v1Ticket } },
       }, null, 2),
     )
-    const { service } = await harness({ root })
-    const snapshot = await service.snapshot()
+    const { service, devA } = await harness({ root })
+    const snapshot = await service.snapshot(devA)
     expect(snapshot.tickets).toHaveLength(1)
     const loaded = snapshot.tickets[0]!
     expect(loaded.id).toBe('ticket-v1-legacy')

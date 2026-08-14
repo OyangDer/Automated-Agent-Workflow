@@ -10,6 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { basename } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
@@ -412,6 +413,85 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Resolve the calling session's workspace from its header cwd through the
+   * host workspace registry (resolveByPath). A missing registry, a missing
+   * cwd, an unresolvable path, or any registry failure falls back to unowned
+   * (undefined).
+   * @param agent - the calling session agent.
+   * @returns the resolved workspace id and canonical path, or undefined when unowned.
+   */
+  private async workspaceOf(agent: Agent): Promise<{ id: string; path: string } | undefined> {
+    const cwd = agent.session.header.cwd
+    if (typeof cwd !== 'string' || cwd.length === 0) return undefined
+    const registry = this.ctx.get('workspaceRegistry') as
+      | { resolveByPath?: (path: string) => Promise<{ id: string; path: string } | undefined> }
+      | undefined
+    if (registry === undefined || typeof registry.resolveByPath !== 'function') return undefined
+    try {
+      const workspace = await registry.resolveByPath(cwd)
+      return workspace === undefined ? undefined : { id: workspace.id, path: workspace.path }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Ensure the caller's default board exists, materializing it per workspace:
+   * the first real-workspace access lazily adopts the legacy unowned "default"
+   * board (renamed to the workspace directory basename); every later workspace
+   * gets a deterministic "default-<workspaceId>" board with the same naming.
+   * An unowned caller keeps the legacy implicit "default" board while it stays
+   * unowned, and has no default board of its own once a real workspace adopted
+   * it (undefined).
+   * @param workspaceId - the caller's workspace id, or '' when unowned.
+   * @param name - the directory basename to use for a materialized default board.
+   * @returns the caller's default board, or undefined when the caller has none.
+   */
+  private async ensureDefaultBoard(
+    workspaceId: string,
+    name: string | undefined,
+  ): Promise<BoardView | undefined> {
+    const table = await this.boards()
+    if (workspaceId === '') {
+      const legacy = table.get('default')
+      if (legacy === undefined) return this.ensureBoard('default')
+      return legacy.workspaceId === '' ? legacy : undefined
+    }
+    const legacy = table.get('default')
+    if (legacy === undefined || legacy.workspaceId === '') {
+      await this.ensureBoard('default')
+      return this.mutateBoard('default', current => ({
+        ...current,
+        workspaceId,
+        ...(name === undefined ? {} : { name }),
+      }))
+    }
+    // The legacy default board already belongs to this workspace.
+    if (legacy.workspaceId === workspaceId) return legacy
+    return this.ensureBoard('default-' + workspaceId, {
+      workspaceId,
+      ...(name === undefined ? {} : { name }),
+    })
+  }
+
+  /**
+   * Require one board to be visible to a caller: a record-less board (the
+   * implicit default or a legacy implicit board) is unowned and shared, and a
+   * recorded board must be unowned or owned by the caller's workspace. A
+   * cross-workspace board is denied as not found so its existence is not
+   * leaked.
+   * @param boardId - the board to check.
+   * @param workspaceId - the caller's workspace id, or '' when unowned.
+   */
+  private async assertBoardAccessible(boardId: string, workspaceId: string): Promise<void> {
+    const table = await this.boards()
+    const board = table.get(boardId)
+    if (board === undefined) return
+    if (board.workspaceId === '' || board.workspaceId === workspaceId) return
+    throw new TaskboardError('board "' + boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+  }
+
+  /**
    * Validate the board context of one ticket operation: the requested board
    * (default "default") must be the ticket's own board.
    */
@@ -786,13 +866,22 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Whole-board snapshot, sorted by column then position, scoped to one
-   * board (default "default").
-   * @param boardId - the board to snapshot, or undefined for the default board.
+   * board the caller may see: its own workspace's boards plus the unowned
+   * ones. A board owned by another workspace is denied as not found.
+   * @param agent - the calling session agent; its workspace scopes the board.
+   * @param boardId - the board to snapshot, or undefined for the caller's default board.
    * @returns the live board snapshot.
    */
   @Remote('snapshot')
-  async snapshot(boardId?: string): Promise<BoardSnapshot> {
-    const board = boardId ?? 'default'
+  async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot> {
+    const workspace = await this.workspaceOf(agent)
+    const workspaceId = workspace === undefined ? '' : workspace.id
+    const defaultBoard = await this.ensureDefaultBoard(
+      workspaceId,
+      workspace === undefined ? undefined : basename(workspace.path),
+    )
+    const board = boardId ?? defaultBoard?.boardId ?? 'default'
+    await this.assertBoardAccessible(board, workspaceId)
     const table = await this.openedTable()
     const rows: TicketView[] = []
     for (const [, ticket] of table.entries()) {
@@ -808,15 +897,26 @@ export class TaskboardService extends TypertRemoteService {
   private openTable: KvTable<string, TicketView> | null = null
 
   /**
-   * List every board, the implicit "default" board first when absent.
-   * @returns the live board rows.
+   * List every board the caller may see: its own workspace's boards plus the
+   * unowned ones. The implicit unowned "default" board row is reported first
+   * when no record exists for it yet (v1 compatibility).
+   * @param agent - the calling session agent; its workspace scopes the listing.
+   * @returns the visible board rows.
    */
   @Remote('listBoards')
-  async listBoards(): Promise<BoardView[]> {
+  async listBoards(agent: Agent): Promise<BoardView[]> {
+    const workspace = await this.workspaceOf(agent)
+    const workspaceId = workspace === undefined ? '' : workspace.id
+    await this.ensureDefaultBoard(
+      workspaceId,
+      workspace === undefined ? undefined : basename(workspace.path),
+    )
     const table = await this.boards()
     const boards: BoardView[] = []
-    for (const [, board] of table.entries()) boards.push(board)
-    if (!boards.some(board => board.boardId === 'default')) {
+    for (const [, board] of table.entries()) {
+      if (board.workspaceId === '' || board.workspaceId === workspaceId) boards.push(board)
+    }
+    if (table.get('default') === undefined) {
       boards.unshift({
         boardId: 'default',
         name: 'default',
@@ -831,16 +931,25 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Create one board through the Remote boundary.
-   * @param request - the board name and owning workspace.
+   * Create one board through the Remote boundary. The board is stamped with
+   * the caller's workspace ('' when unowned); any workspaceId in the request
+   * is ignored.
+   * @param agent - the calling session agent; its workspace owns the board.
+   * @param request - the board name.
    * @returns the created board.
    */
   @Remote('createBoard')
-  async createBoardRemote(request: CreateBoardRequest): Promise<BoardView> {
+  async createBoardRemote(agent: Agent, request: CreateBoardRequest): Promise<BoardView> {
+    const workspace = await this.workspaceOf(agent)
+    const workspaceId = workspace === undefined ? '' : workspace.id
+    await this.ensureDefaultBoard(
+      workspaceId,
+      workspace === undefined ? undefined : basename(workspace.path),
+    )
     const record: BoardView = {
       boardId: 'board-' + randomUUID(),
       name: resolveBoardName(request.name),
-      workspaceId: typeof request.workspaceId === 'string' ? request.workspaceId : '',
+      workspaceId,
       masterAgentId: null,
       masterClaimedAt: null,
       handoverNotes: '',
