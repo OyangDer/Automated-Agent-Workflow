@@ -48,6 +48,8 @@ interface StubProps {
   board: TicketView[]
   boards?: BoardView[]
   boardId?: string
+  /** Owning workspace of the session this board list belongs to. */
+  workspaceId?: string
   selectedId?: string | null
   create?: (request: unknown) => Promise<TicketView>
   move?: (request: unknown) => Promise<TicketView>
@@ -56,20 +58,20 @@ interface StubProps {
   archiveBoard?: (boardId: string) => Promise<BoardView>
 }
 
-/** One board row fixture. */
-function boardRow(boardId: string, name: string): BoardView {
+/** One board row fixture; unowned (workspaceId '') unless overridden. */
+function boardRow(boardId: string, name: string, workspaceId = ''): BoardView {
   return {
-    boardId, name, workspaceId: '',
+    boardId, name, workspaceId,
     masterAgentId: null, masterClaimedAt: null, handoverNotes: '', archivedAt: null,
   }
 }
 
 /** Assemble the four shares the component destructures. */
 function propsOf({
-  board, boards = [], boardId = 'default', selectedId = null,
+  board, boards = [], boardId = 'default', workspaceId = '', selectedId = null,
   create, move, selectBoard, createBoard, archiveBoard,
 }: StubProps): TaskboardViewProps {
-  const state = { boardId, boards, snapshot: { boardId, name: boardId, tickets: board } }
+  const state = { boardId, boards, snapshot: { boardId, name: boardId, tickets: board }, workspaceId }
   const storeState = { selectedId }
   return {
     useBoard: (selector: (value: typeof state) => typeof state) => selector(state),
@@ -210,6 +212,29 @@ describe('TaskboardView', () => {
     const values = Array.from(select.options).map(option => option.value)
     expect(values).toEqual(['default', 'board-1', 'board-2'])
     expect(select.querySelector('optgroup')?.getAttribute('label')).toBe('已归档')
+  })
+
+  it('filters the board selector to the current workspace', () => {
+    // A board list spanning several workspaces (plus the shared unowned
+    // default): only this project's boards render, active and archived.
+    const boards: BoardView[] = [
+      boardRow('default', 'default'),
+      boardRow('board-own', '本项目的板', 'workspace-1'),
+      boardRow('board-other', '他项目的板', 'workspace-2'),
+      { ...boardRow('board-own-archived', '本项目已归档', 'workspace-1'), archivedAt: 5 },
+      { ...boardRow('board-other-archived', '他项目已归档', 'workspace-2'), archivedAt: 6 },
+    ]
+    render(createElement(TaskboardView, propsOf({
+      board: [], boards, boardId: 'board-own', workspaceId: 'workspace-1',
+    })))
+    const select = screen.getByLabelText('选择看板') as HTMLSelectElement
+    expect(select.value).toBe('board-own')
+    const values = Array.from(select.options).map(option => option.value)
+    expect(values).toEqual(['default', 'board-own', 'board-own-archived'])
+    expect(select.querySelector('optgroup')?.getAttribute('label')).toBe('已归档')
+    // Other workspaces' boards never appear, not even as archived labels.
+    expect(screen.queryByText('他项目的板')).toBeNull()
+    expect(screen.queryByText('他项目已归档')).toBeNull()
   })
 
   it('switches boards through the selector, calling selectBoard', () => {

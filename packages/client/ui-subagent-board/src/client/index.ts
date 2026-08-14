@@ -6,7 +6,7 @@
  * taskboard/changed event, republished through one stable observable source.
  * The plugin owns no store beyond that live source.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the generated Remote API and ctx.remote merge through the Client assembly boundary.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 // Type-only: pulls the ui-conversation SlotMap merge (the conversation.view ring).
@@ -50,29 +50,41 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-subagent-board: dictionaries')
   const t = ctx.locale.bind(NS)
 
-  // One root-scoped default-board source shared by every session tab: the
-  // forwarded change event triggers a refetch, and the fresh snapshot is
-  // republished through the same source identity so hook bindings stay warm.
-  let current: BoardSnapshot | null = null
-  const listeners = new Set<() => void>()
-  const refresh = async (): Promise<void> => {
-    try {
-      current = unwrap(await ctx.remote.taskboard.snapshot('default'))
-    } catch {
-      // Keep the last good snapshot; failures surface through the next retry.
-      current = current === null ? { boardId: 'default', name: '', tickets: [] } : current
+  // The taskboard snapshot verb now carries the calling session (the host
+  // resolves the session's workspace default board), so each session cell
+  // keeps its own default-board source, fetched with that session's id.
+  const sources = new Map<SessionId, { board: HostObservable<BoardSnapshot | null>; refresh(): Promise<void> }>()
+
+  /** Build one session's default-board source. */
+  const makeSource = (sessionId: SessionId): { board: HostObservable<BoardSnapshot | null>; refresh(): Promise<void> } => {
+    let current: BoardSnapshot | null = null
+    const listeners = new Set<() => void>()
+    const refresh = async (): Promise<void> => {
+      try {
+        current = unwrap(await ctx.remote.taskboard.snapshot(sessionId))
+      } catch {
+        // Keep the last good snapshot; failures surface through the next retry.
+        current = current === null ? { boardId: 'default', name: '', tickets: [] } : current
+      }
+      for (const listener of listeners) listener()
     }
-    for (const listener of listeners) listener()
+    return {
+      board: {
+        getSnapshot: () => current,
+        subscribe: (listener) => {
+          listeners.add(listener)
+          return () => { listeners.delete(listener) }
+        },
+      },
+      refresh,
+    }
   }
-  const board: HostObservable<BoardSnapshot | null> = {
-    getSnapshot: () => current,
-    subscribe: (listener) => {
-      listeners.add(listener)
-      return () => { listeners.delete(listener) }
-    },
-  }
-  void refresh()
-  ctx.effect(() => ctx.remote.$on('taskboard/changed', () => { void refresh() }), 'ui-subagent-board: board changes')
+
+  // The forwarded change event carries no session identity, so every live
+  // source refetches (only the mounted tab's state is observed).
+  ctx.effect(() => ctx.remote.$on('taskboard/changed', () => {
+    for (const source of sources.values()) void source.refresh()
+  }), 'ui-subagent-board: board changes')
 
   ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
@@ -80,8 +92,16 @@ export function apply(ctx: ClientContext): void {
     order: 21,
     locale: NS,
     label: () => t('view.subagents'),
-    inject: (): SubagentBoardInjected => ({
-      hooks: { board },
-    }),
+    inject: (sessionId: SessionId): SubagentBoardInjected => {
+      let source = sources.get(sessionId)
+      if (source === undefined) {
+        source = makeSource(sessionId)
+        sources.set(sessionId, source)
+        void source.refresh()
+      }
+      return {
+        hooks: { board: source.board },
+      }
+    },
   }, SubagentBoardView))
 }

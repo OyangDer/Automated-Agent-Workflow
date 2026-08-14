@@ -17,6 +17,13 @@ export interface BoardState {
   boards: BoardView[]
   /** The active board's ticket snapshot; null until the first load lands. */
   snapshot: BoardSnapshot | null
+  /**
+   * The owning workspace of the session this board list belongs to (the
+   * host scopes every board verb to it); '' when the session is unowned or
+   * the workspace baseline has not resolved yet. The selector shows boards
+   * of this workspace plus the unowned (shared) ones.
+   */
+  workspaceId: string
 }
 
 /** The browser actions one TaskboardView surface may take. */

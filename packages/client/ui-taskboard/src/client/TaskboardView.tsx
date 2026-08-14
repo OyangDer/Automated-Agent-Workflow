@@ -8,7 +8,7 @@ import { useMemo, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { InjectFace, PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
-  ColumnId, MoveTicketRequest, TicketView,
+  BoardView, ColumnId, MoveTicketRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { TaskboardInjected } from './contract.ts'
 import { createTaskboardStore } from './stores.ts'
@@ -60,9 +60,16 @@ export function TaskboardView({
   const selected = board === null ? null : board.tickets.find(ticket => ticket.id === selectedId) ?? null
   const ticketCount = board?.tickets.length ?? 0
 
-  /** Active boards for the selector; archived ones collapse into a group. */
-  const activeBoards = boardState.boards.filter(item => item.archivedAt === null)
-  const archivedBoards = boardState.boards.filter(item => item.archivedAt !== null)
+  /**
+   * Active boards for the selector; archived ones collapse into a group.
+   * Only the current project's boards render (the host already filters, so
+   * this is defense-in-depth): a board owned by another workspace is never
+   * selectable here, while unowned boards stay shared across workspaces.
+   */
+  const workspaceId = boardState.workspaceId
+  const inWorkspace = (item: BoardView): boolean => item.workspaceId === workspaceId || item.workspaceId === ''
+  const activeBoards = boardState.boards.filter(item => item.archivedAt === null && inWorkspace(item))
+  const archivedBoards = boardState.boards.filter(item => item.archivedAt !== null && inWorkspace(item))
 
   /** Create one board from the inline name field and open it. */
   const handleCreateBoard = async (): Promise<void> => {
