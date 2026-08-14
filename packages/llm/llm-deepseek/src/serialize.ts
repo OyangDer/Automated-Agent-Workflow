@@ -2,13 +2,14 @@
  * Serialize harness messages into DeepSeek chat completions. User text is joined; assistant text
  * becomes `content`, tool calls become `tool_calls`, and tool results become separate tool messages.
  * Assistant reasoning is replayed as `reasoning_content` only on tool-call turns, as required by
- * thinking-mode passback. Core image blocks are rejected explicitly because this wire route is text-only;
- * unknown declaration-merged block types retain the adapter's documented extension fallback.
+ * thinking-mode passback. Core image blocks render as inline text markers because this wire route is
+ * text-only (the durable session history keeps the real image); unknown declaration-merged
+ * block types retain the adapter's documented extension fallback.
  * @module dsh-llm-deepseek/serialize
  */
 
-import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, GenerateOptions, ImageBlock, Message } from '@deepseek-ai/dsh-llm'
 import type { WireMessage, WireRequest, WireTool } from './types.ts'
 
 /** Adapter-level request defaults (from plugin config). */
@@ -52,19 +53,20 @@ function resolveThinking(options: GenerateOptions, defaults: RequestDefaults): R
   return defaults.thinking === undefined ? {} : { thinking: defaults.thinking }
 }
 
-/** Join the text blocks of a message (used for user/tool-result content). */
-function flattenText(blocks: ContentBlock[]): string {
-  return blocks
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
+/** Render one image block as a stable inline marker on the text-only wire route. */
+function imageMarker(block: ImageBlock): string {
+  const attachment = block.attachment
+  return '[image: ' + attachment.mediaType + ' ' + attachment.width + 'x' + attachment.height
+    + (attachment.name === undefined ? '' : ' ' + attachment.name) + ']'
 }
 
-/** Reject core image content before any text-flattening path can silently erase it. */
-function assertTextOnly(blocks: readonly ContentBlock[]): void {
-  if (contentHasImage(blocks)) {
-    throw new LlmError('The DeepSeek chat-completions adapter does not support image content.', 'UNSUPPORTED_CONTENT')
-  }
+/** Join the text of a message, rendering image blocks as inline markers (used for user/tool-result content). */
+function flattenText(blocks: ContentBlock[]): string {
+  return blocks
+    .map(block => block.type === 'text'
+      ? block.text
+      : block.type === 'image' ? imageMarker(block) : '')
+    .join('')
 }
 
 /** Serialize one assistant message (text + reasoning + tool calls). */
@@ -112,7 +114,6 @@ function serializeAssistant(message: Message): WireMessage {
 export function serializeMessages(messages: Message[]): WireMessage[] {
   const wire: WireMessage[] = []
   for (const message of messages) {
-    assertTextOnly(message.content)
     if (message.role === 'system') {
       wire.push({ role: 'system', content: flattenText(message.content) })
       continue
