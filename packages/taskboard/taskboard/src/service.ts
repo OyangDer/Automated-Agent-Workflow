@@ -18,6 +18,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   defineDomain, DomainError, domainTable,
@@ -37,8 +38,8 @@ import type {
   TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
-  agentLabel, appendHistory, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
-  MASTER_SECTION, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
+  agentLabel, appendHistory, buildHandoverNotes, buildReviewPrompt, buildReviewReportPrompt,
+  buildWorkerPrompt, MASTER_SECTION, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
@@ -100,6 +101,7 @@ const boardSchema = zod.object({
   ownerSessionId: zod.string().nullable().default(null),
   masterAgentId: zod.string().nullable().default(null),
   masterClaimedAt: zod.number().nullable().default(null),
+  masterExpiresAt: zod.number().nullable().default(null),
   handoverNotes: zod.string().default(''),
   masterHistory: zod.array(zod.object({
     fromAgentId: zod.string().nullable(),
@@ -218,6 +220,13 @@ export interface ResolveReviewResult {
   blockedAfterReject: boolean
 }
 
+/** Tool payload: the released board plus the generated handover notes. */
+export interface HandoverResult {
+  board: BoardView
+  /** The structured handover notes written onto the board's handoverNotes. */
+  notes: string
+}
+
 /** The compact row taskboard_list returns per ticket. */
 export interface TicketRow {
   id: string
@@ -251,6 +260,12 @@ function resolveMasterSeatTimeout(value: number): number {
     throw new Error('taskboard: masterSeatTimeoutMs must be a non-negative safe integer')
   }
   return value
+}
+
+/** Derived lease expiry of one board row; null while the seat is vacant. */
+function masterExpiryOf(board: BoardView, leaseMs: number): number | null {
+  if (board.masterAgentId === null || board.masterClaimedAt === null) return null
+  return board.masterClaimedAt + leaseMs
 }
 
 /** Column ids as a runtime set for cheap membership checks. */
@@ -415,6 +430,7 @@ export class TaskboardService extends TypertRemoteService {
       ownerSessionId: null,
       masterAgentId: null,
       masterClaimedAt: null,
+      masterExpiresAt: null,
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
@@ -449,6 +465,7 @@ export class TaskboardService extends TypertRemoteService {
       ownerSessionId: agent.id,
       masterAgentId: null,
       masterClaimedAt: null,
+      masterExpiresAt: null,
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
@@ -788,11 +805,13 @@ export class TaskboardService extends TypertRemoteService {
   private async recordReviewOutcome(ticketId: string, sessionId: string, outcome: SubagentResult): Promise<void> {
     const structured = outcome.structured
     if (structured === undefined || !isReviewOutcome(structured)) return
-    await this.mutate(ticketId, 'review-claim', (current) => {
+    let landed = false
+    const next = await this.mutate(ticketId, 'review-claim', (current) => {
       // The card must still name this reviewer and remain under review;
       // a resolved or re-reviewed card no longer accepts the report.
       if (current.reviewer === null || current.reviewer.agentId !== sessionId) return current
       if (current.column !== 'in_testing') return current
+      landed = true
       return {
         ...current,
         reviewOutcome: {
@@ -804,6 +823,11 @@ export class TaskboardService extends TypertRemoteService {
         updatedAt: Date.now(),
       }
     })
+    // The verdict landed on the board: the master must resolve it.
+    if (landed) {
+      await this.notifyMaster(next.boardId,
+        'Taskboard notice: the review verdict (' + structured.verdict + ') for ticket ' + next.id + ' ("' + next.title + '") landed on the board. Adjudicate it with taskboard_resolve_review.')
+    }
   }
 
   /**
@@ -903,10 +927,12 @@ export class TaskboardService extends TypertRemoteService {
 
   /** Mark a card blocked when its worker session ended without reporting. */
   private async reclaimTerminatedWorker(ticketId: string, sessionId: string, stopReason: string): Promise<void> {
-    await this.mutate(ticketId, 'fail', (current) => {
+    let reclaimed = false
+    const next = await this.mutate(ticketId, 'fail', (current) => {
       if (current.workerSessionId !== sessionId) return current
       if (current.column !== 'in_progress' || current.status !== 'running') return current
       const detail = 'worker terminated (' + stopReason + ')'
+      reclaimed = true
       return appendHistory(
         {
           ...current,
@@ -918,6 +944,10 @@ export class TaskboardService extends TypertRemoteService {
         detail,
       )
     })
+    if (reclaimed) {
+      await this.notifyMaster(next.boardId,
+        'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") terminated without reporting; the card is blocked. Re-dispatch with taskboard_reassign.')
+    }
   }
 
   /** Attach the designated reviewer to an In testing ticket. */
@@ -1027,7 +1057,10 @@ export class TaskboardService extends TypertRemoteService {
     const table = await this.boards()
     const boards: BoardView[] = []
     for (const [, board] of table.entries()) {
-      if (this.isBoardVisible(board, agent.id, workspaceId)) boards.push(board)
+      if (!this.isBoardVisible(board, agent.id, workspaceId)) continue
+      // The lease expiry is derived state: recompute it from the claim time
+      // and the current lease so the browser banner always sees the live value.
+      boards.push({ ...board, masterExpiresAt: masterExpiryOf(board, this.resolved.masterSeatTimeoutMs) })
     }
     if (table.get('default') === undefined) {
       boards.unshift({
@@ -1038,6 +1071,7 @@ export class TaskboardService extends TypertRemoteService {
         ownerSessionId: null,
         masterAgentId: null,
         masterClaimedAt: null,
+        masterExpiresAt: null,
         handoverNotes: '',
         masterHistory: [],
         archivedAt: null,
@@ -1080,6 +1114,7 @@ export class TaskboardService extends TypertRemoteService {
       ownerSessionId: scope === 'session' ? agent.id : null,
       masterAgentId: null,
       masterClaimedAt: null,
+      masterExpiresAt: null,
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
@@ -1329,6 +1364,96 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Require the caller to be a top-level session agent, not a spawned
+   * subagent child. Master verbs that dispatch workers must run in the
+   * master's own session so the spawned worker's parent lineage stays the
+   * top-level session (the three-layer hierarchy: master -> worker ->
+   * reviewer). A subagent child carries an origin/delegationDepth in its
+   * session header; top-level sessions carry neither.
+   * @param agent - the calling session agent.
+   */
+  private static assertRootSession(agent: Agent): void {
+    const header = agent.session.header
+    if (header.origin === 'subagent' || (header.delegationDepth !== undefined && header.delegationDepth > 0)) {
+      throw new TaskboardError(
+        'only a top-level session agent may perform this action (subagent ' + agent.id + ')',
+        'TASKBOARD_NOT_ROOT',
+      )
+    }
+  }
+
+  /**
+   * Hand over the master seat (master only): generate the structured handover
+   * notes — every card's status, each in-flight worker identity, the In
+   * testing review seats, the backlog summary, and the master history —
+   * write them onto the board's handoverNotes, and release the seat. The
+   * successor claims the seat with taskboard_claim_master, whose result
+   * carries the notes.
+   * @param boardId - the board to hand over.
+   * @param agent - the current master.
+   * @returns the released board plus the generated notes.
+   */
+  async handover(boardId: string, agent: Agent): Promise<HandoverResult> {
+    await this.assertBoardAccessible(boardId, agent)
+    const table = await this.tickets()
+    const boards = await this.boards()
+    const board = boards.get(boardId)
+    if (board === undefined) {
+      throw new TaskboardError('board "' + boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+    }
+    const tickets: TicketView[] = []
+    for (const [, ticket] of table.entries()) {
+      if (ticket.boardId === boardId) tickets.push(ticket)
+    }
+    const notes = buildHandoverNotes(board, tickets)
+    const released = await this.mutateBoard(boardId, (current) => {
+      if (current.masterAgentId !== agent.id) {
+        throw new TaskboardError('only the current master may hand over the seat', 'TASKBOARD_NOT_MASTER')
+      }
+      return {
+        ...current,
+        handoverNotes: notes,
+        masterAgentId: null,
+        masterClaimedAt: null,
+        masterExpiresAt: null,
+      }
+    })
+    return { board: released, notes }
+  }
+
+  /**
+   * Inject one lightweight notice into the live inbox of the board's seat
+   * holder (the master), following the goal-round driver's inbox-injection
+   * precedent: the master's agent loop claims the message as ordinary input
+   * and acts on it — no board polling. Best-effort by design: a vacant seat,
+   * a not-loaded master session, or a delivery fault never fails the
+   * triggering mutation.
+   * @param boardId - the board whose master receives the notice.
+   * @param text - the notice text (what happened and what to do next).
+   */
+  private async notifyMaster(boardId: string, text: string): Promise<void> {
+    const table = await this.boards()
+    const board = table.get(boardId)
+    if (board === undefined || board.masterAgentId === null) return
+    // The agent registry is a runtime dependency of the live master's inbox;
+    // without it (or before the master session is loaded) the notice is
+    // skipped silently — the master reads the board when it returns.
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    if (registry === undefined) return
+    const master = registry.get(board.masterAgentId as SessionId)
+    if (master === undefined) return
+    try {
+      const message = createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'taskboard', boardId },
+      })
+      master.followup(message)
+    } catch {
+      // A notification must never fail the mutation that triggered it.
+    }
+  }
+
+  /**
    * Transfer the master seat to another session agent with handover notes.
    * A board the caller cannot see is denied as not found (no existence leak).
    * @param boardId - the board to transfer.
@@ -1374,6 +1499,9 @@ export class TaskboardService extends TypertRemoteService {
    * @returns the card plus the worker-spawn outcome.
    */
   async assign(agent: Agent, ticketId: string, workerLabel?: string): Promise<AssignTicketResult> {
+    // The caller must be the top-level session agent: a spawned worker or
+    // reviewer child must never dispatch further workers.
+    TaskboardService.assertRootSession(agent)
     const table = await this.tickets()
     const current = table.get(ticketId)
     if (current === undefined) {
@@ -1450,6 +1578,9 @@ export class TaskboardService extends TypertRemoteService {
         'worker reported development done, waiting for review',
       )
     })
+    // The master must adjudicate the review whether or not a reviewer spawned.
+    await this.notifyMaster(ticket.boardId,
+      'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
     const spawn = await this.spawnReviewer(agent, ticket)
     if (!spawn.spawned) {
       return { ticket, review: spawn.reason, reviewerAgentId: null }
@@ -1469,7 +1600,7 @@ export class TaskboardService extends TypertRemoteService {
    */
   async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView> {
     const notes = resolveRequiredText(reason, 'fail reason')
-    return this.mutate(ticketId, 'fail', (current) => {
+    const blocked = await this.mutate(ticketId, 'fail', (current) => {
       if (current.workerAgentId !== agent.id) {
         throw new TaskboardError('only the assigned worker may report failure', 'TASKBOARD_NOT_WORKER')
       }
@@ -1485,6 +1616,9 @@ export class TaskboardService extends TypertRemoteService {
         'worker reported failure',
       )
     })
+    await this.notifyMaster(blocked.boardId,
+      'Taskboard notice: the worker for ticket ' + blocked.id + ' ("' + blocked.title + '") reported failure; the card is blocked. Re-dispatch with taskboard_reassign.')
+    return blocked
   }
 
   /**
@@ -2428,7 +2562,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_claim_master',
-      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted.',
+      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history).',
       parameters: {
         boardId: {
           type: 'string' as const,
@@ -2442,16 +2576,18 @@ export class TaskboardService extends TypertRemoteService {
             boardId: { type: 'string', required: true },
             name: { type: 'string', required: true },
             masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+            handoverNotes: { type: 'string', required: true },
           },
         },
-        render: (_args, value: { boardId: string; masterAgentId: string | null }) => [{
+        render: (_args, value: { boardId: string; masterAgentId: string | null; handoverNotes: string }) => [{
           type: 'text' as const,
-          text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId),
+          text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId)
+            + (value.handoverNotes === '' ? '' : '; handover notes available in the claim result'),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
         const board = await this.claimMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
-        return { boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId }
+        return { boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId, handoverNotes: board.handoverNotes }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Claim taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
     }))
@@ -2480,6 +2616,36 @@ export class TaskboardService extends TypertRemoteService {
         return { boardId: board.boardId, masterAgentId: board.masterAgentId }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Release taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_handover',
+      description: 'Hand over the master seat of a taskboard board (master only): generate structured handover notes (every card status, each in-flight worker identity, the In testing review seats, the backlog summary, and the master history), write them onto the board, and release the seat. The successor claims the seat with taskboard_claim_master — the claim result carries these notes.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to hand over. Omit for the default board.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+            notes: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value: { boardId: string; notes: string }) => [{
+          type: 'text' as const,
+          text: 'master seat of board ' + value.boardId + ' released with structured handover notes (' + String(value.notes.length) + ' chars)',
+        }],
+      },
+      execute: async (args: { boardId?: string }, exec) => {
+        const result = await this.handover(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        return { boardId: result.board.boardId, masterAgentId: result.board.masterAgentId, notes: result.notes }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Hand over taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
     }))
 
     this.ctx.tools.register(defineTool({
@@ -2853,7 +3019,7 @@ const WORKER_DENIED_TOOLS = [
   'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
   'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
-  'taskboard_create', 'taskboard_move', 'taskboard_plan',
+  'taskboard_handover', 'taskboard_create', 'taskboard_move', 'taskboard_plan',
 ] as const
 
 /**

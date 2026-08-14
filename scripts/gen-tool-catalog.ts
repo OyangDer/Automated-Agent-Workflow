@@ -375,7 +375,7 @@ const TOOL_PACKAGES: ToolPackage[] = [
       await ctx.plugin(TaskboardService)
     },
     note:
-      'The eight taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, and own-ticket updates.',
+      'The nineteen taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.',
   },
   {
     pkg: '@deepseek-ai/dsh-schedule',

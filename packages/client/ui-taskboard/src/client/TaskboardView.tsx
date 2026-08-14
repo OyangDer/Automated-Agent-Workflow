@@ -20,6 +20,15 @@ import css from './Board.module.css'
 /** The five workflow columns in canonical left-to-right order. */
 const COLUMNS: readonly ColumnId[] = ['backlog', 'not_started', 'in_progress', 'in_testing', 'done']
 
+/** How close to the master-lease expiry the banner starts warning. */
+const SEAT_LEASE_WARNING_MS = 60_000
+
+/** Short display handle for one session id (strips the session- prefix). */
+function shortSessionId(id: string): string {
+  const bare = id.startsWith('session-') ? id.slice('session-'.length) : id
+  return bare.length > 8 ? bare.slice(0, 8) : bare
+}
+
 export type TaskboardViewProps = ConvViewProps
   & InjectFace<TaskboardInjected>
   & PropsLocale<'taskboard'>
@@ -46,6 +55,7 @@ export function TaskboardView({
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
 
   /** Column id → ordered tickets, derived purely from the snapshot. */
   const byColumn = useMemo(() => {
@@ -60,6 +70,35 @@ export function TaskboardView({
 
   const selected = board === null ? null : board.tickets.find(ticket => ticket.id === selectedId) ?? null
   const ticketCount = board?.tickets.length ?? 0
+
+  /**
+   * Master-seat banner state for the active board: held (with a lease about
+   * to expire warning) or vacant. The host reports masterExpiresAt (claim
+   * time plus the configured lease), so the expiring state is exact.
+   */
+  const masterLabel = boardState.masterAgentId === null
+    ? null
+    : shortSessionId(boardState.masterAgentId)
+  const masterExpiring = boardState.masterAgentId !== null
+    && boardState.masterExpiresAt !== null
+    && boardState.masterExpiresAt - Date.now() < SEAT_LEASE_WARNING_MS
+
+  /** Copy the standard takeover script for a vacant seat into the clipboard. */
+  const copyTakeover = async (): Promise<void> => {
+    const script = t('seat.takeover')
+      .replaceAll('{boardId}', boardState.boardId)
+      .replaceAll('{boardName}', board?.name ?? boardState.boardId)
+    try {
+      if (navigator.clipboard !== undefined) {
+        await navigator.clipboard.writeText(script)
+      } else {
+        throw new Error('clipboard unavailable')
+      }
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
+  }
 
   /**
    * Active boards for the selector, grouped by scope; archived ones collapse
@@ -186,6 +225,26 @@ export function TaskboardView({
               <button type="button" className={css.cancelButton} onClick={() => setConfirmArchive(false)}>
                 {t('action.cancel')}
               </button>
+            </span>
+          )}
+        </div>
+        <div className={css.seatBanner} data-seat={boardState.masterAgentId === null ? 'vacant' : 'held'}>
+          {boardState.masterAgentId === null ? (
+            <>
+              <span className={css.seatText}>{t('seat.vacant')}</span>
+              <button type="button" className={css.copyButton} onClick={() => { void copyTakeover() }}>
+                {t('seat.copyTakeover')}
+              </button>
+              {copyState !== 'idle' && (
+                <span className={css.seatCopyState} data-copy={copyState}>
+                  {copyState === 'copied' ? t('seat.copied') : t('seat.copyFailed')}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className={css.seatText} data-expiring={masterExpiring}>
+              {t('seat.holder').replace('{holder}', masterLabel ?? '')}
+              {masterExpiring ? ' · ' + t('seat.expiring') : ''}
             </span>
           )}
         </div>

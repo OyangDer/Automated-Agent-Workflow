@@ -20,9 +20,11 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import { CallId } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
+import { buildHandoverNotes } from '../src/domain.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
 function stubAgentForSession(session: Session): Agent {
@@ -207,6 +209,11 @@ async function toNotStarted(service: TaskboardService, agent: Agent, ticket: Tic
 
 async function claimTicket(service: TaskboardService, agent: Agent, ticket: TicketView): Promise<TicketView> {
   return await service.claim(agent, ticket.id)
+}
+
+/** Extract the text of one injected notice message. */
+function textOf(message: { content: { type: string; text: string }[] }): string {
+  return message.content.map(block => block.type === 'text' ? block.text : '').join('')
 }
 
 /** Complete and assert the reviewer spawn, returning the In testing ticket. */
@@ -1249,6 +1256,320 @@ describe('TaskboardService workflow', () => {
     await expect(service.snapshot(workspaceAgent, 'orphan-board')).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
     await expect(service.claimMaster('orphan-board', workspaceAgent)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
   })
+})
+
+it('hands over the master seat with structured notes and continues cross-session', async () => {
+  const { service, devA, devB, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  await createTicket(service, 'planned card')
+  const inFlight = await createTicket(service, 'in flight')
+  await toNotStarted(service, devA, inFlight)
+  await service.assign(devA, inFlight.id)
+  const underReview = await createTicket(service, 'under review')
+  await toNotStarted(service, devA, underReview)
+  await service.assign(devA, underReview.id)
+  await service.report(workerChild, underReview.id, 'implemented')
+
+  // A non-master cannot hand over the seat.
+  await expect(service.handover('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+
+  // The master hands over: structured notes + released seat.
+  const result = await service.handover('default', devA)
+  expect(result.board.masterAgentId).toBeNull()
+  expect(result.board.masterClaimedAt).toBeNull()
+  const notes = result.notes
+  expect(notes).toContain('# Taskboard handover — board "default"')
+  expect(notes).toContain('## Backlog (1)')
+  expect(notes).toContain('planned card')
+  expect(notes).toContain('## Not started (0)')
+  expect(notes).toContain('## In progress (1)')
+  expect(notes).toContain('in flight')
+  expect(notes).toContain('status running')
+  expect(notes).toContain('worker worker-child-agent (session worker-child-agent)')
+  expect(notes).toContain('## In testing (1)')
+  expect(notes).toContain('under review')
+  expect(notes).toContain('reviewer reviewer-child-agent')
+  expect(notes).toContain('## Master history')
+  expect(notes).toContain('dev-agent-a')
+
+  // The board record carries the notes for the next master.
+  const boardRow = (await service.listBoards(devB)).find(candidate => candidate.boardId === 'default')!
+  expect(boardRow.handoverNotes).toBe(notes)
+
+  // Cross-session: the successor claims the seat, reads the notes and
+  // continues dispatching from them.
+  const claimed = await service.claimMaster('default', devB)
+  expect(claimed.masterAgentId).toBe(devB.id)
+  expect(claimed.handoverNotes).toContain('worker worker-child-agent (session worker-child-agent)')
+  const next = await createTicket(service, 'next dispatch')
+  await toNotStarted(service, devB, next)
+  const assigned = await service.assign(devB, next.id)
+  expect(assigned.worker).toBe('spawned')
+  expect(assigned.ticket.column).toBe('in_progress')
+})
+
+it('rejects handover on an unknown board', async () => {
+  const { service, devA } = await harness()
+  await expect(service.handover('no-such-board', devA)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
+})
+
+it('rejects assign from a subagent session; the top-level master still dispatches', async () => {
+  const { service, devA } = await harness()
+  const subagent = stubAgentForSession(Session.create(SessionId('spawned-child'), undefined, {
+    version: 0,
+    id: SessionId('spawned-child'),
+    createdAt: Date.now(),
+    origin: 'subagent',
+    delegationDepth: 1,
+  }))
+  await service.claimMaster('default', devA)
+  const ticket = await createTicket(service, 'root guard')
+  await toNotStarted(service, devA, ticket)
+  await expect(service.assign(subagent, ticket.id)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_ROOT' })
+  // The top-level master still dispatches after the rejection.
+  const result = await service.assign(devA, ticket.id)
+  expect(result.worker).toBe('spawned')
+  expect(result.ticket.status).toBe('running')
+})
+
+it('notifies the master inbox when a worker reports and when a verdict lands', async () => {
+  let settle!: (result: RunResultStub) => void
+  const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+  const { service, devA, workerChild } = await harness({ reviewerRunResult: runResult })
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await createTicket(service, 'notice card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  // Worker reports done: the master's inbox receives the adjudicate notice.
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.ticket.column).toBe('in_testing')
+  expect(followup).toHaveBeenCalledTimes(1)
+  const first = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+  expect(first.source.kind).toBe('taskboard')
+  expect(first.source.boardId).toBe('default')
+  expect(textOf(first)).toContain(card.id)
+  expect(textOf(first)).toContain('taskboard_resolve_review')
+
+  // The reviewer verdict lands on the card: a second notice reaches the master.
+  settle({ output: [], stopReason: 'completed', structured: { verdict: 'approve', summary: 'verified', problems: [] } })
+  await vi.waitFor(() => {
+    expect(followup.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+  const second = followup.mock.calls[1]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+  expect(second.source.kind).toBe('taskboard')
+  expect(textOf(second)).toContain('approve')
+  expect(textOf(second)).toContain('taskboard_resolve_review')
+})
+
+it('notifies the master inbox when a worker reports failure', async () => {
+  const { service, devA, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await createTicket(service, 'doomed card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  const blocked = await service.fail(workerChild, card.id, 'dependency is down')
+  expect(blocked.status).toBe('blocked')
+  expect(followup).toHaveBeenCalledTimes(1)
+  const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+  expect(message.source.kind).toBe('taskboard')
+  expect(textOf(message)).toContain(card.id)
+  expect(textOf(message)).toContain('taskboard_reassign')
+})
+
+it('notifies the master when a worker run terminates without reporting', async () => {
+  let settle!: (result: RunResultStub) => void
+  const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+  const { service, devA } = await harness({ workerRunResult: runResult })
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await createTicket(service, 'silent worker')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  settle({ output: [], stopReason: 'aborted' })
+  await vi.waitFor(async () => {
+    const current = await service.viewTicket(card.id)
+    expect(current.status).toBe('blocked')
+  })
+  expect(followup).toHaveBeenCalledTimes(1)
+  const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+  expect(message.source.kind).toBe('taskboard')
+  expect(textOf(message)).toContain('terminated without reporting')
+  expect(textOf(message)).toContain('taskboard_reassign')
+})
+
+it('skips the master notice while the seat is vacant', async () => {
+  const { service, devA, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'vacant seat card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  await service.releaseMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.ticket.column).toBe('in_testing')
+  expect(followup).not.toHaveBeenCalled()
+})
+
+it('skips the master notice when the master session is not loaded', async () => {
+  const { service, workerChild } = await harness()
+  const ghost = stubAgent('ghost-master')
+  await service.claimMaster('default', ghost)
+  const card = await createTicket(service, 'ghost seat card')
+  await toNotStarted(service, ghost, card)
+  await service.assign(ghost, card.id)
+  const followup = vi.spyOn(ghost, 'followup')
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.ticket.column).toBe('in_testing')
+  expect(followup).not.toHaveBeenCalled()
+})
+
+it('reports the master lease expiry on every board row', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  try {
+    const { service, devA } = await harness({ masterSeatTimeoutMs: 60000 })
+    const claimed = await service.claimMaster('default', devA)
+    const row = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
+    expect(row.masterExpiresAt).toBe(claimed.masterClaimedAt! + 60000)
+    await service.releaseMaster('default', devA)
+    const vacant = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
+    expect(vacant.masterExpiresAt).toBeNull()
+    expect(vacant.masterAgentId).toBeNull()
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+it('executes the taskboard_handover tool as the master and releases the seat', async () => {
+  const { ctx, service, devA } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'tool handover card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  const result = await ctx.tools.execute({
+    callId: CallId('tool-handover'),
+    name: 'taskboard_handover',
+    arguments: {},
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(result.isError).toBe(false)
+  const value = (result as { value: { boardId: string; masterAgentId: string | null; notes: string } }).value
+  expect(value.boardId).toBe('default')
+  expect(value.masterAgentId).toBeNull()
+  expect(value.notes).toContain('tool handover card')
+  // The rendered content reflects the released seat.
+  const rendered = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+  expect(rendered).toContain('released with structured handover notes')
+})
+
+it('rejects the taskboard_assign tool for a subagent-origin caller', async () => {
+  const { ctx, service, devA } = await harness()
+  const subagent = stubAgentForSession(Session.create(SessionId('spawned-tool-child'), undefined, {
+    version: 0,
+    id: SessionId('spawned-tool-child'),
+    createdAt: Date.now(),
+    origin: 'subagent',
+    delegationDepth: 1,
+  }))
+  await service.claimMaster('default', devA)
+  const ticket = await createTicket(service, 'tool root guard')
+  await toNotStarted(service, devA, ticket)
+
+  const result = await ctx.tools.execute({
+    callId: CallId('tool-assign'),
+    name: 'taskboard_assign',
+    arguments: { ticketId: ticket.id },
+    agent: subagent,
+    signal: new AbortController().signal,
+  })
+  expect(result.isError).toBe(true)
+  expect((result as { error: { message: string } }).error.message).toContain('top-level session agent')
+  // The top-level master still dispatches through the same tool.
+  const ok = await ctx.tools.execute({
+    callId: CallId('tool-assign-ok'),
+    name: 'taskboard_assign',
+    arguments: { ticketId: ticket.id },
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(ok.isError).toBe(false)
+  expect((ok as { value: { worker: string } }).value.worker).toBe('spawned')
+})
+
+it('skips the master notice when the agent registry is absent', async () => {
+  const { ctx, service, devA, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'no registry card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  const followup = vi.spyOn(devA, 'followup')
+  Object.defineProperty(ctx, 'agents', { value: undefined, configurable: true })
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.ticket.column).toBe('in_testing')
+  expect(followup).not.toHaveBeenCalled()
+})
+
+it('builds handover notes covering every card state and the empty history', () => {
+  const board = {
+    boardId: 'default', name: 'default', workspaceId: '', scope: 'project' as const,
+    ownerSessionId: null, masterAgentId: null, masterClaimedAt: null, masterExpiresAt: null,
+    handoverNotes: '', archivedAt: null,
+  }
+  const at = 1000
+  const base: TicketView = {
+    id: 'ticket-x', title: 'x', description: 'x', column: 'backlog', priority: 'normal',
+    boardId: 'default', type: 'feature', status: 'ready', failure: null,
+    createdAt: at, updatedAt: at, position: 0, assignee: null, reviewer: null,
+    reviewAttempts: 0, lastReview: null, reviewOutcome: null, devNotes: '',
+    targetBranch: '', dependsOn: [], history: [],
+  }
+  const backlog = { ...base, id: 'ticket-backlog', title: 'planned', column: 'backlog' as const, dependsOn: ['ticket-done'] }
+  const notStarted = { ...base, id: 'ticket-next', title: 'next up', column: 'not_started' as const, dependsOn: ['ticket-done'] }
+  const claimed = { ...base, id: 'ticket-claimed', title: 'claimed card', column: 'in_progress' as const, status: 'claimed' as const }
+  const sessionlessWorker = {
+    ...base, id: 'ticket-sessionless', title: 'sessionless worker', column: 'in_progress' as const,
+    status: 'running' as const, workerAgentId: 'worker-solo',
+  }
+  const blocked = {
+    ...base, id: 'ticket-blocked', title: 'blocked card', column: 'in_progress' as const, status: 'blocked' as const,
+    workerAgentId: 'worker-1', workerSessionId: 'worker-1', failure: { reason: 'infra down', at },
+  }
+  const vacantReview = {
+    ...base, id: 'ticket-vacant', title: 'vacant seat', column: 'in_testing' as const, status: 'claimed' as const,
+    reviewAttempts: 2,
+  }
+  const verdict = {
+    ...base, id: 'ticket-verdict', title: 'verdict card', column: 'in_testing' as const, status: 'claimed' as const,
+    reviewer: { agentId: 'reviewer-1', label: 'reviewer 1' }, reviewAttempts: 3,
+    reviewOutcome: { verdict: 'approve' as const, summary: 'ok', problems: [], at },
+  }
+  const done = { ...base, id: 'ticket-done', title: 'finished', column: 'done' as const, status: 'claimed' as const }
+
+  const notes = buildHandoverNotes(board, [claimed, sessionlessWorker, blocked, verdict, done, vacantReview, backlog, notStarted])
+  expect(notes).toContain('# Taskboard handover — board "default"')
+  expect(notes).toContain('## Backlog (1)')
+  expect(notes).toContain('ticket-backlog "planned" [feature, normal] — depends on ticket-done')
+  expect(notes).toContain('## Not started (1)')
+  expect(notes).toContain('ticket-next "next up"')
+  expect(notes).toContain('## In progress (3)')
+  expect(notes).toContain('ticket-claimed "claimed card" [feature, normal] — status claimed')
+  expect(notes).toContain('ticket-sessionless "sessionless worker" [feature, normal] — status running; worker worker-solo (session )')
+  expect(notes).toContain('ticket-blocked "blocked card" [feature, normal] — status blocked; worker worker-1 (session worker-1); failure: infra down')
+  expect(notes).toContain('## In testing (2)')
+  expect(notes).toContain('ticket-vacant "vacant seat" [feature, normal] — review attempt 3; review seat vacant')
+  expect(notes).toContain('ticket-verdict "verdict card" [feature, normal] — review attempt 4; reviewer reviewer-1; verdict approve awaiting resolve')
+  expect(notes).toContain('## Done (1)')
+  expect(notes).toContain('ticket-done "finished"')
+  expect(notes).toContain('## Master history')
+  expect(notes).toContain('(no seat transitions yet)')
+  // A history carrying transition notes renders them on their rows.
+  const withHistory = buildHandoverNotes({ ...board, masterHistory: [{ fromAgentId: null, toAgentId: 'agent-two', at: 2000, notes: 'board state: two cards' }] }, [done])
+  expect(withHistory).toContain('agent-two')
+  expect(withHistory).toContain('board state: two cards')
 })
 
 describe('column vocabulary', () => {

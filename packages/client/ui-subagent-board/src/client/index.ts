@@ -101,6 +101,10 @@ export function apply(ctx: ClientContext): void {
       }
       return {
         hooks: { board: source.board },
+        // While this tab is mounted, the parent session's direct-child
+        // catalog consumes live membership updates: subagent start/end
+        // frames refresh it, so the directory stays current.
+        setCatalogOpen: (open: boolean) => ctx.sessions.setSubagentCatalogOpen(sessionId, open),
       }
     },
   }, SubagentBoardView))

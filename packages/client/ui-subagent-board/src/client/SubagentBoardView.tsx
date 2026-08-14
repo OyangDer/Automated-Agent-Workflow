@@ -6,7 +6,7 @@
  * snapshot, grouped into In progress / In testing / other, with a red blocked
  * badge for failed workers.
  */
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import clsx from 'clsx'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { InjectFace, PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
@@ -91,12 +91,20 @@ function labelOf(entry: CatalogEntry): string {
 }
 
 export function SubagentBoardView({
-  useBoard, useSessions, sessionId, t,
+  useBoard, useSessions, sessionId, setCatalogOpen, t,
 }: SubagentBoardViewProps) {
   const board = useBoard(snapshot => snapshot)
   const subagentsByParent = useSessions(state => state.subagentsByParent)
   const tickets = board?.tickets ?? []
   const entries = subagentsByParent[sessionId]?.entries ?? []
+
+  // While this tab is mounted, its parent session's direct-child catalog
+  // consumes live membership updates, so subagent start/end events refresh
+  // the directory without any manual action.
+  useEffect(() => {
+    setCatalogOpen(true)
+    return () => { setCatalogOpen(false) }
+  }, [sessionId, setCatalogOpen])
 
   /** Grouped rows, derived purely from the two snapshots. */
   const groups = useMemo(() => {

@@ -219,6 +219,7 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
   AssignTicketResult: 'taskboard.md',
   BoardView: 'taskboard.md',
   CreateBoardRequest: 'taskboard.md',
+  HandoverResult: 'taskboard.md',
   ReassignTicketResult: 'taskboard.md',
   ResolveReviewResult: 'taskboard.md',
   Agent: 'core.md',

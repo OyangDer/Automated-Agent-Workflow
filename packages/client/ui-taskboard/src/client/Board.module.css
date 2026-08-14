@@ -159,6 +159,53 @@
   background: var(--dsw-alias-button-primary-hover);
 }
 
+.seatBanner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.seatText {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.seatText[data-expiring='true'] {
+  color: var(--dsw-alias-state-warning-primary, #b7791f);
+}
+
+.copyButton {
+  background: var(--dsw-alias-button-primary-fill);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary-inverted);
+  font-size: 11px;
+  line-height: 16px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.copyButton:hover {
+  background: var(--dsw-alias-button-primary-hover);
+}
+
+.seatCopyState {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.seatCopyState[data-copy='failed'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
 .errorBanner {
   display: flex;
   align-items: center;

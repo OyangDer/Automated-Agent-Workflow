@@ -6,7 +6,7 @@
  * state. Props are fed directly — no render machinery — per the
  * component-test convention.
  */
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import type { SubagentCatalogSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
@@ -66,7 +66,9 @@ interface StubProps {
 }
 
 /** Assemble the shares the component destructures. */
-function propsOf({ board, entries, sessionId = 'session-root' }: StubProps): SubagentBoardViewProps {
+function propsOf({
+  board, entries, sessionId = 'session-root', setCatalogOpen,
+}: StubProps & { setCatalogOpen?: (open: boolean) => void }): SubagentBoardViewProps {
   const subagentsByParent = {
     [sessionId]: { entries, parentAvailable: true, state: 'ready', error: null },
   } as unknown as Record<string, never>
@@ -74,6 +76,7 @@ function propsOf({ board, entries, sessionId = 'session-root' }: StubProps): Sub
     useBoard: (selector: (value: BoardSnapshot | null) => BoardSnapshot | null) => selector(board),
     useSessions: (selector: (value: unknown) => unknown) => selector({ subagentsByParent }),
     sessionId: sessionId as never,
+    setCatalogOpen: setCatalogOpen ?? (() => {}),
     t,
   } as unknown as SubagentBoardViewProps
 }
@@ -142,6 +145,16 @@ describe('SubagentBoardView', () => {
   it('shows the loading state while the board snapshot has not arrived', () => {
     render(createElement(SubagentBoardView, propsOf({ board: null, entries: [] })))
     expect(screen.getByText('加载中…')).toBeTruthy()
+  })
+
+  it('opens the live subagent catalog while mounted and closes it on unmount', () => {
+    const setCatalogOpen = vi.fn()
+    const view = render(createElement(SubagentBoardView, propsOf({ board: null, entries: [], setCatalogOpen })))
+    // Mount opens the parent's catalog so subagent start/end refresh the tab.
+    expect(setCatalogOpen).toHaveBeenCalledWith(true)
+    // Unmount closes it so an invisible tab stops consuming live updates.
+    view.unmount()
+    expect(setCatalogOpen).toHaveBeenLastCalledWith(false)
   })
 
   it('matches cards through the reviewer attribution', () => {

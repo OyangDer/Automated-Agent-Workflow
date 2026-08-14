@@ -90,6 +90,9 @@ export function apply(ctx: ClientContext): void {
       // unowned default board reads as project-shared.
       scope: 'project',
       ownerSessionId: null,
+      masterAgentId: null,
+      masterClaimedAt: null,
+      masterExpiresAt: null,
     }
     const listeners = new Set<() => void>()
     const publish = (): void => {
@@ -121,6 +124,9 @@ export function apply(ctx: ClientContext): void {
           workspaceId: workspaceOf(sessionId),
           scope: active?.scope ?? 'project',
           ownerSessionId: active?.ownerSessionId ?? null,
+          masterAgentId: active?.masterAgentId ?? null,
+          masterClaimedAt: active?.masterClaimedAt ?? null,
+          masterExpiresAt: active?.masterExpiresAt ?? null,
         }
       } catch {
         // Keep the last good state; a first load that fails falls back to an
@@ -133,6 +139,9 @@ export function apply(ctx: ClientContext): void {
             workspaceId: current.workspaceId,
             scope: current.scope,
             ownerSessionId: current.ownerSessionId,
+            masterAgentId: current.masterAgentId,
+            masterClaimedAt: current.masterClaimedAt,
+            masterExpiresAt: current.masterExpiresAt,
           }
         }
       }

@@ -11,4 +11,10 @@ import type { BoardSnapshot } from '@deepseek-ai/dsh-taskboard/client'
 export interface SubagentBoardInjected {
   /** Live default-board snapshot source; the renderer binds it into useBoard. */
   hooks: { board: HostObservable<BoardSnapshot | null> }
+  /**
+   * Report whether this tab is consuming live subagent-catalog updates for
+   * its session: while open, subagent start/end membership frames trigger a
+   * debounced catalog refresh in the sessions runtime.
+   */
+  setCatalogOpen(open: boolean): void
 }

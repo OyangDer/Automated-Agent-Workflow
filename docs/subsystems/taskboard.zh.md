@@ -76,6 +76,14 @@ interface TaskboardChanged {
 
 [`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（领取归属、依赖门控、进行中容量、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授按序领取与不得自审自卡的规则。
 
+## 席位与交接
+
+每个看板有一个 master 席位（用 `taskboard_claim_master` 认领，受租期约束）。master 负责派单（`taskboard_assign` —— 仅限顶层会话 Agent，子代理一律拒绝）、重新派发被阻塞的卡片，并裁决 report 模式审核。`taskboard_handover` 将席位交接产品化：生成结构化交接笔记（各卡状态、每个进行中 worker 的身份、In testing 审核席位、待办摘要与 master 历史），写入看板 `handoverNotes` 并释放席位。后继者通过 `taskboard_claim_master` 认领时，其返回结果携带这些笔记，新会话无需轮询即可继续派单。看板行还上报 `masterExpiresAt`（认领时间加配置租期），供浏览器横幅标记租期将尽。
+
+## master 收件箱通知
+
+当 worker 上报完成（`taskboard_report`）、上报失败（`taskboard_fail`）或未上报即终止，或审核结论落到卡片上时，服务会向看板 master 的在线收件箱注入一条轻量通知（沿用 goal 驱动的收件箱注入先例）。master 的 agent loop 会把它作为普通输入处理——用 `taskboard_resolve_review` 裁决、用 `taskboard_reassign` 重新派单——因此 master 无需轮询看板。席位空缺或 master 会话未加载时静默跳过通知。
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -207,6 +215,19 @@ async claimMaster(boardId: string, agent: Agent): Promise<BoardView>
  * @returns the board with an empty seat.
  */
 async releaseMaster(boardId: string, agent: Agent): Promise<BoardView>
+
+/**
+ * Hand over the master seat (master only): generate the structured handover
+ * notes — every card's status, each in-flight worker identity, the In
+ * testing review seats, the backlog summary, and the master history —
+ * write them onto the board's handoverNotes, and release the seat. The
+ * successor claims the seat with taskboard_claim_master, whose result
+ * carries the notes.
+ * @param boardId - the board to hand over.
+ * @param agent - the current master.
+ * @returns the released board plus the generated notes.
+ */
+async handover(boardId: string, agent: Agent): Promise<HandoverResult>
 
 /**
  * Transfer the master seat to another session agent with handover notes.
@@ -387,7 +408,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:296`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:311`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -410,5 +431,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:269`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:276`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

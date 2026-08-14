@@ -76,6 +76,14 @@ interface TaskboardChanged {
 
 [`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) enforces the workflow transitions (claim ownership, dependency gating, in-progress capacity, designated-reviewer authority, reject-and-rework), persists every record through a storage domain, spawns the reviewer child through the subagent seam when a ticket enters In testing, and injects the `taskboard:workflow` system-prompt section that teaches every session the claim-in-order and never-review-your-own-ticket rules.
 
+## Master seat and handover
+
+One board has one master seat (claim with `taskboard_claim_master`, held against a lease). The master dispatches cards (`taskboard_assign` — restricted to the top-level session agent, never a spawned child), re-dispatches blocked work, and adjudicates report-mode reviews. `taskboard_handover` productizes the seat handover: it generates structured notes (every card's status, each in-flight worker's identity, the In testing review seats, the backlog summary, and the master history), writes them onto the board's `handoverNotes`, and releases the seat. The successor's `taskboard_claim_master` result carries those notes, so a new session can continue dispatching without polling. The board row also reports `masterExpiresAt` (claim time plus the configured lease) so the browser banner can flag a lease about to expire.
+
+## Master inbox notices
+
+When a worker reports (`taskboard_report`), fails (`taskboard_fail`), or terminates without reporting, or when a reviewer verdict lands on a card, the service injects a lightweight notice into the live inbox of the board's master (following the goal-round driver's inbox-injection precedent). The master's agent loop claims it as ordinary input — adjudicate with `taskboard_resolve_review`, re-dispatch with `taskboard_reassign` — so the master never needs to poll the board. A vacant seat or a not-loaded master session silently skips the notice.
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>
@@ -207,6 +215,19 @@ async claimMaster(boardId: string, agent: Agent): Promise<BoardView>
  * @returns the board with an empty seat.
  */
 async releaseMaster(boardId: string, agent: Agent): Promise<BoardView>
+
+/**
+ * Hand over the master seat (master only): generate the structured handover
+ * notes — every card's status, each in-flight worker identity, the In
+ * testing review seats, the backlog summary, and the master history —
+ * write them onto the board's handoverNotes, and release the seat. The
+ * successor claims the seat with taskboard_claim_master, whose result
+ * carries the notes.
+ * @param boardId - the board to hand over.
+ * @param agent - the current master.
+ * @returns the released board plus the generated notes.
+ */
+async handover(boardId: string, agent: Agent): Promise<HandoverResult>
 
 /**
  * Transfer the master seat to another session agent with handover notes.
@@ -387,7 +408,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:296`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:311`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -410,5 +431,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:269`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:276`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

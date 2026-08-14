@@ -1808,6 +1808,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the board with an empty seat.',
       },
       {
+        signature: 'async handover(boardId: string, agent: Agent): Promise<HandoverResult>',
+        description: 'Hand over the master seat (master only): generate the structured handover notes — every card\'s status, each in-flight worker identity, the In testing review seats, the backlog summary, and the master history — write them onto the board\'s handoverNotes, and release the seat. The successor claims the seat with taskboard_claim_master, whose result carries the notes.',
+        parameters: [{ name: 'boardId', description: 'the board to hand over.' }, { name: 'agent', description: 'the current master.' }],
+        returns: 'the released board plus the generated notes.',
+      },
+      {
         signature: 'async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView>',
         description: 'Transfer the master seat to another session agent with handover notes. A board the caller cannot see is denied as not found (no existence leak).',
         parameters: [{ name: 'boardId', description: 'the board to transfer.' }, { name: 'fromAgent', description: 'the current master.' }, { name: 'toAgentId', description: 'the receiving session agent id.' }, { name: 'handoverNotes', description: 'notes for the next master.' }],
@@ -3339,6 +3345,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'GoalView',
     declaration: 'export interface GoalView extends GoalSnapshot {\n    readonly roundsStarted: number;\n    readonly createdAt: number;\n    readonly updatedAt: number;\n    readonly activation: GoalActivation;\n}',
+  },
+  {
+    name: 'HandoverResult',
+    declaration: 'export interface HandoverResult {\n    board: BoardView;\n    notes: string;\n}',
   },
   {
     name: 'ImageAttachmentLimits',

@@ -151,7 +151,14 @@ export interface BoardView {
   masterAgentId: string | null
   /** When the master seat was claimed; null while unclaimed. */
   masterClaimedAt: number | null
-  /** Handover notes written on transferMaster, for the next master. */
+  /**
+   * When the current master's seat lease expires (claim time plus the
+   * configured lease), derived by the host on every read; null while the
+   * seat is vacant. The browser banner uses it to flag a lease about to
+   * expire.
+   */
+  masterExpiresAt: number | null
+  /** Handover notes written on transferMaster/taskboard_handover, for the next master. */
   handoverNotes: string
   /** Durable master-seat transitions (claim/transfer), for hierarchy-tree rendering. */
   masterHistory?: MasterHistoryEntry[]

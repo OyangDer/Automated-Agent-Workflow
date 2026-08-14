@@ -55,6 +55,12 @@ interface StubProps {
   scope?: BoardScope
   /** Active board's owning session id; derived when omitted. */
   ownerSessionId?: string | null
+  /** Active board's master seat holder; derived when omitted. */
+  masterAgentId?: string | null
+  /** When the active board's master seat was claimed; derived when omitted. */
+  masterClaimedAt?: number | null
+  /** When the active board's master lease expires; derived when omitted. */
+  masterExpiresAt?: number | null
   selectedId?: string | null
   create?: (request: unknown) => Promise<TicketView>
   move?: (request: unknown) => Promise<TicketView>
@@ -76,13 +82,14 @@ function boardRow(
 ): BoardView {
   return {
     boardId, name, workspaceId, scope, ownerSessionId,
-    masterAgentId: null, masterClaimedAt: null, handoverNotes: '', archivedAt: null,
+    masterAgentId: null, masterClaimedAt: null, masterExpiresAt: null, handoverNotes: '', archivedAt: null,
   }
 }
 
 /** Assemble the four shares the component destructures. */
 function propsOf({
   board, boards = [], boardId = 'default', workspaceId = '', scope, ownerSessionId,
+  masterAgentId, masterClaimedAt, masterExpiresAt,
   selectedId = null, create, move, selectBoard, createBoard, archiveBoard,
 }: StubProps): TaskboardViewProps {
   const active = boards.find(item => item.boardId === boardId)
@@ -93,6 +100,9 @@ function propsOf({
     workspaceId,
     scope: scope ?? active?.scope ?? 'project',
     ownerSessionId: ownerSessionId !== undefined ? ownerSessionId : (active?.ownerSessionId ?? null),
+    masterAgentId: masterAgentId !== undefined ? masterAgentId : (active?.masterAgentId ?? null),
+    masterClaimedAt: masterClaimedAt !== undefined ? masterClaimedAt : (active?.masterClaimedAt ?? null),
+    masterExpiresAt: masterExpiresAt !== undefined ? masterExpiresAt : (active?.masterExpiresAt ?? null),
   }
   const storeState = { selectedId }
   return {
@@ -348,6 +358,71 @@ describe('TaskboardView', () => {
     render(createElement(TaskboardView, propsOf({ board: [bugfix, spike] })))
     expect(screen.getByText('缺陷修复')).toBeTruthy()
     expect(screen.getByText('探索')).toBeTruthy()
+  })
+
+  it('shows the vacant seat banner with a copy-takeover button', async () => {
+    const writeText = vi.fn(async () => {})
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const boards = [boardRow('default', 'default')]
+    render(createElement(TaskboardView, propsOf({ board: [], boards })))
+    expect(screen.getByText('席位空缺')).toBeTruthy()
+    fireEvent.click(screen.getByText('复制接管指令'))
+    await vi.waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1)
+    })
+    const script = writeText.mock.calls[0]![0] as string
+    expect(script).toContain('taskboard_claim_master')
+    expect(script).toContain('boardId "default"')
+    expect(script).toContain('taskboard_assign')
+    expect(script).toContain('taskboard_resolve_review')
+    await vi.waitFor(() => {
+      expect(screen.getByText('已复制')).toBeTruthy()
+    })
+  })
+
+  it('shows the held banner with the master short id and the expiring warning', () => {
+    const boards = [{
+      ...boardRow('default', 'default'),
+      masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 850000,
+      masterExpiresAt: Date.now() + 50000,
+    }]
+    render(createElement(TaskboardView, propsOf({
+      board: [], boards, boardId: 'default', masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 850000, masterExpiresAt: Date.now() + 50000,
+    })))
+    const text = screen.getByText(/席位由 abcdef01 持有/)
+    expect(text.getAttribute('data-expiring')).toBe('true')
+    expect(screen.getByText(/租期将尽/)).toBeTruthy()
+    expect(screen.queryByText('复制接管指令')).toBeNull()
+  })
+
+  it('shows the held banner without the expiring warning inside the lease', () => {
+    const boards = [{
+      ...boardRow('default', 'default'),
+      masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 60000,
+      masterExpiresAt: Date.now() + 600000,
+    }]
+    render(createElement(TaskboardView, propsOf({
+      board: [], boards, masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 60000, masterExpiresAt: Date.now() + 600000,
+    })))
+    expect(screen.getByText(/席位由 abcdef01 持有/)).toBeTruthy()
+    expect(screen.queryByText('租期将尽')).toBeNull()
+  })
+
+  it('reports a failed clipboard copy', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: vi.fn(async () => { throw new Error('denied') }) },
+      configurable: true,
+    })
+    const boards = [boardRow('default', 'default')]
+    render(createElement(TaskboardView, propsOf({ board: [], boards })))
+    fireEvent.click(screen.getByText('复制接管指令'))
+    await vi.waitFor(() => {
+      expect(screen.getByText('复制失败')).toBeTruthy()
+    })
   })
 
   it('archives the active board after inline confirmation', async () => {

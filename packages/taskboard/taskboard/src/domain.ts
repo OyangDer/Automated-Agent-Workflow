@@ -7,7 +7,7 @@
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { TicketHistoryEntry, TicketView } from './types.ts'
+import type { BoardView, ColumnId, TicketHistoryEntry, TicketView } from './types.ts'
 
 /** Stable error codes for rejected taskboard reads and mutations. */
 export type TaskboardErrorCode =
@@ -25,6 +25,7 @@ export type TaskboardErrorCode =
   | 'TASKBOARD_NOT_REVIEWER'
   | 'TASKBOARD_NOT_MASTER'
   | 'TASKBOARD_NOT_WORKER'
+  | 'TASKBOARD_NOT_ROOT'
   | 'TASKBOARD_MASTER_HELD'
   | 'TASKBOARD_REVIEWER_PRESENT'
   | 'TASKBOARD_AGENT_REQUIRED'
@@ -43,7 +44,12 @@ export class TaskboardError extends Error {
 /** How many history rows one ticket retains (oldest dropped first). */
 export const HISTORY_LIMIT = 50
 
-/** Append one bounded history row to a record under construction. */
+/** Append one bounded history row to a record under construction.
+ * @param record - the record to append the row to.
+ * @param kind - the stable event kind (e.g. "create", "claim", "approve").
+ * @param detail - human-readable detail in the board language.
+ * @param at - Unix epoch milliseconds of the row; defaults to now.
+ * @returns the record with the bounded history extended. */
 export function appendHistory(
   record: TicketView,
   kind: string,
@@ -57,19 +63,41 @@ export function appendHistory(
   return { ...record, history }
 }
 
-/** Display label for one agent: the session id is the durable handle, shortened for display. */
+/** Display label for one agent: the session id is the durable handle, shortened for display.
+ * @param agent - the agent to label.
+ * @returns the short display label. */
 export function agentLabel(agent: Agent): string {
   return ['agent', agent.id.slice(0, 8)].join(' ')
 }
 
-/** Display label for a spawned reviewer child. */
+/** Display label for a spawned reviewer child.
+ * @param childAgentId - the reviewer child's agent id.
+ * @returns the short display label. */
 export function reviewerLabel(childAgentId: string): string {
   return ['reviewer', childAgentId.slice(0, 8)].join(' ')
 }
 
-/** Display label for a spawned worker child. */
+/** Display label for a spawned worker child.
+ * @param childAgentId - the worker child's agent id.
+ * @returns the short display label. */
 export function workerLabel(childAgentId: string): string {
   return ['worker', childAgentId.slice(0, 8)].join(' ')
+}
+
+/** Message attribution for master-seat notifications injected into the seat
+ * holder's live inbox (worker report/fail, review verdict landed). Mirrors the
+ * goal-round driver's inbox-injection precedent: the master's agent loop
+ * claims the message as ordinary input and acts without polling the board. */
+export interface TaskboardNoticeSource {
+  readonly kind: 'taskboard'
+  /** The board whose seat holder receives the notice. */
+  readonly boardId: string
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    taskboard: TaskboardNoticeSource
+  }
 }
 
 /**
@@ -202,6 +230,77 @@ export function buildWorkerPrompt(ticket: TicketView, cwd?: string): string {
   ].join('\n')
 }
 
+/** One card's handover line detail, scoped to its column. */
+function handoverCardDetail(ticket: TicketView): string {
+  const bits: string[] = []
+  if (ticket.column === 'in_progress') {
+    bits.push('status ' + ticket.status)
+    if (ticket.workerAgentId !== undefined) {
+      bits.push('worker ' + ticket.workerAgentId + ' (session ' + String(ticket.workerSessionId ?? '') + ')')
+    }
+    if (ticket.failure !== null) bits.push('failure: ' + ticket.failure.reason)
+  } else if (ticket.column === 'in_testing') {
+    bits.push('review attempt ' + String(ticket.reviewAttempts + 1))
+    bits.push(ticket.reviewer === null ? 'review seat vacant' : 'reviewer ' + ticket.reviewer.agentId)
+    if (ticket.reviewOutcome !== null) bits.push('verdict ' + ticket.reviewOutcome.verdict + ' awaiting resolve')
+  } else if (ticket.column === 'not_started' || ticket.column === 'backlog') {
+    if (ticket.dependsOn.length > 0) bits.push('depends on ' + ticket.dependsOn.join(', '))
+  }
+  return bits.length === 0 ? '' : ' — ' + bits.join('; ')
+}
+
+/**
+ * The structured handover notes taskboard_handover writes onto the board for
+ * the next master: one section per column with each card's status, the
+ * in-flight worker identities, the In testing review seats, the backlog
+ * summary, and the durable master-seat history.
+ * @param board - the board being handed over.
+ * @param tickets - every ticket on the board (any order; grouped by column here).
+ * @returns the notes text, formatted for the next master to read.
+ */
+export function buildHandoverNotes(board: BoardView, tickets: TicketView[]): string {
+  const sections: [ColumnId, string][] = [
+    ['backlog', 'Backlog'],
+    ['not_started', 'Not started'],
+    ['in_progress', 'In progress'],
+    ['in_testing', 'In testing'],
+    ['done', 'Done'],
+  ]
+  const lines: string[] = [
+    '# Taskboard handover — board ' + JSON.stringify(board.boardId) + ' ("' + board.name + '")',
+    '',
+    'Generated ' + new Date(Date.now()).toISOString() + '; the seat has been released.',
+    'Claim the seat with taskboard_claim_master (boardId "' + board.boardId + '") — the claim',
+    'result carries these notes — then continue dispatching (taskboard_assign) and',
+    'adjudicating reviews (taskboard_resolve_review) from the state below.',
+    '',
+  ]
+  for (const [column, name] of sections) {
+    const rows = tickets.filter(ticket => ticket.column === column)
+    lines.push('## ' + name + ' (' + String(rows.length) + ')')
+    if (rows.length === 0) {
+      lines.push('- (none)')
+    } else {
+      for (const ticket of rows) {
+        lines.push('- ' + ticket.id + ' "' + ticket.title + '" [' + ticket.type + ', ' + ticket.priority + ']'
+          + handoverCardDetail(ticket))
+      }
+    }
+    lines.push('')
+  }
+  lines.push('## Master history')
+  const history = board.masterHistory ?? []
+  if (history.length === 0) {
+    lines.push('- (no seat transitions yet)')
+  } else {
+    for (const entry of history) {
+      lines.push('- ' + new Date(entry.at).toISOString() + ' ' + String(entry.fromAgentId) + ' -> ' + entry.toAgentId
+        + (entry.notes === '' ? '' : ' — ' + entry.notes))
+    }
+  }
+  return lines.join('\n')
+}
+
 /** The model-facing workflow section injected into every session's system prompt. */
 export const WORKFLOW_SECTION = [
   '# Taskboard workflow',
@@ -236,7 +335,7 @@ export const MASTER_SECTION = [
   'You are the board\'s master: you dispatch tickets to workers, adjudicate review results, and discuss the plan with the user. The master seat is per board — claim it with taskboard_claim_master (boardId defaults to "default") before assigning or resolving work.',
   '',
   '- Solve context pressure with compaction first: when the conversation is long or context is running low, compact instead of handing off.',
-  '- When a handover is genuinely needed, first record handover notes on the board: the board state, every card\'s status, and each in-flight worker\'s identity (workerAgentId/workerSessionId). The successor claims the seat with taskboard_claim_master, reads the board (taskboard_view per card), and continues from those notes.',
+  '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board — every card\'s status, each in-flight worker\'s identity (workerAgentId/workerSessionId), the In testing review seats, the backlog summary, and the master history — then releases the seat. The successor claims the seat with taskboard_claim_master; the claim result carries those notes, and the successor continues dispatching from them.',
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',

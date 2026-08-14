@@ -49,6 +49,12 @@ export interface BoardState {
   scope: BoardScope
   /** The active board's owning session id; null for project-shared boards. */
   ownerSessionId: string | null
+  /** The active board's master seat holder; null while vacant. */
+  masterAgentId: string | null
+  /** When the active board's master seat was claimed; null while vacant. */
+  masterClaimedAt: number | null
+  /** When the active board's master seat lease expires; null while vacant. */
+  masterExpiresAt: number | null
 }
 
 /** One board-creation request the client sends; scope picks the visibility. */
