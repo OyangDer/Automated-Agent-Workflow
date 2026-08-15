@@ -16,6 +16,15 @@ const COLUMNS: readonly ColumnId[] = ['backlog', 'not_started', 'in_progress', '
 
 const PRIORITIES: readonly Priority[] = ['low', 'normal', 'high']
 
+/**
+ * Turn one rejected verb into a user-facing message: surface the real
+ * server failure text when the rejection carries one, falling back to the
+ * generic copy for non-Error rejections.
+ */
+function failureMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim() !== '' ? error.message : fallback
+}
+
 export interface TicketDetailProps {
   ticket: TicketView
   /** All board tickets, for the dependsOn picker. */
@@ -52,10 +61,10 @@ export function TicketDetail({
     }
     setPending(true)
     try {
-      await onEdit({ ticketId: ticket.id, title, description, priority, dependsOn, filesScope })
+      await onEdit({ ticketId: ticket.id, boardId: ticket.boardId, title, description, priority, dependsOn, filesScope })
       setEditing(false)
-    } catch {
-      onError(t('error.generic'))
+    } catch (error) {
+      onError(failureMessage(error, t('error.generic')))
     } finally {
       setPending(false)
     }
@@ -68,10 +77,10 @@ export function TicketDetail({
     }
     setPending(true)
     try {
-      await onRemove({ ticketId: ticket.id })
+      await onRemove({ ticketId: ticket.id, boardId: ticket.boardId })
       onClose()
-    } catch {
-      onError(t('error.generic'))
+    } catch (error) {
+      onError(failureMessage(error, t('error.generic')))
     } finally {
       setPending(false)
     }
@@ -80,9 +89,9 @@ export function TicketDetail({
   const requestReview = async (): Promise<void> => {
     setPending(true)
     try {
-      await onRequestReview({ ticketId: ticket.id })
-    } catch {
-      onError(t('error.generic'))
+      await onRequestReview({ ticketId: ticket.id, boardId: ticket.boardId })
+    } catch (error) {
+      onError(failureMessage(error, t('error.generic')))
     } finally {
       setPending(false)
     }

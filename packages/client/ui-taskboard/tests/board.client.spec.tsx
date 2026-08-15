@@ -231,7 +231,38 @@ describe('TaskboardView', () => {
       requestReview,
     } as unknown as TaskboardViewProps))
     fireEvent.click(screen.getByText('重新送审'))
-    expect(requestReview).toHaveBeenCalledWith({ ticketId: 'ticket-0300' })
+    // The request rides the ticket's own board id, so a ticket on a
+    // non-default board reaches the host with the right context.
+    expect(requestReview).toHaveBeenCalledWith({ ticketId: 'ticket-0300', boardId: 'default' })
+  })
+
+  it('re-requests review with the ticket board when it is not the default', () => {
+    const requestReview = vi.fn(async () => ticket())
+    const card = ticket({ id: 'ticket-0301', column: 'in_testing', reviewer: null, boardId: 'board-9' })
+    const base = propsOf({ board: [card], selectedId: card.id })
+    render(createElement(TaskboardView, {
+      ...base,
+      requestReview,
+    } as unknown as TaskboardViewProps))
+    fireEvent.click(screen.getByText('重新送审'))
+    expect(requestReview).toHaveBeenCalledWith({ ticketId: 'ticket-0301', boardId: 'board-9' })
+  })
+
+  it('surfaces the real server failure instead of the generic copy', async () => {
+    const requestReview = vi.fn(async () => {
+      throw new Error('ticket "ticket-0302" is on board "board-9", not "default"')
+    })
+    const card = ticket({ id: 'ticket-0302', column: 'in_testing', reviewer: null, boardId: 'board-9' })
+    const base = propsOf({ board: [card], selectedId: card.id })
+    render(createElement(TaskboardView, {
+      ...base,
+      requestReview,
+    } as unknown as TaskboardViewProps))
+    fireEvent.click(screen.getByText('重新送审'))
+    await vi.waitFor(() => {
+      expect(screen.getByRole('alert').textContent)
+        .toContain('ticket "ticket-0302" is on board "board-9", not "default"')
+    })
   })
 
   it('renders the board selector with active and archived boards', () => {

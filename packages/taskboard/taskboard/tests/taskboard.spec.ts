@@ -327,6 +327,25 @@ describe('TaskboardService workflow', () => {
       .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
   })
 
+  it('accepts requestReview without a boardId for a ticket on a non-default board', async () => {
+    const { service } = await harness()
+    // A ticket living on its own board (not the legacy default) with a real
+    // reviewer backend available; the caller omits boardId like the v1 UI.
+    const onAlpha = await createTicket(service, 'alpha review card', [], 'alpha')
+    const moved = await service.moveRemote(devAgent(onAlpha), {
+      ticketId: onAlpha.id, column: 'in_testing', beforeTicketId: null, afterTicketId: null,
+    })
+    expect(moved.boardId).toBe('alpha')
+    expect(moved.reviewer?.agentId).toBe('reviewer-child-agent')
+    const reviewed = await service.requestReviewRemote(devAgent(onAlpha), { ticketId: onAlpha.id })
+    expect(reviewed.boardId).toBe('alpha')
+    expect(reviewed.reviewer?.agentId).toBe('reviewer-child-agent')
+    // An explicit wrong board is still rejected: the fallback never forgives
+    // a caller that names a different board than the ticket lives on.
+    await expect(service.requestReviewRemote(devAgent(onAlpha), { ticketId: onAlpha.id, boardId: 'default' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
+  })
+
   it('lists, creates and archives boards through the Remote surface', async () => {
     const { service, devA } = await harness()
     // First access materializes the session-private default board and the legacy default.

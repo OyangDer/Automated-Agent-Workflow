@@ -748,10 +748,13 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Validate the board context of one ticket operation: the requested board
-   * (default "default") must be the ticket's own board.
+   * must be the ticket's own board. An omitted request falls back to the
+   * ticket's own board (v1 callers omit boardId and mean "the ticket's
+   * board"), so a client that forgets the field never trips on a ticket
+   * living on a non-default board; an explicit wrong board is still rejected.
    */
   private static boardContextOf(requestBoardId: string | undefined, ticket: TicketView): string {
-    const requested = requestBoardId ?? 'default'
+    const requested = requestBoardId ?? ticket.boardId
     if (ticket.boardId !== requested) {
       throw new TaskboardError(
         'ticket "' + ticket.id + '" is on board "' + ticket.boardId + '", not "' + requested + '"',
