@@ -51,6 +51,9 @@ function unwrap<T>(result: RemoteResult<T>): T {
  * only survives as the pre-fetch placeholder when no board exists yet. This
  * keeps the first load alive when the legacy 'default' board was adopted by
  * another workspace and the host denies its snapshot.
+ * @param boardId - the board the caller asked to render.
+ * @param boards - the board list the host reports as visible to the session.
+ * @returns the board id to snapshot: the request when visible, else the first visible board, else the request.
  */
 export function pickBoardTarget(boardId: string, boards: readonly BoardView[]): string {
   if (boards.some(board => board.boardId === boardId)) return boardId
