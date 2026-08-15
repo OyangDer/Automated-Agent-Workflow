@@ -45,6 +45,18 @@ function unwrap<T>(result: RemoteResult<T>): T {
   return result.value
 }
 
+/**
+ * Pick the effective active board for a fetch: the requested board when the
+ * session can see it, otherwise the first visible board. The requested id
+ * only survives as the pre-fetch placeholder when no board exists yet. This
+ * keeps the first load alive when the legacy 'default' board was adopted by
+ * another workspace and the host denies its snapshot.
+ */
+export function pickBoardTarget(boardId: string, boards: readonly BoardView[]): string {
+  if (boards.some(board => board.boardId === boardId)) return boardId
+  return boards[0]?.boardId ?? boardId
+}
+
 /** One session's live board state source (created lazily per session cell). */
 interface BoardSource {
   board: HostObservable<BoardState>
@@ -82,12 +94,14 @@ export function apply(ctx: ClientContext): void {
   /** Build one session's board state source. */
   const makeSource = (sessionId: SessionId): BoardSource => {
     let current: BoardState = {
+      // Pre-fetch placeholder: the effective active board is resolved after
+      // the first listBoards lands (the legacy 'default' may be invisible to
+      // this session once another workspace adopted it).
       boardId: 'default',
       boards: [],
       snapshot: null,
       workspaceId: workspaceOf(sessionId),
-      // The default fallback before the first fetch lands: the legacy
-      // unowned default board reads as project-shared.
+      // The pre-fetch fallback reads as project-shared.
       scope: 'project',
       ownerSessionId: null,
       masterAgentId: null,
@@ -99,15 +113,29 @@ export function apply(ctx: ClientContext): void {
       for (const listener of listeners) listener()
     }
 
-    /** Fetch the board list and one board's snapshot in one round trip. */
-    const fetchBoardState = async (boardId: string): Promise<{ boards: BoardView[]; snapshot: BoardSnapshot }> => {
-      const [boards, snapshot] = await Promise.all([
-        // The host lands scope/ownerSessionId with the incremental contract;
-        // the cast pins the client's forward view of the wire rows.
-        unwrap(await ctx.remote.taskboard.listBoards(sessionId)) as BoardView[],
-        unwrap(await ctx.remote.taskboard.snapshot(sessionId, boardId)),
-      ])
-      return { boards, snapshot }
+    /**
+     * Fetch the board list and the active board's snapshot. The list is
+     * authoritative for visibility: when the requested board is not in it
+     * (the legacy 'default' may belong to another workspace under project
+     * isolation), the first visible board becomes the effective active
+     * board instead of failing the whole first load. A snapshot failure
+     * degrades to an empty snapshot while keeping the fetched board list,
+     * so the selector never loses the boards it already knows about.
+     */
+    const fetchBoardState = async (boardId: string): Promise<{ boardId: string; boards: BoardView[]; snapshot: BoardSnapshot }> => {
+      const boards = unwrap(await ctx.remote.taskboard.listBoards(sessionId)) as BoardView[]
+      const target = pickBoardTarget(boardId, boards)
+      let snapshot: BoardSnapshot
+      if (boards.length === 0) {
+        snapshot = { boardId: target, name: target, tickets: [] }
+      } else {
+        try {
+          snapshot = unwrap(await ctx.remote.taskboard.snapshot(sessionId, target))
+        } catch {
+          snapshot = { boardId: target, name: target, tickets: [] }
+        }
+      }
+      return { boardId: target, boards, snapshot }
     }
 
     /** Refetch the active board's state and republish it. */
@@ -117,10 +145,11 @@ export function apply(ctx: ClientContext): void {
         const next = await fetchBoardState(boardId)
         // A selection made while this fetch was in flight wins; drop the stale state.
         if (current.boardId !== boardId) return
-        const active = next.boards.find(board => board.boardId === boardId)
+        const active = next.boards.find(board => board.boardId === next.boardId)
         current = {
-          boardId,
-          ...next,
+          boardId: next.boardId,
+          boards: next.boards,
+          snapshot: next.snapshot,
           workspaceId: workspaceOf(sessionId),
           scope: active?.scope ?? 'project',
           ownerSessionId: active?.ownerSessionId ?? null,
@@ -129,19 +158,12 @@ export function apply(ctx: ClientContext): void {
           masterExpiresAt: active?.masterExpiresAt ?? null,
         }
       } catch {
-        // Keep the last good state; a first load that fails falls back to an
-        // empty snapshot so the tab renders something.
+        // Keep the last good state; a first load whose board list also fails
+        // falls back to an empty snapshot so the tab renders something.
         if (current.boardId === boardId && current.snapshot === null) {
           current = {
-            boardId,
-            boards: current.boards,
+            ...current,
             snapshot: { boardId, name: boardId, tickets: [] },
-            workspaceId: current.workspaceId,
-            scope: current.scope,
-            ownerSessionId: current.ownerSessionId,
-            masterAgentId: current.masterAgentId,
-            masterClaimedAt: current.masterClaimedAt,
-            masterExpiresAt: current.masterExpiresAt,
           }
         }
       }
