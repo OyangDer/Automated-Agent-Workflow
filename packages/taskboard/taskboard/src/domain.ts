@@ -7,7 +7,7 @@
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { BoardView, ColumnId, TicketHistoryEntry, TicketView } from './types.ts'
+import type { BoardNotice, BoardView, ColumnId, TicketHistoryEntry, TicketView } from './types.ts'
 
 /** Stable error codes for rejected taskboard reads and mutations. */
 export type TaskboardErrorCode =
@@ -43,6 +43,23 @@ export class TaskboardError extends Error {
 
 /** How many history rows one ticket retains (oldest dropped first). */
 export const HISTORY_LIMIT = 50
+
+/** How many master notices one board retains (oldest dropped first). */
+export const NOTICE_LIMIT = 100
+
+/** Append one bounded master notice to a board record under construction.
+ * @param board - the board record to extend.
+ * @param notice - the durable notice row to append.
+ * @returns the board with the bounded notices extended. */
+export function appendNotice(
+  board: BoardView,
+  notice: BoardNotice,
+): BoardView {
+  const notices = (board.notices ?? []).length >= NOTICE_LIMIT
+    ? [...(board.notices ?? []).slice(-(NOTICE_LIMIT - 1)), notice]
+    : [...(board.notices ?? []), notice]
+  return { ...board, notices }
+}
 
 /** Append one bounded history row to a record under construction.
  * @param record - the record to append the row to.
@@ -354,6 +371,7 @@ export const WORKFLOW_SECTION = [
   '- Dispatch a Not started ticket with taskboard_assign: the card moves to In progress and a fresh worker subagent (DeepSeek v4 flash) is spawned with the ticket content; the card records the worker identity. Workers finish with taskboard_report (done) or taskboard_fail (blocked).',
   '- When a worker fails or its session terminates without reporting, the card stays In progress with status "blocked" and a failure record. Use taskboard_reassign with action "retry" to spawn a new worker, or action "backlog" to return the card to Not started.',
   '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
+  '- Master notifications are durable: worker done/failed/lost events and review verdicts land a notice on the board (readable via taskboard_notices, and carried by the taskboard_claim_master result) and are injected into the master\'s inbox live, or queued into the master\'s persisted inbox when the master session is not live so the next run receives them.',
   "- Never move cards on the user's behalf: dragging cards between columns — in particular Backlog to Not started — is the user's \"start this\" signal in the web UI.",
 ].join('\n')
 
@@ -376,6 +394,7 @@ export const MASTER_SECTION = [
   '- Solve context pressure with compaction first: when the conversation is long or context is running low, compact instead of handing off.',
   '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board — every card\'s status, each in-flight worker\'s identity (workerAgentId/workerSessionId), the In testing review seats, the backlog summary, and the master history — then releases the seat. The successor claims the seat with taskboard_claim_master; the claim result carries those notes, and the successor continues dispatching from them.',
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
+  '- Master notices are durable: every worker done/failed/lost event and review verdict lands a {kind, text, at, ticketId} row on the board synchronously, and is injected into your inbox when your session is live (or queued into your persisted inbox when it is not, so the next run replays it). Read them with taskboard_notices, or with taskboard_claim_master whose result carries them — do not rely on polling the board in a loop.',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
   '',

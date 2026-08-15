@@ -32,14 +32,15 @@ import {
   TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
 import type {
-  ArchiveBoardRequest, BoardSnapshot, BoardView, ColumnId, CreateBoardRequest,
+  ArchiveBoardRequest, BoardNotice, BoardSnapshot, BoardView, ColumnId, CreateBoardRequest,
   CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MoveTicketRequest, Priority,
   RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, TaskboardChanged,
   TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
-  agentLabel, appendHistory, buildHandoverNotes, buildReviewPrompt, buildReviewReportPrompt,
-  buildWorkerPrompt, MASTER_SECTION, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
+  agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildReviewPrompt,
+  buildReviewReportPrompt, buildWorkerPrompt, MASTER_SECTION, reviewerLabel, TaskboardError,
+  WORKFLOW_SECTION,
 } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
@@ -110,6 +111,12 @@ const boardSchema = zod.object({
     at: zod.number(),
     notes: zod.string(),
   })).default([]),
+  notices: zod.array(zod.object({
+    kind: zod.string(),
+    text: zod.string(),
+    at: zod.number(),
+    ticketId: zod.string(),
+  })).default([]),
   archivedAt: zod.number().nullable().default(null),
 })
 
@@ -137,6 +144,79 @@ function isReviewOutcome(value: unknown): value is { verdict: 'approve' | 'rejec
   if (record.verdict !== 'approve' && record.verdict !== 'reject') return false
   if (typeof record.summary !== 'string') return false
   return Array.isArray(record.problems) && record.problems.every(problem => typeof problem === 'string')
+}
+
+/** Stable master-notice event kinds (the dedupe key part alongside ticketId). */
+const NOTICE_KIND = {
+  reviewVerdict: 'review-verdict',
+  workerDone: 'worker-done',
+  workerFailed: 'worker-failed',
+  workerTerminated: 'worker-terminated',
+  workerLost: 'worker-lost',
+} as const
+
+/**
+ * The minimal session-persistence surface the cold master-inbox delivery
+ * needs: read the stored log (inspect) and durably append a contiguous batch
+ * (append). Structural typing on purpose — the taskboard package must not
+ * hard-depend on the persistence backend package; a backend exposing these
+ * two methods (the @deepseek-ai/dsh-session-persistence Service contract)
+ * satisfies the seam.
+ */
+interface SessionInspectionLike {
+  readonly meta: { readonly id: SessionId }
+  readonly events: readonly {
+    readonly type: string
+    readonly seq: number
+    readonly time: number
+    readonly data: unknown
+  }[]
+}
+
+interface SessionPersistenceLike {
+  append(id: SessionId, events: readonly unknown[]): Promise<void>
+  inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspectionLike>
+}
+
+/** One durable agent-inbox mutation in the shape the session log stores. */
+interface InboxSpliceEventLike {
+  readonly type: 'agent/inbox/spliced'
+  readonly seq: number
+  readonly time: number
+  readonly data: {
+    target: 'next-turn' | 'next-step'
+    start: number
+    inserted: unknown[]
+  }
+}
+
+/**
+ * Fold a stored session log's 'agent/inbox/spliced' events into the pending
+ * message count per inbox target, mirroring the agent-loop Inbox projection
+ * (Inbox.apply replays the same events on session load). Used to compute the
+ * append coordinate of a cold master's inbox so a delivered notice lands at
+ * the end of the pending queue and never clobbers already-pending input.
+ */
+function pendingInboxLengths(
+  events: readonly { type: string; data: unknown }[],
+): { nextTurn: number; nextStep: number } {
+  let nextTurn = 0
+  let nextStep = 0
+  for (const event of events) {
+    if (event.type !== 'agent/inbox/spliced') continue
+    const splice = event.data as { target?: string; start?: number; removedCount?: number; inserted?: unknown[] }
+    if (splice.target !== 'next-turn' && splice.target !== 'next-step') continue
+    const start = typeof splice.start === 'number' && splice.start >= 0 ? splice.start : 0
+    const removed = typeof splice.removedCount === 'number' ? splice.removedCount : 0
+    const inserted = Array.isArray(splice.inserted) ? splice.inserted.length : 0
+    const current = splice.target === 'next-turn' ? nextTurn : nextStep
+    // Standard array-splice arithmetic, defensively clamped against a corrupt log.
+    const removedFromTail = Math.min(removed, Math.max(current - start, 0))
+    const updated = Math.max(current - removedFromTail, 0) + inserted
+    if (splice.target === 'next-turn') nextTurn = updated
+    else nextStep = updated
+  }
+  return { nextTurn, nextStep }
 }
 
 /** The taskboard storage domain declaration: tickets plus boards tables. */
@@ -172,6 +252,12 @@ export interface Config {
    * scan still runs once). Defaults to 60000.
    */
   reconcileIntervalMs?: number
+  /**
+   * Master-notice dedupe window in milliseconds: a second notice for the
+   * same board + ticket + event kind within the window records nothing and
+   * delivers nothing (0 disables dedupe). Defaults to 10000.
+   */
+  noticeDedupeWindowMs?: number
 }
 
 /** Schemastery configuration for the taskboard consumer. */
@@ -184,6 +270,7 @@ export const Config: z<Config> = z.object({
   masterSeatTimeoutMs: z.number().default(900000),
   reviewMode: z.union(['report', 'direct'] as const).default('report'),
   reconcileIntervalMs: z.number().default(60000),
+  noticeDedupeWindowMs: z.number().default(10000),
 })
 
 /** One worker-spawn outcome. */
@@ -283,6 +370,14 @@ function resolveReconcileInterval(value: number): number {
   return value
 }
 
+/** Validate one explicit master-notice dedupe window (0 disables dedupe). */
+function resolveNoticeDedupeWindow(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: noticeDedupeWindowMs must be a non-negative safe integer')
+  }
+  return value
+}
+
 /** Derived lease expiry of one board row; null while the seat is vacant. */
 function masterExpiryOf(board: BoardView, leaseMs: number): number | null {
   if (board.masterAgentId === null || board.masterClaimedAt === null) return null
@@ -343,6 +438,7 @@ export class TaskboardService extends TypertRemoteService {
     masterSeatTimeoutMs: number
     reviewMode: 'report' | 'direct'
     reconcileIntervalMs: number
+    noticeDedupeWindowMs: number
   }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
@@ -357,6 +453,7 @@ export class TaskboardService extends TypertRemoteService {
       masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
       reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
       reconcileIntervalMs: resolveReconcileInterval(config.reconcileIntervalMs ?? 60000),
+      noticeDedupeWindowMs: resolveNoticeDedupeWindow(config.noticeDedupeWindowMs ?? 10000),
     }
     this.domain = ctx.storageDomain.open(TASKBOARD_DOMAIN)
     // The open races shutdown when the host unmounts before it resolves;
@@ -474,6 +571,7 @@ export class TaskboardService extends TypertRemoteService {
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
+      notices: [],
     }
     await table.put(boardId, record)
     return record
@@ -509,15 +607,10 @@ export class TaskboardService extends TypertRemoteService {
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
+      notices: [],
     }
     await table.put(boardId, record)
     return record
-  }
-
-  /** The display name of one board (the boardId itself while implicit). */
-  private async boardName(boardId: string): Promise<string> {
-    const table = await this.boards()
-    return table.get(boardId)?.name ?? boardId
   }
 
   /**
@@ -880,7 +973,8 @@ export class TaskboardService extends TypertRemoteService {
     // The verdict landed on the board: the master must resolve it.
     if (landed) {
       await this.notifyMaster(next.boardId,
-        'Taskboard notice: the review verdict (' + structured.verdict + ') for ticket ' + next.id + ' ("' + next.title + '") landed on the board. Adjudicate it with taskboard_resolve_review.')
+        'Taskboard notice: the review verdict (' + structured.verdict + ') for ticket ' + next.id + ' ("' + next.title + '") landed on the board. Adjudicate it with taskboard_resolve_review.',
+        NOTICE_KIND.reviewVerdict, next.id)
     }
   }
 
@@ -1012,7 +1106,8 @@ export class TaskboardService extends TypertRemoteService {
     })
     if (reclaimed) {
       await this.notifyMaster(next.boardId,
-        'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") terminated without reporting; the card is blocked. Re-dispatch with taskboard_reassign.')
+        'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") terminated without reporting; the card is blocked. Re-dispatch with taskboard_reassign.',
+        NOTICE_KIND.workerTerminated, next.id)
     }
   }
 
@@ -1090,7 +1185,8 @@ export class TaskboardService extends TypertRemoteService {
       if (marked) {
         blockedCount += 1
         await this.notifyMaster(next.boardId,
-          'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is no longer a live session (absent from the agent registry, e.g. after a restart); the card is blocked. Re-dispatch with taskboard_reassign.')
+          'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is no longer a live session (absent from the agent registry, e.g. after a restart); the card is blocked. Re-dispatch with taskboard_reassign.',
+          NOTICE_KIND.workerLost, next.id)
       }
     }
     return blockedCount
@@ -1185,6 +1281,8 @@ export class TaskboardService extends TypertRemoteService {
     )
     const board = boardId ?? defaultBoard?.boardId ?? 'default'
     await this.assertBoardAccessible(board, agent)
+    const boards = await this.boards()
+    const boardRow = boards.get(board) ?? await this.ensureBoard(board)
     const table = await this.openedTable()
     const rows: TicketView[] = []
     for (const [, ticket] of table.entries()) {
@@ -1194,7 +1292,7 @@ export class TaskboardService extends TypertRemoteService {
       const columnOrder = TASKBOARD_COLUMNS.indexOf(a.column) - TASKBOARD_COLUMNS.indexOf(b.column)
       return columnOrder !== 0 ? columnOrder : a.position - b.position
     })
-    return { boardId: board, name: await this.boardName(board), tickets }
+    return { boardId: board, name: boardRow.name, tickets, notices: boardRow.notices ?? [] }
   }
 
   private openTable: KvTable<string, TicketView> | null = null
@@ -1239,6 +1337,7 @@ export class TaskboardService extends TypertRemoteService {
         masterExpiresAt: null,
         handoverNotes: '',
         masterHistory: [],
+        notices: [],
         archivedAt: null,
       })
     }
@@ -1283,6 +1382,7 @@ export class TaskboardService extends TypertRemoteService {
       handoverNotes: '',
       archivedAt: null,
       masterHistory: [],
+      notices: [],
     }
     await (await this.boards()).put(record.boardId, record)
     return record
@@ -1596,39 +1696,110 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Inject one lightweight notice into the live inbox of the board's seat
-   * holder (the master), following the goal-round driver's inbox-injection
-   * precedent: the master's agent loop claims the message as ordinary input
-   * and acts on it — no board polling. Best-effort by design: a vacant seat,
-   * a not-loaded master session, or a delivery fault never fails the
+   * Notify the board's master about one workflow event. Three layers, in
+   * order of durability:
+   * 1. A durable in-board notice ({kind, text, at, ticketId}) is recorded
+   *    synchronously on the board — the master reads it back through
+   *    taskboard_claim_master / taskboard_notices even when every delivery
+   *    path fails.
+   * 2. Live inbox injection when the master session is in the agent registry
+   *    (master.followup, the goal-round driver's inbox-injection precedent):
+   *    the loop claims the message as ordinary input and acts on it — no
+   *    board polling.
+   * 3. Persistent inbox delivery when the master is NOT live (e.g. after a
+   *    restart the session is absent from the runtime registry): the notice
+   *    is appended as an 'agent/inbox/spliced' event to the master's
+   *    persisted session log through ctx.sessionPersistence, so the master's
+   *    next load/resume replays it as new input (the agent-loop Inbox
+   *    rebuilds its pending projection from exactly those events).
+   * Same board + ticket + event kind inside the dedupe window records nothing
+   * and delivers nothing. Best-effort by design: a vacant seat, an absent
+   * registry/persistence backend, or any delivery fault never fails the
    * triggering mutation.
    * @param boardId - the board whose master receives the notice.
    * @param text - the notice text (what happened and what to do next).
+   * @param kind - the stable event kind (dedupe key part, e.g. "worker-done").
+   * @param ticketId - the ticket the notice refers to (dedupe key part; '' for board-wide notices).
    */
-  private async notifyMaster(boardId: string, text: string): Promise<void> {
-    // The whole notification path is best-effort and must never fail the
-    // mutation that triggered it: a missing board, a vacant seat, a registry
-    // that is absent or rejects the lookup, or a followup fault all degrade
-    // to a silent skip — the master reads the board when it returns.
+  private async notifyMaster(boardId: string, text: string, kind: string, ticketId = ''): Promise<void> {
     try {
-      const table = await this.boards()
-      const board = table.get(boardId)
-      if (board === undefined || board.masterAgentId === null) return
-      // The agent registry is a runtime dependency of the live master's inbox;
-      // without it (or before the master session is loaded) the notice is
-      // skipped silently — the master reads the board when it returns.
-      const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
-      if (registry === undefined || typeof registry.get !== 'function') return
-      const master = registry.get(board.masterAgentId as SessionId)
-      if (master === undefined || typeof master.followup !== 'function') return
+      // Dedupe before any write: a repeated same-board/same-ticket/same-kind
+      // notice inside the window records nothing and delivers nothing.
+      if (!(await this.recordBoardNotice(boardId, text, kind, ticketId))) return
+      await this.deliverInbox(boardId, text)
+    } catch {
+      // A notification must never fail the mutation that triggered it.
+    }
+  }
+
+  /** Record one durable in-board notice; false when deduped or the board vanished. */
+  private async recordBoardNotice(boardId: string, text: string, kind: string, ticketId: string): Promise<boolean> {
+    const table = await this.boards()
+    if (table.get(boardId) === undefined) {
+      // Materialize the implicit board record so every notification leaves a
+      // durable trace even when the board was never explicitly created.
+      await this.ensureBoard(boardId)
+    }
+    const now = Date.now()
+    let appended = false
+    try {
+      await table.update(boardId, (current) => {
+        const tail = current.notices?.at(-1)
+        if (tail !== undefined && tail.ticketId === ticketId && tail.kind === kind
+          && now - tail.at < this.resolved.noticeDedupeWindowMs) {
+          return current
+        }
+        appended = true
+        return appendNotice(current, { kind, text, at: now, ticketId })
+      })
+    } catch (error) {
+      // The board vanished between the ensure and the update: no master can
+      // exist either, so the notice has nowhere to land — degrade quietly.
+      if (error instanceof DomainError && error.code === 'missing-key') return false
+      throw error
+    }
+    return appended
+  }
+
+  /** Deliver one notice into the master's inbox: live followup, else a persistent inbox splice. */
+  private async deliverInbox(boardId: string, text: string): Promise<void> {
+    const board = (await this.boards()).get(boardId)
+    if (board === undefined || board.masterAgentId === null) return
+    const masterId = board.masterAgentId as SessionId
+    // Live path: the master session is in the runtime registry (an idle agent
+    // is still alive; only an unregistered session — e.g. after a restart —
+    // is lost). followup() writes the splice into the live session log, which
+    // the normal durability flush persists.
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    const master = registry?.get(masterId)
+    if (master !== undefined && typeof master.followup === 'function') {
       const message = createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'taskboard', boardId },
       })
       master.followup(message)
-    } catch {
-      // A notification must never fail the mutation that triggered it.
+      return
     }
+    // Persistent path: queue the notice into the master's persisted session
+    // log so its next load/resume delivers it as pending input. Only reachable
+    // with a session-persistence backend configured.
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined || typeof persistence.append !== 'function' || typeof persistence.inspect !== 'function') return
+    const inspected = await persistence.inspect(masterId)
+    if (inspected === undefined) return
+    const events = inspected.events
+    const pending = pendingInboxLengths(events)
+    const message = createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'taskboard', boardId },
+    })
+    const splice: InboxSpliceEventLike = {
+      type: 'agent/inbox/spliced',
+      seq: events.length,
+      time: Date.now(),
+      data: { target: 'next-turn', start: pending.nextTurn, inserted: [message] },
+    }
+    await persistence.append(masterId, [splice])
   }
 
   /**
@@ -1777,13 +1948,15 @@ export class TaskboardService extends TypertRemoteService {
         await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
       }
       await this.notifyMaster(ticket.boardId,
-        'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
+        'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.',
+        NOTICE_KIND.workerDone, ticket.id)
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
     this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
     await this.notifyMaster(withReviewer.boardId,
-      'Taskboard notice: the worker for ticket ' + withReviewer.id + ' ("' + withReviewer.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
+      'Taskboard notice: the worker for ticket ' + withReviewer.id + ' ("' + withReviewer.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.',
+      NOTICE_KIND.workerDone, withReviewer.id)
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
 
@@ -1820,7 +1993,8 @@ export class TaskboardService extends TypertRemoteService {
       )
     })
     await this.notifyMaster(blocked.boardId,
-      'Taskboard notice: the worker for ticket ' + blocked.id + ' ("' + blocked.title + '") reported failure; the card is blocked. Re-dispatch with taskboard_reassign.')
+      'Taskboard notice: the worker for ticket ' + blocked.id + ' ("' + blocked.title + '") reported failure; the card is blocked. Re-dispatch with taskboard_reassign.',
+      NOTICE_KIND.workerFailed, blocked.id)
     return blocked
   }
 
@@ -2387,6 +2561,22 @@ export class TaskboardService extends TypertRemoteService {
     return ticket
   }
 
+  /**
+   * Read the durable master notices of one board — the in-board fallback
+   * inbox. Every notifyMaster event lands a row here synchronously, so the
+   * master can see what happened even when live followup or persistent inbox
+   * delivery could not reach it. A board the caller cannot see is denied as
+   * not found (no existence leak).
+   * @param boardId - the board to read.
+   * @param agent - the calling session agent.
+   * @returns the board id and its notices, newest last.
+   */
+  async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; notices: BoardNotice[] }> {
+    await this.assertBoardAccessible(boardId, agent)
+    const board = await this.ensureBoard(boardId)
+    return { boardId, notices: board.notices ?? [] }
+  }
+
   /** Capture the opened table handle once the domain resolves. */
   private async openedTable(): Promise<KvTable<string, TicketView>> {
     if (this.openTable !== null) return this.openTable
@@ -2775,7 +2965,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_claim_master',
-      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history).',
+      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board\'s durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.',
       parameters: {
         boardId: {
           type: 'string' as const,
@@ -2790,19 +2980,74 @@ export class TaskboardService extends TypertRemoteService {
             name: { type: 'string', required: true },
             masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
             handoverNotes: { type: 'string', required: true },
+            notices: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  kind: { type: 'string', required: true },
+                  text: { type: 'string', required: true },
+                  at: { type: 'number', required: true },
+                  ticketId: { type: 'string', required: true },
+                },
+              },
+            },
           },
         },
-        render: (_args, value: { boardId: string; masterAgentId: string | null; handoverNotes: string }) => [{
+        render: (_args, value: { boardId: string; masterAgentId: string | null; handoverNotes: string; notices: BoardNotice[] }) => [{
           type: 'text' as const,
           text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId)
-            + (value.handoverNotes === '' ? '' : '; handover notes available in the claim result'),
+            + (value.handoverNotes === '' ? '' : '; handover notes available in the claim result')
+            + (value.notices.length === 0 ? '' : '; ' + String(value.notices.length) + ' notice(s) available in the claim result'),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
         const board = await this.claimMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
-        return { boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId, handoverNotes: board.handoverNotes }
+        return {
+          boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId,
+          handoverNotes: board.handoverNotes, notices: board.notices ?? [],
+        }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Claim taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_notices',
+      description: 'Read the durable master notices of a taskboard board (default board "default"): every notice (worker reported done/failed, worker lost after a restart, review verdicts) lands on the board synchronously, so this read works even when live or persistent inbox delivery could not reach the master. Notices carry {kind, text, at, ticketId}; the newest is last.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to read. Omit for the default board.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            notices: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  kind: { type: 'string', required: true },
+                  text: { type: 'string', required: true },
+                  at: { type: 'number', required: true },
+                  ticketId: { type: 'string', required: true },
+                },
+              },
+            },
+          },
+        },
+        render: (_args, value: { boardId: string; notices: BoardNotice[] }) => [{
+          type: 'text' as const,
+          text: String(value.notices.length) + ' notice(s) on board ' + value.boardId,
+        }],
+      },
+      execute: async (args: { boardId?: string }, exec) => {
+        return await this.boardNotices(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Read taskboard board notices', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
     }))
 
     this.ctx.tools.register(defineTool({
@@ -3239,6 +3484,7 @@ const WORKER_DENIED_TOOLS = [
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
   'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
   'taskboard_handover', 'taskboard_create', 'taskboard_move', 'taskboard_plan',
+  'taskboard_notices',
 ] as const
 
 /**

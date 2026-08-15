@@ -217,6 +217,7 @@ export const EVENT_WALK_EXEMPTIONS: Record<string, string> = {
 export const LINK_MAP: Readonly<Record<string, string>> = {
   ArchiveBoardRequest: 'taskboard.md',
   AssignTicketResult: 'taskboard.md',
+  BoardNotice: 'taskboard.md',
   BoardView: 'taskboard.md',
   CreateBoardRequest: 'taskboard.md',
   HandoverResult: 'taskboard.md',

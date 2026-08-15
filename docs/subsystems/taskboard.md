@@ -433,11 +433,23 @@ async listRows(column: ColumnId | null, mine: boolean, agentId: string): Promise
  * @returns the full ticket view.
  */
 async viewTicket(ticketId: string): Promise<TicketView>
+
+/**
+ * Read the durable master notices of one board — the in-board fallback
+ * inbox. Every notifyMaster event lands a row here synchronously, so the
+ * master can see what happened even when live followup or persistent inbox
+ * delivery could not reach it. A board the caller cannot see is denied as
+ * not found (no existence leak).
+ * @param boardId - the board to read.
+ * @param agent - the calling session agent.
+ * @returns the board id and its notices, newest last.
+ */
+async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; notices: BoardNotice[] }>
 ```
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:332`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:427`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -460,5 +472,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:287`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:308`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

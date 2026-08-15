@@ -1921,6 +1921,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         parameters: [{ name: 'ticketId', description: 'the ticket to read.' }],
         returns: 'the full ticket view.',
       },
+      {
+        signature: 'async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; notices: BoardNotice[] }>',
+        description: 'Read the durable master notices of one board — the in-board fallback inbox. Every notifyMaster event lands a row here synchronously, so the master can see what happened even when live followup or persistent inbox delivery could not reach it. A board the caller cannot see is denied as not found (no existence leak).',
+        parameters: [{ name: 'boardId', description: 'the board to read.' }, { name: 'agent', description: 'the calling session agent.' }],
+        returns: 'the board id and its notices, newest last.',
+      },
     ],
   },
   {
@@ -2933,8 +2939,12 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface BashEnvVariableInfo extends BashEnvVariable {\n    contributor: string;\n    key: DshEnvironmentKey;\n}',
   },
   {
+    name: 'BoardNotice',
+    declaration: 'export interface BoardNotice {\n    kind: string;\n    text: string;\n    at: number;\n    ticketId: string;\n}',
+  },
+  {
     name: 'BoardSnapshot',
-    declaration: 'export interface BoardSnapshot {\n    boardId: string;\n    name: string;\n    tickets: TicketView[];\n}',
+    declaration: 'export interface BoardSnapshot {\n    boardId: string;\n    name: string;\n    tickets: TicketView[];\n    notices?: BoardNotice[];\n}',
   },
   {
     name: 'Branded',

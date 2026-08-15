@@ -128,6 +128,23 @@ export interface TicketView {
   history: TicketHistoryEntry[]
 }
 
+/**
+ * One durable master notice recorded on the board (the in-board fallback
+ * inbox). Every notifyMaster call lands one row here synchronously, so the
+ * master can read back what happened even when live followup or persistent
+ * inbox delivery could not reach it.
+ */
+export interface BoardNotice {
+  /** Stable event kind, e.g. "worker-done", "worker-failed", "worker-lost". */
+  kind: string
+  /** Human-readable notice text in the board language. */
+  text: string
+  /** Unix epoch milliseconds when the notice was recorded. */
+  at: number
+  /** The ticket the notice refers to; '' for board-wide notices. */
+  ticketId: string
+}
+
 /** One durable master-seat transition recorded on the board, for hierarchy-tree rendering. */
 export interface MasterHistoryEntry {
   /** The previous master session id; null when the seat was empty. */
@@ -169,6 +186,8 @@ export interface BoardView {
   handoverNotes: string
   /** Durable master-seat transitions (claim/transfer), for hierarchy-tree rendering. */
   masterHistory?: MasterHistoryEntry[]
+  /** Durable master notices (the in-board fallback inbox); oldest rows drop past NOTICE_LIMIT. */
+  notices?: BoardNotice[]
   /** When the board was archived; null while active. */
   archivedAt: number | null
 }
@@ -178,6 +197,8 @@ export interface BoardSnapshot {
   boardId: string
   name: string
   tickets: TicketView[]
+  /** The board's durable master notices, newest last; absent on old hosts. */
+  notices?: BoardNotice[]
 }
 
 /** Mutation verbs surfaced by the forwarded `taskboard/changed` event. */

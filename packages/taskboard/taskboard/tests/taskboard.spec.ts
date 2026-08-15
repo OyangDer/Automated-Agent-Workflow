@@ -23,6 +23,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
 import {
@@ -71,6 +72,33 @@ function workspaceStub(id: string, path: string): { id: string; path: string } {
   return { id, path }
 }
 
+/**
+ * A minimal in-memory session-persistence double mirroring the coordinator's
+ * append/inspect contract: append validates contiguous seq and records the
+ * batch; inspect serves the stored log (rejecting unknown sessions, as the
+ * real backends do). The recorded log is exactly what a resumed agent-loop
+ * session replays through its Inbox projection.
+ */
+function fakeSessionPersistence() {
+  const stored = new Map<string, SessionEvent[]>()
+  return {
+    stored,
+    append: vi.fn(async (id: string, events: SessionEvent[]) => {
+      const log = stored.get(id) ?? []
+      for (const event of events) {
+        if (event.seq !== log.length) throw new Error('append seq mismatch')
+      }
+      log.push(...events)
+      stored.set(id, log)
+    }),
+    inspect: vi.fn(async (id: string) => {
+      const log = stored.get(id)
+      if (log === undefined) throw new Error('session "' + id + '" has no persisted log')
+      return { meta: { id }, events: [...log] }
+    }),
+  }
+}
+
 /** How the stubbed subagent seam answers one spawn. */
 type SpawnBehavior = 'spawn' | 'fail' | 'absent'
 
@@ -97,6 +125,8 @@ interface Harness {
   subagentsStart: ReturnType<typeof vi.fn>
   /** Remove the harness worker child from the live agent registry (simulates the worker session vanishing, e.g. a host restart). */
   unregisterWorker: () => void
+  /** Remove the harness master agent (devA) from the live agent registry (simulates the master session vanishing, e.g. a host restart). */
+  unregisterMaster: () => void
 }
 
 interface HarnessOptions {
@@ -128,6 +158,10 @@ interface HarnessOptions {
   failReviewerSpawn?: boolean
   /** Worker-liveness reconciliation interval passed to the plugin (0 disables the periodic scan). */
   reconcileIntervalMs?: number
+  /** Master-notice dedupe window passed to the plugin (defaults to 10000). */
+  noticeDedupeWindowMs?: number
+  /** When set, a fake session-persistence seam (append/inspect) is provided to the service. */
+  sessionPersistence?: ReturnType<typeof fakeSessionPersistence>
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -188,6 +222,9 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
       ...(options.archive === undefined ? {} : { archiveSession: options.archive }),
     } as never)
   }
+  if (options.sessionPersistence !== undefined) {
+    ctx.provide('sessionPersistence', options.sessionPersistence as never)
+  }
   // The periodic worker-liveness scanner stays off by default in tests: the
   // startup pass still runs (harmless on a fresh board), and the scan itself
   // is exercised explicitly or with a short explicit interval.
@@ -196,6 +233,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     ...(options.masterSeatTimeoutMs === undefined ? {} : { masterSeatTimeoutMs: options.masterSeatTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
     ...(options.reconcileIntervalMs === undefined ? { reconcileIntervalMs: 0 } : { reconcileIntervalMs: options.reconcileIntervalMs }),
+    ...(options.noticeDedupeWindowMs === undefined ? {} : { noticeDedupeWindowMs: options.noticeDedupeWindowMs }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -204,13 +242,13 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const devB = stubAgent('dev-agent-b')
   const reviewerChild = stubAgent(spawnedReviewerId)
   const workerChild = stubAgent(spawnedWorkerId)
-  ctx.agents.register(devA)
+  const unregisterMaster = ctx.agents.register(devA)
   ctx.agents.register(devB)
   ctx.agents.register(reviewerChild)
   const unregisterWorker = ctx.agents.register(workerChild)
   return {
     ctx, service, root, changes, devA, devB, reviewerChild, workerChild,
-    spawnedReviewerId, spawnedWorkerId, subagentsStart, unregisterWorker,
+    spawnedReviewerId, spawnedWorkerId, subagentsStart, unregisterWorker, unregisterMaster,
   }
 }
 
@@ -1741,6 +1779,145 @@ it('skips the master notice when the master session is not loaded', async () => 
   expect(reported.ticket.column).toBe('in_testing')
   expect(followup).not.toHaveBeenCalled()
 })
+it('queues a master notice into the persisted session inbox when the master is absent from the registry and replays it on the next run', async () => {
+  const persistence = fakeSessionPersistence()
+  // The master session has a persisted log from the previous process (the
+  // agent id is the persisted session id); a fresh log with no events keeps
+  // the next seq at 0.
+  persistence.stored.set(SessionId('dev-agent-a'), [])
+  const { service, devA, workerChild, unregisterMaster } = await harness({ sessionPersistence: persistence })
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'persistent notice card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  // The master session leaves the live registry (host restart): the live
+  // followup path cannot reach it, so the notice must be queued durably.
+  unregisterMaster()
+  const blocked = await service.fail(workerChild, card.id, 'backend down')
+  expect(blocked.status).toBe('blocked')
+  // One contiguous inbox splice was appended to the master's persisted log.
+  expect(persistence.append).toHaveBeenCalledTimes(1)
+  const [masterId, events] = persistence.append.mock.calls[0] as [string, SessionEvent[]]
+  expect(masterId).toBe(devA.id)
+  expect(events).toHaveLength(1)
+  const splice = events[0]!
+  expect(splice.type).toBe('agent/inbox/spliced')
+  const data = splice.data as { target: string; start: number; inserted: { content: { text: string }[] }[] }
+  expect(data.target).toBe('next-turn')
+  expect(data.start).toBe(0)
+  expect(JSON.stringify(data.inserted)).toContain(card.id)
+  // The master's next run replays the persisted log: the Inbox projection
+  // (exactly what agent-loop resume builds from stored events) sees the
+  // notice as pending input for the next turn.
+  const persisted = persistence.stored.get(devA.id)!
+  const resumed = Session.create(SessionId(devA.id), persisted)
+  const inbox = new Inbox(resumed, { inserted: () => {}, discarded: () => {}, claimed: () => {} })
+  expect(JSON.stringify(inbox.nextTurn)).toContain(card.id)
+  // The in-board fallback record landed too.
+  const read = await service.boardNotices('default', devA)
+  expect(read.notices).toHaveLength(1)
+  expect(read.notices[0]).toMatchObject({ kind: 'worker-failed', ticketId: card.id })
+  expect(read.notices[0]!.text).toContain(card.id)
+})
+
+it('records durable board notices readable via the claim result and the taskboard_notices tool', async () => {
+  const { ctx, service, devA, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'notice trail card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  await service.fail(workerChild, card.id, 'crashed')
+  // The in-board fallback record carries the event with its stable kind.
+  const read = await service.boardNotices('default', devA)
+  expect(read.boardId).toBe('default')
+  expect(read.notices).toHaveLength(1)
+  expect(read.notices[0]).toMatchObject({ kind: 'worker-failed', ticketId: card.id })
+  // A master re-claim carries the notices so nothing since the last look is missed.
+  const claimed = await service.claimMaster('default', devA)
+  expect(claimed.notices ?? []).toHaveLength(1)
+  expect(claimed.notices?.[0]!.text).toContain(card.id)
+  // The taskboard_notices tool reads them back.
+  const toolResult = await ctx.tools.execute({
+    callId: CallId('tool-notices'),
+    name: 'taskboard_notices',
+    arguments: {},
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(toolResult.isError).toBe(false)
+  type NoticeRow = { kind: string; text: string; at: number; ticketId: string }
+  const value = (toolResult as { value: { boardId: string; notices: NoticeRow[] } }).value
+  expect(value.boardId).toBe('default')
+  expect(value.notices).toHaveLength(1)
+  expect(value.notices[0]!.kind).toBe('worker-failed')
+})
+
+it('dedupes repeated notices for the same ticket and kind inside the window and notifies again after it', async () => {
+  const { service, devA, unregisterWorker } = await harness({ noticeDedupeWindowMs: 60 })
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await createTicket(service, 'dedupe card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  // First loss: one 'worker-lost' notice reaches the master.
+  unregisterWorker()
+  expect(await service.reconcileLostWorkers()).toBe(1)
+  expect(followup).toHaveBeenCalledTimes(1)
+  // Re-dispatch and lose the replacement worker inside the window: the same
+  // (ticket, kind) notice is deduped — no second record, no second delivery.
+  await service.reassign(devA, card.id, 'retry')
+  unregisterWorker()
+  expect(await service.reconcileLostWorkers()).toBe(1)
+  const afterSecond = await service.boardNotices('default', devA)
+  expect(afterSecond.notices).toHaveLength(1)
+  expect(followup).toHaveBeenCalledTimes(1)
+  // Past the window the same event notifies again.
+  await new Promise(resolve => setTimeout(resolve, 80))
+  await service.reassign(devA, card.id, 'retry')
+  unregisterWorker()
+  expect(await service.reconcileLostWorkers()).toBe(1)
+  const afterThird = await service.boardNotices('default', devA)
+  expect(afterThird.notices).toHaveLength(2)
+  expect(followup).toHaveBeenCalledTimes(2)
+})
+
+it('never fails the triggering mutation when the notification path breaks', async () => {
+  const persistence = fakeSessionPersistence()
+  // The master session has a persisted log, but the delivery read explodes:
+  // the notice must degrade silently and leave the mutation intact.
+  persistence.stored.set(SessionId('dev-agent-a'), [])
+  persistence.inspect.mockRejectedValueOnce(new Error('storage exploded'))
+  const { service, devA, workerChild, unregisterMaster } = await harness({ sessionPersistence: persistence })
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'resilient card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  unregisterMaster()
+  const blocked = await service.fail(workerChild, card.id, 'boom')
+  expect(blocked.status).toBe('blocked')
+  expect(blocked.failure?.reason).toBe('boom')
+  // The durable board notice still landed before the delivery fault.
+  const read = await service.boardNotices('default', devA)
+  expect(read.notices).toHaveLength(1)
+  expect(read.notices[0]!.kind).toBe('worker-failed')
+})
+
+it('records a notice even when no persistence backend is configured (board-only fallback)', async () => {
+  const { service, workerChild } = await harness()
+  const ghost = stubAgent('ghost-master')
+  await service.claimMaster('default', ghost)
+  const card = await createTicket(service, 'board fallback card')
+  await toNotStarted(service, ghost, card)
+  await service.assign(ghost, card.id)
+  // The master is not live and no persistence backend exists: the notice
+  // still lands on the board for later reads.
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.ticket.column).toBe('in_testing')
+  const read = await service.boardNotices('default', ghost)
+  expect(read.notices).toHaveLength(1)
+  expect(read.notices[0]!.kind).toBe('worker-done')
+})
+
 
 it('reports the master lease expiry on every board row', async () => {
   vi.useFakeTimers({ toFake: ['Date'] })
