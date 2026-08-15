@@ -3,9 +3,10 @@
  * isolation, the master seat (claim/release/transfer/preemption), user
  * moves, the v1 claim path (owner/capacity/dependency rules), the v2
  * dispatch protocol (assign → report → review, fail → blocked, reassign),
- * worker-model injection, failure reclamation, and old-data compatibility.
- * Runs against the real storage-domain facility with a temp JSON backend and
- * a stubbed subagent seam.
+ * worker-model injection, failure reclamation, worker-liveness
+ * reconciliation (startup scan + periodic scanner), and old-data
+ * compatibility. Runs against the real storage-domain facility with a temp
+ * JSON backend and a stubbed subagent seam.
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -94,6 +95,8 @@ interface Harness {
   spawnedWorkerId: string
   /** The vi.fn backing the stubbed subagents.start seam. */
   subagentsStart: ReturnType<typeof vi.fn>
+  /** Remove the harness worker child from the live agent registry (simulates the worker session vanishing, e.g. a host restart). */
+  unregisterWorker: () => void
 }
 
 interface HarnessOptions {
@@ -123,6 +126,8 @@ interface HarnessOptions {
   }
   /** When set, only reviewer-label spawns throw; worker spawns still succeed. */
   failReviewerSpawn?: boolean
+  /** Worker-liveness reconciliation interval passed to the plugin (0 disables the periodic scan). */
+  reconcileIntervalMs?: number
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -183,10 +188,14 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
       ...(options.archive === undefined ? {} : { archiveSession: options.archive }),
     } as never)
   }
+  // The periodic worker-liveness scanner stays off by default in tests: the
+  // startup pass still runs (harmless on a fresh board), and the scan itself
+  // is exercised explicitly or with a short explicit interval.
   await ctx.plugin(TaskboardService, {
     maxInProgress,
     ...(options.masterSeatTimeoutMs === undefined ? {} : { masterSeatTimeoutMs: options.masterSeatTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
+    ...(options.reconcileIntervalMs === undefined ? { reconcileIntervalMs: 0 } : { reconcileIntervalMs: options.reconcileIntervalMs }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -198,8 +207,11 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   ctx.agents.register(devA)
   ctx.agents.register(devB)
   ctx.agents.register(reviewerChild)
-  ctx.agents.register(workerChild)
-  return { ctx, service, root, changes, devA, devB, reviewerChild, workerChild, spawnedReviewerId, spawnedWorkerId, subagentsStart }
+  const unregisterWorker = ctx.agents.register(workerChild)
+  return {
+    ctx, service, root, changes, devA, devB, reviewerChild, workerChild,
+    spawnedReviewerId, spawnedWorkerId, subagentsStart, unregisterWorker,
+  }
 }
 
 /** Temp storage roots created by the harnesses, cleaned between cases. */
@@ -457,6 +469,170 @@ describe('TaskboardService workflow', () => {
       expect(current.status).toBe('blocked')
       expect(current.failure?.reason).toContain('worker terminated (error)')
     })
+  })
+
+  it('reconciles a running card whose worker session is missing from the live registry on startup and notifies the master', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskboard-restart-'))
+    const now = Date.now()
+    // A durable card from the previous process: In progress/running, its
+    // worker session id can never be live in this process (session ids are
+    // process-local), and the in-memory run settlement callback is gone.
+    const orphan = {
+      id: 'ticket-restart-orphan',
+      title: 'restart orphan',
+      description: 'worker died with the old process',
+      column: 'in_progress',
+      priority: 'normal',
+      boardId: 'default',
+      type: 'bugfix',
+      status: 'running',
+      workerAgentId: 'ghost-worker-session',
+      workerSessionId: 'ghost-worker-session',
+      failure: null,
+      createdAt: now,
+      updatedAt: now,
+      position: 0,
+      assignee: { agentId: 'dev-agent-a', label: 'agent dev-agen' },
+      reviewer: null,
+      reviewAttempts: 0,
+      lastReview: null,
+      devNotes: '',
+      dependsOn: [],
+      history: [],
+    }
+    const masterBoard = {
+      boardId: 'default',
+      name: 'default',
+      workspaceId: '',
+      scope: 'project',
+      ownerSessionId: null,
+      masterAgentId: 'dev-agent-a',
+      masterClaimedAt: now,
+      handoverNotes: '',
+      masterHistory: [],
+      archivedAt: null,
+    }
+    await writeFile(
+      join(root, 'taskboard.json'),
+      JSON.stringify({
+        unit: { name: 'taskboard', version: 1 },
+        global: null,
+        tables: {
+          tickets: { [orphan.id]: orphan },
+          boards: { [masterBoard.boardId]: masterBoard },
+        },
+      }, null, 2),
+    )
+    const { service, devA, changes } = await harness({ root })
+    const followup = vi.spyOn(devA, 'followup')
+    // The startup pass (scheduled once the domain is open) marks the card blocked.
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(orphan.id)
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    })
+    const blocked = await service.viewTicket(orphan.id)
+    expect(blocked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(blocked.history.at(-1)?.detail).toBe('worker terminated (restart reconciliation)')
+    // The master inbox received exactly one notice naming the card.
+    expect(followup).toHaveBeenCalledTimes(1)
+    const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+    expect(message.source.kind).toBe('taskboard')
+    expect(textOf(message)).toContain(orphan.id)
+    expect(textOf(message)).toContain('taskboard_reassign')
+    // The forwarded change event carries the reconciliation mutation.
+    expect(changes.some(change => change.operation === 'fail' && change.ticketId === orphan.id)).toBe(true)
+  })
+
+  it('leaves a running card alone while its worker is live and blocks it once the worker leaves the registry', async () => {
+    const { service, devA, unregisterWorker } = await harness()
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'live worker card')
+    await toNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    // The spawned worker is a registered live session: the pass touches nothing.
+    expect(await service.reconcileLostWorkers()).toBe(0)
+    let current = await service.viewTicket(card.id)
+    expect(current.status).toBe('running')
+    expect(followup).not.toHaveBeenCalled()
+    // The worker session vanishes (termination / host restart): the next pass blocks.
+    unregisterWorker()
+    expect(await service.reconcileLostWorkers()).toBe(1)
+    current = await service.viewTicket(card.id)
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    expect(current.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(followup).toHaveBeenCalledTimes(1)
+    const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+    expect(textOf(message)).toContain(card.id)
+    expect(textOf(message)).toContain('taskboard_reassign')
+  })
+
+  it('periodically scans running cards and stays idempotent across repeats', async () => {
+    const { service, devA, unregisterWorker } = await harness({ reconcileIntervalMs: 20 })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'periodic scan card')
+    await toNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    unregisterWorker()
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(card.id)
+      expect(current.status).toBe('blocked')
+    })
+    const blocked = await service.viewTicket(card.id)
+    expect(blocked.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    // Let several more interval ticks fire: the scan stays idempotent — one
+    // fail row and one notice for the whole lifetime.
+    await new Promise(resolve => setTimeout(resolve, 80))
+    const again = await service.viewTicket(card.id)
+    expect(again.status).toBe('blocked')
+    expect(again.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(again.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    expect(followup).toHaveBeenCalledTimes(1)
+  })
+
+  it('coexists with the settlement reclamation: one block wins, one fail row per card', async () => {
+    // Order A: the settlement callback wins; the reconciliation then skips.
+    let settleA!: (result: RunResultStub) => void
+    const runA = new Promise<RunResultStub>((resolve) => { settleA = resolve })
+    const { service, devA, unregisterWorker } = await harness({ workerRunResult: runA })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const cardA = await createTicket(service, 'dual path A')
+    await toNotStarted(service, devA, cardA)
+    await service.assign(devA, cardA.id)
+    unregisterWorker()
+    settleA({ output: [], stopReason: 'cancelled' })
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(cardA.id)
+      expect(current.status).toBe('blocked')
+    })
+    expect(await service.reconcileLostWorkers()).toBe(0)
+    const blockedA = await service.viewTicket(cardA.id)
+    expect(blockedA.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(blockedA.failure?.reason).toContain('worker terminated (cancelled)')
+    expect(followup).toHaveBeenCalledTimes(1)
+
+    // Order B: the reconciliation wins; the stale settlement callback skips.
+    let settleB!: (result: RunResultStub) => void
+    const runB = new Promise<RunResultStub>((resolve) => { settleB = resolve })
+    const { service: serviceB, devA: devAB, unregisterWorker: unregisterB } = await harness({ workerRunResult: runB })
+    await serviceB.claimMaster('default', devAB)
+    const cardB = await createTicket(serviceB, 'dual path B')
+    await toNotStarted(serviceB, devAB, cardB)
+    await serviceB.assign(devAB, cardB.id)
+    unregisterB()
+    expect(await serviceB.reconcileLostWorkers()).toBe(1)
+    const blockedB = await serviceB.viewTicket(cardB.id)
+    expect(blockedB.status).toBe('blocked')
+    expect(blockedB.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    settleB({ output: [], stopReason: 'error' })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const againB = await serviceB.viewTicket(cardB.id)
+    expect(againB.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(againB.failure?.reason).toBe('worker terminated (restart reconciliation)')
   })
 
   it('emits a forwarded change per mutation and a tombstone on removal', async () => {

@@ -100,6 +100,35 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 
 ```ts cordis-catalog
 /**
+ * One worker-liveness reconciliation pass: every In progress card whose
+ * worker is still marked running and whose worker session id is absent from
+ * the live agent registry is marked blocked — durable failure with reason
+ * RECONCILE_REASON, one 'fail' history row, and a master notice. Shared by
+ * the startup scan and the periodic scanner.
+ *
+ * Liveness authority research (service dependency surface): the agent
+ * registry is the exact "is this session's agent alive right now" authority
+ * — agents.get(id) returns the live Agent or undefined; presence means
+ * live (an idle agent is still alive, only an unregistered session is
+ * lost), which is precisely the restart scenario where the in-memory run
+ * settlement callbacks are gone. The subagent seam's listChildren /
+ * listDescendants are parent-rooted tree listings that throw without a
+ * mounted projection registry + session store, and the session store tracks
+ * persisted sessions rather than live agent loops — neither is a general
+ * flat liveness probe, so the registry is used directly, and a missing
+ * registry (never in the host, where 'agents' is an injected dependency)
+ * degrades to a silent skip without blocking anything.
+ *
+ * Idempotent by construction and coexistent with the settlement callback:
+ * only running cards are considered, and the guarded mutate re-checks
+ * column/status/worker identity atomically on the committed record, so a
+ * card the settlement callback already blocked (or whose worker came back)
+ * is returned untouched — exactly one 'fail' row ever lands per card.
+ * @returns how many cards this pass marked blocked.
+ */
+async reconcileLostWorkers(): Promise<number>
+
+/**
  * Whole-board snapshot, sorted by column then position, scoped to one
  * board the caller may see: its own session-private boards plus its
  * workspace's project boards and the unowned legacy ones. A board outside
@@ -408,7 +437,7 @@ async viewTicket(ticketId: string): Promise<TicketView>
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:316`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:332`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 

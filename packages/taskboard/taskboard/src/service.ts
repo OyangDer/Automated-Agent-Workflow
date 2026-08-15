@@ -165,6 +165,13 @@ export interface Config {
   masterSeatTimeoutMs?: number
   /** Review protocol: "report" has the reviewer return a structured verdict (master resolves); "direct" keeps the v1 reviewer tools. */
   reviewMode?: 'report' | 'direct'
+  /**
+   * Worker-liveness reconciliation interval in milliseconds: the periodic
+   * scanner marks In progress/running cards whose worker session left the
+   * live agent registry blocked (0 disables the periodic scan; the startup
+   * scan still runs once). Defaults to 60000.
+   */
+  reconcileIntervalMs?: number
 }
 
 /** Schemastery configuration for the taskboard consumer. */
@@ -176,6 +183,7 @@ export const Config: z<Config> = z.object({
   workerProvider: z.string().default('spawn'),
   masterSeatTimeoutMs: z.number().default(900000),
   reviewMode: z.union(['report', 'direct'] as const).default('report'),
+  reconcileIntervalMs: z.number().default(60000),
 })
 
 /** One worker-spawn outcome. */
@@ -267,6 +275,14 @@ function resolveMasterSeatTimeout(value: number): number {
   return value
 }
 
+/** Validate one explicit worker-liveness reconciliation interval (0 disables the periodic scan). */
+function resolveReconcileInterval(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: reconcileIntervalMs must be a non-negative safe integer')
+  }
+  return value
+}
+
 /** Derived lease expiry of one board row; null while the seat is vacant. */
 function masterExpiryOf(board: BoardView, leaseMs: number): number | null {
   if (board.masterAgentId === null || board.masterClaimedAt === null) return null
@@ -326,6 +342,7 @@ export class TaskboardService extends TypertRemoteService {
     workerProvider: string
     masterSeatTimeoutMs: number
     reviewMode: 'report' | 'direct'
+    reconcileIntervalMs: number
   }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
@@ -339,6 +356,7 @@ export class TaskboardService extends TypertRemoteService {
       workerProvider: config.workerProvider ?? 'spawn',
       masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
       reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
+      reconcileIntervalMs: resolveReconcileInterval(config.reconcileIntervalMs ?? 60000),
     }
     this.domain = ctx.storageDomain.open(TASKBOARD_DOMAIN)
     // The open races shutdown when the host unmounts before it resolves;
@@ -354,6 +372,23 @@ export class TaskboardService extends TypertRemoteService {
         void pending.then((domain) => { void domain.close() }).catch(() => {})
       }
     }, 'taskboard: domain lifetime')
+    ctx.effect(() => {
+      // Worker-liveness reconciliation. The startup scan runs once, as soon
+      // as the domain is open (a host restart drops the in-memory run
+      // settlement callbacks, so cards whose worker died with the previous
+      // process would otherwise hang In progress forever); the periodic scan
+      // then repeats at the configured interval (0 disables it). Each pass is
+      // deferred one macrotask so boot-time session registration (the root /
+      // master sessions) settles before liveness is judged.
+      const run = () => { void this.reconcileLostWorkers().catch(() => {}) }
+      void this.domain.then(() => { setTimeout(run, 0) }).catch(() => {})
+      const timer = this.resolved.reconcileIntervalMs > 0
+        ? setInterval(run, this.resolved.reconcileIntervalMs)
+        : undefined
+      return () => {
+        if (timer !== undefined) clearInterval(timer)
+      }
+    }, 'taskboard: worker liveness reconciliation')
     ctx.systemPrompt.section({ name: 'taskboard:master', order: 149, text: MASTER_SECTION })
     ctx.systemPrompt.section({ name: 'taskboard:workflow', order: 150, text: WORKFLOW_SECTION })
     this.registerTools()
@@ -979,6 +1014,86 @@ export class TaskboardService extends TypertRemoteService {
       await this.notifyMaster(next.boardId,
         'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") terminated without reporting; the card is blocked. Re-dispatch with taskboard_reassign.')
     }
+  }
+
+  /**
+   * The durable failure reason the worker-liveness reconciliation records,
+   * distinct from the settlement-callback reason ('worker terminated
+   * (<stopReason>)') so the two reclaim paths never double-report one
+   * termination with two different reasons.
+   */
+  private static readonly RECONCILE_REASON = 'worker terminated (restart reconciliation)'
+
+  /**
+   * One worker-liveness reconciliation pass: every In progress card whose
+   * worker is still marked running and whose worker session id is absent from
+   * the live agent registry is marked blocked — durable failure with reason
+   * RECONCILE_REASON, one 'fail' history row, and a master notice. Shared by
+   * the startup scan and the periodic scanner.
+   *
+   * Liveness authority research (service dependency surface): the agent
+   * registry is the exact "is this session's agent alive right now" authority
+   * — agents.get(id) returns the live Agent or undefined; presence means
+   * live (an idle agent is still alive, only an unregistered session is
+   * lost), which is precisely the restart scenario where the in-memory run
+   * settlement callbacks are gone. The subagent seam's listChildren /
+   * listDescendants are parent-rooted tree listings that throw without a
+   * mounted projection registry + session store, and the session store tracks
+   * persisted sessions rather than live agent loops — neither is a general
+   * flat liveness probe, so the registry is used directly, and a missing
+   * registry (never in the host, where 'agents' is an injected dependency)
+   * degrades to a silent skip without blocking anything.
+   *
+   * Idempotent by construction and coexistent with the settlement callback:
+   * only running cards are considered, and the guarded mutate re-checks
+   * column/status/worker identity atomically on the committed record, so a
+   * card the settlement callback already blocked (or whose worker came back)
+   * is returned untouched — exactly one 'fail' row ever lands per card.
+   * @returns how many cards this pass marked blocked.
+   */
+  async reconcileLostWorkers(): Promise<number> {
+    // The registry is the liveness authority; without it the pass cannot
+    // judge and must not block anything (mirrors notifyMaster's guard).
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    if (registry === undefined || typeof registry.get !== 'function') return 0
+    const table = await this.tickets()
+    let blockedCount = 0
+    for (const [, ticket] of table.entries()) {
+      if (ticket.column !== 'in_progress' || ticket.status !== 'running') continue
+      const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
+      if (sessionId === undefined) continue
+      if (registry.get(sessionId) !== undefined) continue
+      let marked = false
+      let next: TicketView
+      try {
+        next = await this.mutate(ticket.id, 'fail', (current) => {
+          if (current.column !== 'in_progress' || current.status !== 'running') return current
+          const currentSession = current.workerSessionId ?? current.workerAgentId
+          if (currentSession === undefined || registry.get(currentSession) !== undefined) return current
+          const detail = TaskboardService.RECONCILE_REASON
+          marked = true
+          return appendHistory(
+            {
+              ...current,
+              status: 'blocked',
+              failure: { reason: detail, at: Date.now() },
+              updatedAt: Date.now(),
+            },
+            'fail',
+            detail,
+          )
+        })
+      } catch {
+        // The card vanished mid-scan (removed by another caller); skip it.
+        continue
+      }
+      if (marked) {
+        blockedCount += 1
+        await this.notifyMaster(next.boardId,
+          'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is no longer a live session (absent from the agent registry, e.g. after a restart); the card is blocked. Re-dispatch with taskboard_reassign.')
+      }
+    }
+    return blockedCount
   }
 
   /** Attach the designated reviewer to an In testing ticket. */
