@@ -181,12 +181,14 @@ export const Config: z<Config> = z.object({
 /** One worker-spawn outcome. */
 export type WorkerSpawnResult =
   | { ok: true; sessionId: string; run: SubagentRun }
-  | { ok: false; reason: 'unavailable' | 'failed' }
+  | { ok: false; reason: 'unavailable' }
+  | { ok: false; reason: 'failed'; errorMessage: string }
 
 /** One reviewer-spawn outcome. */
 export type ReviewSpawnResult =
   | { spawned: true; reviewer: TicketAssignee; run: SubagentRun }
-  | { spawned: false; reason: 'unavailable' | 'failed' }
+  | { spawned: false; reason: 'unavailable' }
+  | { spawned: false; reason: 'failed'; errorMessage: string }
 
 /** Tool payload: the card plus what happened to the review seat. */
 export interface CompleteTicketResult {
@@ -312,7 +314,7 @@ function resolveRequiredText(value: string, subject: string): string {
  * model-facing tools.
  */
 export class TaskboardService extends TypertRemoteService {
-  static inject = ['storageDomain', 'systemPrompt', 'tools']
+  static inject = ['storageDomain', 'systemPrompt', 'tools', 'agents']
 
   static Config = Config
 
@@ -764,10 +766,24 @@ export class TaskboardService extends TypertRemoteService {
     }
     try {
       const reportMode = this.resolved.reviewMode === 'report'
-      const prompt: ContentBlock[] = [{
-        type: 'text',
-        text: reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket),
-      }]
+      // Capability downgrade: only request structured output / tool filtering
+      // when the provider advertises the capability. Blindly passing options
+      // an unsupporting provider rejects would surface as an opaque 'failed'
+      // instead of a degraded-but-working report.
+      const provider = typeof subagents.getProvider === 'function'
+        ? subagents.getProvider(this.resolved.reviewProvider)
+        : undefined
+      const capabilities = provider?.capabilities
+      const supportsOutputSchema = capabilities === undefined || capabilities.outputSchema
+      const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
+      const basePrompt = reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket)
+      // Degraded report mode: without structured output the reviewer returns
+      // its verdict as plain text; the prompt says so instead of silently
+      // dropping the contract.
+      const promptText = reportMode && !supportsOutputSchema
+        ? basePrompt + '\n\n[Note: the configured provider does not support structured output; return your verdict (approve or reject) with a summary and problems as plain text in your final message.]'
+        : basePrompt
+      const prompt: ContentBlock[] = [{ type: 'text', text: promptText }]
       const request: SubagentStartRequest = {
         label: 'review ' + ticket.id,
         prompt,
@@ -776,15 +792,15 @@ export class TaskboardService extends TypertRemoteService {
         agentOptions: { model: this.resolved.workerModel },
         // Report mode: the reviewer returns a structured conclusion only and
         // never decides on the card; direct mode keeps the v1 reviewer tools.
-        ...(reportMode ? {
-          outputSchema: REVIEW_OUTCOME_SCHEMA,
-          toolFilter: { deny: REVIEWER_DENIED_TOOLS },
-        } : {}),
+        // Unsupported capabilities are omitted (downgrade) instead of rejected.
+        ...(reportMode && supportsOutputSchema ? { outputSchema: REVIEW_OUTCOME_SCHEMA } : {}),
+        ...(reportMode && supportsToolFilter ? { toolFilter: { deny: REVIEWER_DENIED_TOOLS } } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
       return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run }
-    } catch {
-      return { spawned: false, reason: 'failed' }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      return { spawned: false, reason: 'failed', errorMessage }
     }
   }
 
@@ -899,6 +915,14 @@ export class TaskboardService extends TypertRemoteService {
     }
     try {
       const cwd = parent.session.header.cwd
+      // Capability downgrade: only request the administrative tool filter when
+      // the provider advertises it; an unsupported filter would be rejected by
+      // the seam instead of degrading gracefully.
+      const provider = typeof subagents.getProvider === 'function'
+        ? subagents.getProvider(this.resolved.workerProvider)
+        : undefined
+      const capabilities = provider?.capabilities
+      const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
       const request: SubagentStartRequest = {
         label: workerLabel ?? ticket.title,
         // The master session id names the worker's independent branch
@@ -908,12 +932,13 @@ export class TaskboardService extends TypertRemoteService {
         parent,
         signal: new AbortController().signal,
         agentOptions: { model: this.resolved.workerModel },
-        toolFilter: { deny: WORKER_DENIED_TOOLS },
+        ...(supportsToolFilter ? { toolFilter: { deny: WORKER_DENIED_TOOLS } } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.workerProvider, request)
       return { ok: true, sessionId: run.id, run }
-    } catch {
-      return { ok: false, reason: 'failed' }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      return { ok: false, reason: 'failed', errorMessage }
     }
   }
 
@@ -971,6 +996,22 @@ export class TaskboardService extends TypertRemoteService {
     ))
   }
 
+  /**
+   * Record the real reviewer-spawn failure on the card history. Uses the
+   * free-form 'edit' change (no reviewer invariant) so the failure note lands
+   * on the card without claiming a review seat.
+   */
+  private recordReviewerSpawnFailure(
+    ticketId: string,
+    errorMessage: string,
+  ): Promise<TicketView> {
+    return this.mutate(ticketId, 'edit', current => appendHistory(
+      { ...current, updatedAt: Date.now() },
+      'review-spawn-failed',
+      'reviewer spawn failed: ' + errorMessage,
+    ))
+  }
+
   /** One user move with reviewer automation when the target is In testing. */
   private async moveWithReviewer(agent: Agent, request: MoveTicketRequest): Promise<TicketView> {
     if (!isColumn(request.column)) {
@@ -1001,6 +1042,9 @@ export class TaskboardService extends TypertRemoteService {
         const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
         this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
         return withReviewer
+      }
+      if (spawn.reason === 'failed') {
+        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
       }
     }
     return ticket
@@ -1306,6 +1350,13 @@ export class TaskboardService extends TypertRemoteService {
     }
     const spawn = await this.spawnReviewer(agent, current)
     if (!spawn.spawned) {
+      if (spawn.reason === 'failed') {
+        await this.recordReviewerSpawnFailure(current.id, spawn.errorMessage).catch(() => {})
+        throw new TaskboardError(
+          'no reviewer backend is available to assign: ' + spawn.errorMessage,
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
       throw new TaskboardError('no reviewer backend is available to assign', 'TASKBOARD_INVALID_TRANSITION')
     }
     const withReviewer = await this.attachReviewer(current.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
@@ -1440,17 +1491,21 @@ export class TaskboardService extends TypertRemoteService {
    * @param text - the notice text (what happened and what to do next).
    */
   private async notifyMaster(boardId: string, text: string): Promise<void> {
-    const table = await this.boards()
-    const board = table.get(boardId)
-    if (board === undefined || board.masterAgentId === null) return
-    // The agent registry is a runtime dependency of the live master's inbox;
-    // without it (or before the master session is loaded) the notice is
-    // skipped silently — the master reads the board when it returns.
-    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
-    if (registry === undefined) return
-    const master = registry.get(board.masterAgentId as SessionId)
-    if (master === undefined) return
+    // The whole notification path is best-effort and must never fail the
+    // mutation that triggered it: a missing board, a vacant seat, a registry
+    // that is absent or rejects the lookup, or a followup fault all degrade
+    // to a silent skip — the master reads the board when it returns.
     try {
+      const table = await this.boards()
+      const board = table.get(boardId)
+      if (board === undefined || board.masterAgentId === null) return
+      // The agent registry is a runtime dependency of the live master's inbox;
+      // without it (or before the master session is loaded) the notice is
+      // skipped silently — the master reads the board when it returns.
+      const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+      if (registry === undefined || typeof registry.get !== 'function') return
+      const master = registry.get(board.masterAgentId as SessionId)
+      if (master === undefined || typeof master.followup !== 'function') return
       const message = createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'taskboard', boardId },
@@ -1538,10 +1593,13 @@ export class TaskboardService extends TypertRemoteService {
     })
     const spawn = await this.spawnWorker(agent, running, workerLabel)
     if (!spawn.ok) {
+      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
+        ? 'worker spawn failed: ' + spawn.errorMessage
+        : 'worker spawn ' + spawn.reason
       const blocked = await this.mutate(ticketId, 'fail', ticket => ({
         ...ticket,
         status: 'blocked',
-        failure: { reason: 'worker spawn ' + spawn.reason, at: Date.now() },
+        failure: { reason: failureReason, at: Date.now() },
         updatedAt: Date.now(),
       })).catch(() => running)
       return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
@@ -1570,6 +1628,16 @@ export class TaskboardService extends TypertRemoteService {
    */
   async report(agent: Agent, ticketId: string, devNotes: string): Promise<CompleteTicketResult> {
     const notes = resolveRequiredText(devNotes, 'report devNotes')
+    // Idempotent: a card this worker already reported is already In testing;
+    // return its current state instead of appending another report row.
+    const existing = (await this.tickets()).get(ticketId)
+    if (existing !== undefined && existing.workerAgentId === agent.id && existing.column === 'in_testing') {
+      return {
+        ticket: existing,
+        review: existing.reviewer === null ? 'unavailable' : 'spawned',
+        reviewerAgentId: existing.reviewer?.agentId ?? null,
+      }
+    }
     const ticket = await this.mutate(ticketId, 'report', (current) => {
       if (current.workerAgentId !== agent.id) {
         throw new TaskboardError('only the assigned worker may report the ticket', 'TASKBOARD_NOT_WORKER')
@@ -1586,15 +1654,21 @@ export class TaskboardService extends TypertRemoteService {
         'worker reported development done, waiting for review',
       )
     })
-    // The master must adjudicate the review whether or not a reviewer spawned.
-    await this.notifyMaster(ticket.boardId,
-      'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
+    // Spawn the reviewer first, notify the master after: a notification fault
+    // must never rob the card of its reviewer seat.
     const spawn = await this.spawnReviewer(agent, ticket)
     if (!spawn.spawned) {
+      if (spawn.reason === 'failed') {
+        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
+      }
+      await this.notifyMaster(ticket.boardId,
+        'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
     this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
+    await this.notifyMaster(withReviewer.boardId,
+      'Taskboard notice: the worker for ticket ' + withReviewer.id + ' ("' + withReviewer.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.')
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
 
@@ -1608,6 +1682,12 @@ export class TaskboardService extends TypertRemoteService {
    */
   async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView> {
     const notes = resolveRequiredText(reason, 'fail reason')
+    // Idempotent: a card this worker already blocked is returned as-is, so a
+    // retried fail after a lost tool result stops appending duplicate rows.
+    const existing = (await this.tickets()).get(ticketId)
+    if (existing !== undefined && existing.workerAgentId === agent.id && existing.status === 'blocked') {
+      return existing
+    }
     const blocked = await this.mutate(ticketId, 'fail', (current) => {
       if (current.workerAgentId !== agent.id) {
         throw new TaskboardError('only the assigned worker may report failure', 'TASKBOARD_NOT_WORKER')
@@ -1687,10 +1767,13 @@ export class TaskboardService extends TypertRemoteService {
     })
     const spawn = await this.spawnWorker(agent, running, workerLabel)
     if (!spawn.ok) {
+      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
+        ? 'worker spawn failed: ' + spawn.errorMessage
+        : 'worker spawn ' + spawn.reason
       const blocked = await this.mutate(ticketId, 'fail', ticket => ({
         ...ticket,
         status: 'blocked',
-        failure: { reason: 'worker spawn ' + spawn.reason, at: Date.now() },
+        failure: { reason: failureReason, at: Date.now() },
         updatedAt: Date.now(),
       })).catch(() => running)
       return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
@@ -1900,6 +1983,9 @@ export class TaskboardService extends TypertRemoteService {
     })
     const spawn = await this.spawnReviewer(agent, ticket)
     if (!spawn.spawned) {
+      if (spawn.reason === 'failed') {
+        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
+      }
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')

@@ -114,6 +114,15 @@ interface HarnessOptions {
   archive?: ReturnType<typeof vi.fn>
   /** When set, the stubbed workspace registry resolves cwds through this fn. */
   resolveByPath?: (path: string) => Promise<{ id: string; path: string } | undefined>
+  /** Advertised provider capabilities the stubbed subagent seam exposes through getProvider. */
+  providerCapabilities?: {
+    outputSchema: boolean
+    depthLimit: boolean
+    toolFilter: boolean
+    persona: boolean
+  }
+  /** When set, only reviewer-label spawns throw; worker spawns still succeed. */
+  failReviewerSpawn?: boolean
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -133,6 +142,9 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   let subagentsStart: ReturnType<typeof vi.fn>
   if (spawn === 'spawn') {
     subagentsStart = vi.fn(async (_provider: string, request: SubagentStartRequest) => {
+      if (options.failReviewerSpawn === true && request.label?.startsWith('review ')) {
+        throw new Error('reviewer spawn exploded')
+      }
       const id = request.label?.startsWith('review ')
         ? spawnedReviewerId
         : spawnedWorkerId
@@ -147,6 +159,12 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     ctx.provide('subagents', {
       start: subagentsStart,
       ...(options.followup === undefined ? {} : { followup: options.followup }),
+      ...(options.providerCapabilities === undefined ? {} : {
+        getProvider: () => ({
+          name: 'spawn',
+          capabilities: options.providerCapabilities,
+        }),
+      }),
     } as never)
   } else if (spawn === 'fail') {
     subagentsStart = vi.fn(async () => {
@@ -1633,6 +1651,102 @@ it('skips the master notice when the agent registry is absent', async () => {
   const reported = await service.report(workerChild, card.id, 'implemented')
   expect(reported.ticket.column).toBe('in_testing')
   expect(followup).not.toHaveBeenCalled()
+})
+
+it('keeps report and fail alive when the master notice delivery throws', async () => {
+  const { service, devA, workerChild, reviewerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup').mockImplementation(() => {
+    throw new Error('inbox down')
+  })
+  // A throwing notification must not rob the card of its reviewer: the
+  // reviewer is spawned before the notice and the notice fault is swallowed.
+  const card = await createTicket(service, 'notice storm card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.review).toBe('spawned')
+  expect(reported.ticket.reviewer?.agentId).toBe(reviewerChild.id)
+  expect(followup).toHaveBeenCalledTimes(1)
+  // fail() must land the blocked mutation even when its notice throws.
+  const doomed = await createTicket(service, 'notice storm doomed')
+  await toNotStarted(service, devA, doomed)
+  await service.assign(devA, doomed.id)
+  const blocked = await service.fail(workerChild, doomed.id, 'dependency is down')
+  expect(blocked.status).toBe('blocked')
+  expect(blocked.failure?.reason).toBe('dependency is down')
+  expect(followup).toHaveBeenCalledTimes(2)
+})
+
+it('surfaces the real reviewer spawn failure on the card history', async () => {
+  const { service, devA, workerChild } = await harness({ failReviewerSpawn: true })
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'opaque spawn failure')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.review).toBe('failed')
+  expect(reported.reviewerAgentId).toBeNull()
+  const current = await service.viewTicket(card.id)
+  const failureRow = current.history.find(row => row.kind === 'review-spawn-failed')
+  expect(failureRow).toBeDefined()
+  expect(failureRow?.detail).toContain('reviewer spawn exploded')
+  // requestReviewRemote keeps its message but appends the real cause.
+  await expect(service.requestReviewRemote(devA, { ticketId: card.id, boardId: 'default' }))
+    .rejects.toMatchObject({ message: expect.stringContaining('no reviewer backend is available to assign: reviewer spawn exploded') })
+})
+
+it('returns the current state for repeated fail and repeated report by the same worker', async () => {
+  const { service, devA, workerChild, reviewerChild, subagentsStart } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'idempotent card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  // The first report moves the card to In testing and spawns the reviewer.
+  const first = await service.report(workerChild, card.id, 'implemented once')
+  expect(first.review).toBe('spawned')
+  // A repeated report by the same worker returns the current state and does
+  // not append another report row or spawn a second reviewer.
+  const again = await service.report(workerChild, card.id, 'implemented twice')
+  expect(again.ticket.column).toBe('in_testing')
+  expect(again.ticket.reviewer?.agentId).toBe(reviewerChild.id)
+  const historyAfter = await service.viewTicket(card.id)
+  expect(historyAfter.history.filter(row => row.kind === 'report')).toHaveLength(1)
+  expect(subagentsStart.mock.calls.filter(([, request]) =>
+    (request as SubagentStartRequest).label?.startsWith('review '),
+  )).toHaveLength(1)
+  // fail idempotency: a second fail on the blocked card returns it untouched.
+  const doomed = await createTicket(service, 'idempotent doomed')
+  await toNotStarted(service, devA, doomed)
+  await service.assign(devA, doomed.id)
+  const blocked = await service.fail(workerChild, doomed.id, 'broken once')
+  expect(blocked.status).toBe('blocked')
+  const blockedAgain = await service.fail(workerChild, doomed.id, 'broken twice')
+  expect(blockedAgain.status).toBe('blocked')
+  expect(blockedAgain.failure?.reason).toBe('broken once')
+  const doomedHistory = await service.viewTicket(doomed.id)
+  expect(doomedHistory.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+})
+
+it('downgrades unsupported reviewer capabilities instead of failing the spawn', async () => {
+  const { service, devA, workerChild, subagentsStart } = await harness({
+    reviewMode: 'report',
+    providerCapabilities: { outputSchema: false, depthLimit: true, toolFilter: false, persona: false },
+  })
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'capability downgrade card')
+  await toNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+  const reported = await service.report(workerChild, card.id, 'implemented')
+  expect(reported.review).toBe('spawned')
+  const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+  expect(workerCall[1].toolFilter).toBeUndefined()
+  const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+  expect(reviewCall[1].outputSchema).toBeUndefined()
+  expect(reviewCall[1].toolFilter).toBeUndefined()
+  // The degraded prompt explains the no-schema report fallback.
+  const prompt = (reviewCall[1].prompt as { type: string; text: string }[])[0]!.text
+  expect(prompt).toContain('does not support structured output')
 })
 
 it('builds handover notes covering every card state and the empty history', () => {
