@@ -492,6 +492,59 @@ export function formatHandoverSnapshotText(
   return lines.join('\n')
 }
 
+/**
+ * The compact master-event line: one key=value line carrying every fact the
+ * master needs to adjudicate a notice without opening the card. Fields are
+ * the V3-21 compact vocabulary — ticket / title / state / scope / commit /
+ * verdict / blocker / anomaly — rendered as `KIND ticket=... title=...
+ * state=... scope=... [commit=...] [verdict=...] [blocker=...] [anomaly=...]`.
+ * Never reduced to a bare PASS/FAIL: the scope, commit and anomaly survive so
+ * the master can rule on the card itself.
+ * @param kind - the uppercase event kind, e.g. "WORKER_DONE", "REVIEW_VERDICT".
+ * @param fields - the compact fields; optional ones render only when non-empty.
+ * @returns the compact event line.
+ */
+export interface CompactEventFields {
+  ticket: string
+  title: string
+  /** The card state: column[/status], e.g. "in_testing" or "in_progress/blocked". */
+  state: string
+  /** The declared file scope (filesScope); '' renders as "(none)". */
+  scope: string
+  /** The git commit the event refers to, when known ('' omitted). */
+  commit?: string
+  /** The review verdict (approve/reject), for review events. */
+  verdict?: string
+  /** The concrete blocking detail, for fail/lost/blocked events. */
+  blocker?: string
+  /** Anything unexpected the master must weigh (lost reason, violations, problems). */
+  anomaly?: string
+}
+
+/** Render one compact master-event line from its fields. */
+export function formatCompactEvent(kind: string, fields: CompactEventFields): string {
+  const bits = [
+    kind + ' ticket=' + fields.ticket,
+    'title=' + JSON.stringify(fields.title),
+    'state=' + fields.state,
+    'scope=' + (fields.scope === '' ? '(none)' : fields.scope),
+  ]
+  if (fields.commit !== undefined && fields.commit !== '') bits.push('commit=' + fields.commit)
+  if (fields.verdict !== undefined && fields.verdict !== '') bits.push('verdict=' + fields.verdict)
+  if (fields.blocker !== undefined && fields.blocker !== '') bits.push('blocker=' + JSON.stringify(fields.blocker))
+  if (fields.anomaly !== undefined && fields.anomaly !== '') bits.push('anomaly=' + JSON.stringify(fields.anomaly))
+  return bits.join(' ')
+}
+
+/** The compact card state of one ticket: column, plus status when it refines it.
+ * @param ticket - the ticket (column + status).
+ * @returns e.g. "in_testing" for a claimed In testing card, "in_progress/blocked" for a blocked one. */
+export function compactCardState(ticket: { column: ColumnId; status: TicketWorkerStatus }): string {
+  return ticket.status === 'claimed' || ticket.status === 'ready'
+    ? ticket.column
+    : ticket.column + '/' + ticket.status
+}
+
 /** The model-facing workflow section injected into every session's system prompt. */
 export const WORKFLOW_SECTION = [
   '# Taskboard workflow',
@@ -511,6 +564,7 @@ export const WORKFLOW_SECTION = [
   '- Seat self-healing is automatic: a lost worker session is auto-redispatched (up to the configured per-card cap) with the working tree preserved — the card description carries a "续做勿回滚" annotation and the master receives a "worker-redispatched" notice. A reviewer seat without a verdict past the staleness timeout (or whose session is gone) is released and re-review is attempted; the master receives a "reviewer-released" notice. Only when the automatic budget is exhausted is the card blocked for manual taskboard_reassign.',
   '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
   '- Master notifications are durable: worker done/failed/lost events and review verdicts land a notice on the board (readable via taskboard_notices, and carried by the taskboard_claim_master result) and are injected into the master\'s inbox live, or queued into the master\'s persisted inbox when the master session is not live so the next run receives them.',
+  '- Event-driven master, never poll (V3-21): after taskboard_assign confirms the card is In progress, the current turn ends — do not loop taskboard_list / taskboard_notices / taskboard_view waiting for a worker, and do not read unrelated cards or probe the filesystem while work is in flight. Worker done/fail, review verdicts, and lost/redispatched events wake you through the taskboard notice channel; every notice carries a compact event line (ticket/title/state/scope/commit/verdict/blocker/anomaly) with everything needed to adjudicate. Process reviews, dependency unlocks, and the next dispatch batch only after a new event arrives. A proactive refresh (taskboard_list/taskboard_notices) is reserved for genuine anomalies: a state contradiction or a missing notification.',
   "- Moving cards between columns is the board's master's job, executed only after the master and the user agree on the phase scope; non-master agents never move cards. Not started is the scheduling display for the next queue: the master may dispatch directly from Backlog or Not started with taskboard_assign — no move is needed before dispatch. The user's drag-and-drop keeps its visual feedback, but intent is expressed in the conversation. See the master section's workflow discipline for the plan → phase → schedule → execute order.",
 ].join('\n')
 
@@ -539,6 +593,8 @@ export const MASTER_SECTION = [
   '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board — every card\'s status, each in-flight worker\'s identity (workerAgentId/workerSessionId), the In testing review seats, the backlog summary, and the master history — then releases the seat. The successor claims the seat with taskboard_claim_master; the claim result carries those notes, and the successor continues dispatching from them.',
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
   '- Master notices are durable: every worker done/failed/lost event and review verdict lands a {kind, text, at, ticketId} row on the board synchronously, and is injected into your inbox when your session is live (or queued into your persisted inbox when it is not, so the next run replays it). Read them with taskboard_notices, or with taskboard_claim_master whose result carries them — do not rely on polling the board in a loop.',
+  '- Event-driven master, never poll (V3-21): after taskboard_assign confirms the card is In progress, end the current turn — do not loop taskboard_list / taskboard_notices / taskboard_view waiting for a worker, and do not read unrelated cards or probe the filesystem while work is in flight. Worker done/fail, review verdicts, and lost/redispatched events wake you through the taskboard notice channel; every notice carries a compact event line (ticket/title/state/scope/commit/verdict/blocker/anomaly) with everything needed to adjudicate. Process reviews, dependency unlocks, and the next dispatch batch only after a new event arrives. A proactive refresh (taskboard_list/taskboard_notices) is reserved for genuine anomalies: a state contradiction or a missing notification.',
+  '- Read cards in layers (V3-21): default compact — taskboard_list returns one line per card (ticket/title/state/scope/worker/reviewer/dependsOn), enough to dispatch and adjudicate; taskboard_view is the on-demand full read (description, devNotes, history); use the full read only when a compact line leaves an anomaly unresolved.',
   '- Seat self-healing keeps cards moving without you: a lost worker is auto-redispatched (working tree preserved, card description annotated "续做勿回滚") up to the per-card cap, and a stale or ghost reviewer seat is released and re-reviewed. A "worker-redispatched" or "reviewer-released" notice tells you it happened; only when the automatic budget is exhausted does the card land blocked for manual taskboard_reassign.',
   '- Pause a running card with taskboard_pause (master only): the worker run is aborted, the card is marked paused (column unchanged; history records the pauser and reason) and the master is notified. Paused cards are exempt from settlement reclamation and the liveness reconciliation; resume with taskboard_reassign action "retry" (spawns a fresh worker) or return them to Not started with action "backlog".',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',

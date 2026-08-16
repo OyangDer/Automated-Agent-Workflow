@@ -44,8 +44,8 @@ import {
 } from './preflight.ts'
 import {
   agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildHandoverSnapshot, buildReviewPrompt,
-  buildReviewReportPrompt, buildWorkerPrompt, formatHandoverSnapshotText, formatTicketRowLine, MASTER_SECTION,
-  masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
+  buildReviewReportPrompt, buildWorkerPrompt, compactCardState, formatCompactEvent, formatHandoverSnapshotText,
+  formatTicketRowLine, MASTER_SECTION, masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 import type { HandoverCardRow } from './domain.ts'
 
@@ -434,6 +434,12 @@ export interface TicketRow {
   /** Declared file scope, for the master's parallel-safety judgment at dispatch. */
   filesScope: string
   dependsOn: string[]
+  /** Full-mode only (taskboard_list detail "full"): the card description. */
+  description?: string
+  /** Full-mode only (taskboard_list detail "full"): the developer's completion notes. */
+  devNotes?: string
+  /** Full-mode only (taskboard_list detail "full"): the pending review report. */
+  reviewOutcome?: { verdict: string; summary: string; problems: string[] } | null
 }
 
 /** Validate one explicit capacity knob. */
@@ -1279,7 +1285,14 @@ export class TaskboardService extends TypertRemoteService {
     // The verdict landed on the board: the master must resolve it.
     if (landed) {
       await this.notifyMaster(next.boardId,
-        'Taskboard notice: the review verdict (' + structured.verdict + ') for ticket ' + next.id + ' ("' + next.title + '") landed on the board. Adjudicate it with taskboard_resolve_review.',
+        'Taskboard notice: ' + formatCompactEvent('REVIEW_VERDICT', {
+          ticket: next.id,
+          title: next.title,
+          state: compactCardState(next),
+          scope: next.filesScope,
+          verdict: structured.verdict,
+          ...(structured.problems.length === 0 ? {} : { anomaly: structured.problems.join(' | ') }),
+        }) + '. Adjudicate with taskboard_resolve_review.',
         NOTICE_KIND.reviewVerdict, next.id)
     }
   }
@@ -1559,7 +1572,13 @@ export class TaskboardService extends TypertRemoteService {
     // Attach termination reclamation only after the new identity is durable.
     this.trackWorkerRun(ticket.id, spawn.sessionId, spawn.run, spawn.controller)
     await this.notifyMaster(next.boardId,
-      'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") was lost (' + reason + '); auto-redispatched (attempt ' + attempt + ' of ' + this.resolved.workerAutoRetryLimit + '). The working tree is preserved — the new worker continues without rolling back.',
+      'Taskboard notice: ' + formatCompactEvent('WORKER_REDISPATCHED', {
+        ticket: next.id,
+        title: next.title,
+        state: compactCardState(next),
+        scope: next.filesScope,
+        anomaly: 'lost (' + reason + '); auto-redispatched (attempt ' + attempt + ' of ' + this.resolved.workerAutoRetryLimit + '); working tree preserved — the new worker continues without rolling back',
+      }),
       NOTICE_KIND.workerRedispatched, next.id)
     return 'redispatched'
   }
@@ -1596,7 +1615,14 @@ export class TaskboardService extends TypertRemoteService {
     }
     if (!marked) return 'skipped'
     await this.notifyMaster(next.boardId,
-      'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is lost (' + reason + '); the card is blocked (' + detail + '). Re-dispatch with taskboard_reassign.',
+      'Taskboard notice: ' + formatCompactEvent('WORKER_LOST', {
+        ticket: next.id,
+        title: next.title,
+        state: compactCardState(next),
+        scope: next.filesScope,
+        blocker: detail,
+        anomaly: 'lost (' + reason + ')',
+      }) + '. Re-dispatch with taskboard_reassign.',
       NOTICE_KIND.workerLost, next.id)
     return 'blocked'
   }
@@ -1730,9 +1756,14 @@ export class TaskboardService extends TypertRemoteService {
         }
       }
       await this.notifyMaster(next.boardId,
-        'Taskboard notice: the review seat for ticket ' + next.id + ' ("' + next.title + '") was released because the reviewer '
-        + (ghost ? 'session is gone' : 'was idle without a verdict for too long') + '. '
-        + (reseated ? 'A fresh reviewer has been auto-redispatched.' : 'The seat is vacant — use taskboard_claim_review.'),
+        'Taskboard notice: ' + formatCompactEvent('REVIEWER_RELEASED', {
+          ticket: next.id,
+          title: next.title,
+          state: compactCardState(next),
+          scope: next.filesScope,
+          anomaly: 'review seat released: reviewer ' + (ghost ? 'session is gone' : 'was idle without a verdict for too long')
+            + (reseated ? '; fresh reviewer auto-redispatched' : '; seat vacant — use taskboard_claim_review'),
+        }),
         NOTICE_KIND.reviewerReleased, next.id)
     }
     return released
@@ -1844,7 +1875,13 @@ export class TaskboardService extends TypertRemoteService {
         ? 'none'
         : ticket.dependsOn.join(', ') + (pending.length === 0 ? ' (all Done)' : ' (NOT all Done: ' + pending.join(', ') + ')')
       const filesScope = ticket.filesScope === '' ? '(none)' : ticket.filesScope
-      const text = 'Taskboard notice: the user scheduled ticket ' + ticket.id + ' ("' + ticket.title
+      const text = 'Taskboard notice: ' + formatCompactEvent('USER_SCHEDULED', {
+        ticket: ticket.id,
+        title: ticket.title,
+        state: 'not_started',
+        scope: ticket.filesScope,
+        anomaly: 'priority ' + ticket.priority + '; type ' + ticket.type + '; dependsOn [' + dependsOn + ']',
+      }) + '. The user scheduled ticket ' + ticket.id + ' ("' + ticket.title
         + '", priority ' + ticket.priority + ', type ' + ticket.type + ') into Not started — adjudicate whether to start it. '
         + 'dependsOn [' + dependsOn + ']; filesScope "' + filesScope + '". '
         + 'When every dependency is Done and capacity allows, dispatch with taskboard_assign (the card moves to In progress and the workflow starts); '
@@ -2577,7 +2614,15 @@ export class TaskboardService extends TypertRemoteService {
       updatedAt: Date.now(),
     })).catch(() => running)
     await this.notifyMaster(blocked.boardId,
-      'Taskboard notice: dispatch of ticket ' + blocked.id + ' ("' + blocked.title + '") blocked by repo preflight (no worker spawned): ' + report.violations.join(' | '),
+      'Taskboard notice: ' + formatCompactEvent('PREFLIGHT_BLOCKED', {
+        ticket: blocked.id,
+        title: blocked.title,
+        state: compactCardState(blocked),
+        scope: blocked.filesScope,
+        ...(report.head === '' ? {} : { commit: report.head }),
+        blocker: 'repo preflight failed (no worker spawned)',
+        anomaly: report.violations.join(' | '),
+      }),
       NOTICE_KIND.preflightBlocked, blocked.id)
     return blocked
   }
@@ -2704,14 +2749,25 @@ export class TaskboardService extends TypertRemoteService {
         await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
       }
       await this.notifyMaster(ticket.boardId,
-        'Taskboard notice: the worker for ticket ' + ticket.id + ' ("' + ticket.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.',
+        'Taskboard notice: ' + formatCompactEvent('WORKER_DONE', {
+          ticket: ticket.id,
+          title: ticket.title,
+          state: compactCardState(ticket),
+          scope: ticket.filesScope,
+          anomaly: 'reviewer spawn ' + spawn.reason,
+        }) + '. Adjudicate the review with taskboard_resolve_review.',
         NOTICE_KIND.workerDone, ticket.id)
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
     this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
     await this.notifyMaster(withReviewer.boardId,
-      'Taskboard notice: the worker for ticket ' + withReviewer.id + ' ("' + withReviewer.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.',
+      'Taskboard notice: ' + formatCompactEvent('WORKER_DONE', {
+        ticket: withReviewer.id,
+        title: withReviewer.title,
+        state: compactCardState(withReviewer),
+        scope: withReviewer.filesScope,
+      }) + '. Adjudicate the review with taskboard_resolve_review.',
       NOTICE_KIND.workerDone, withReviewer.id)
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
@@ -2749,7 +2805,13 @@ export class TaskboardService extends TypertRemoteService {
       )
     })
     await this.notifyMaster(blocked.boardId,
-      'Taskboard notice: the worker for ticket ' + blocked.id + ' ("' + blocked.title + '") reported failure; the card is blocked. Re-dispatch with taskboard_reassign.',
+      'Taskboard notice: ' + formatCompactEvent('WORKER_FAILED', {
+        ticket: blocked.id,
+        title: blocked.title,
+        state: compactCardState(blocked),
+        scope: blocked.filesScope,
+        blocker: notes,
+      }) + '. Re-dispatch with taskboard_reassign.',
       NOTICE_KIND.workerFailed, blocked.id)
     return blocked
   }
@@ -2891,7 +2953,13 @@ export class TaskboardService extends TypertRemoteService {
       this.runHandles.delete(ticketId)
     }
     await this.notifyMaster(paused.boardId,
-      'Taskboard notice: the master paused ticket ' + paused.id + ' ("' + paused.title + '") — the worker run was aborted and the card is paused (column unchanged). Resume it with taskboard_reassign action "retry", which spawns a fresh worker.',
+      'Taskboard notice: ' + formatCompactEvent('WORKER_PAUSED', {
+        ticket: paused.id,
+        title: paused.title,
+        state: compactCardState(paused),
+        scope: paused.filesScope,
+        anomaly: 'worker run aborted by master',
+      }) + '. Resume with taskboard_reassign action "retry", which spawns a fresh worker.',
       NOTICE_KIND.workerPaused, paused.id)
     return paused
   }
@@ -3347,9 +3415,17 @@ export class TaskboardService extends TypertRemoteService {
    * @param column - column filter, or null for every column.
    * @param mine - when true, only rows assigned to agentId.
    * @param agentId - the calling agent's id.
+   * @param detail - "compact" (default) returns the compact row; "full" also
+   * carries description, devNotes and the pending review report (V3-21 card
+   * read layering: compact by default, full when an anomaly needs it).
    * @returns the matching rows in position order.
    */
-  async listRows(column: ColumnId | null, mine: boolean, agentId: string): Promise<TicketRow[]> {
+  async listRows(
+    column: ColumnId | null,
+    mine: boolean,
+    agentId: string,
+    detail: 'compact' | 'full' = 'compact',
+  ): Promise<TicketRow[]> {
     const table = await this.tickets()
     const rows: TicketRow[] = []
     for (const [, ticket] of table.entries()) {
@@ -3372,6 +3448,13 @@ export class TaskboardService extends TypertRemoteService {
         lastReviewOutcome: ticket.lastReview?.outcome ?? null,
         filesScope: ticket.filesScope,
         dependsOn: ticket.dependsOn,
+        ...(detail === 'full' ? {
+          description: ticket.description,
+          devNotes: ticket.devNotes,
+          reviewOutcome: ticket.reviewOutcome === null || ticket.reviewOutcome === undefined
+            ? null
+            : { verdict: ticket.reviewOutcome.verdict, summary: ticket.reviewOutcome.summary, problems: ticket.reviewOutcome.problems },
+        } : {}),
       })
     }
     return rows.sort((a, b) => a.position - b.position)
@@ -3480,6 +3563,22 @@ export class TaskboardService extends TypertRemoteService {
         },
         filesScope: { type: 'string' as const, required: true as const },
         dependsOn: { type: 'array' as const, required: true as const, items: { type: 'string' as const } },
+        // Full-mode only (taskboard_list detail "full"): optional card content.
+        description: { type: 'string' as const },
+        devNotes: { type: 'string' as const },
+        reviewOutcome: {
+          oneOf: [
+            {
+              type: 'object' as const, additionalProperties: false,
+              properties: {
+                verdict: { type: 'string' as const, required: true as const },
+                summary: { type: 'string' as const, required: true as const },
+                problems: { type: 'array' as const, required: true as const, items: { type: 'string' as const } },
+              },
+            },
+            { type: 'null' as const },
+          ] as const,
+        },
       },
     }
   }
@@ -3488,7 +3587,7 @@ export class TaskboardService extends TypertRemoteService {
   private registerTools(): void {
     this.ctx.tools.register(defineTool({
       name: 'taskboard_list',
-      description: 'List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up.',
+      description: 'List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up. detail "compact" (default) returns one compact line per card; detail "full" also carries description, devNotes and the pending review report — use full only when a compact line leaves an anomaly unresolved.',
       parameters: {
         column: {
           type: 'string' as const,
@@ -3499,6 +3598,11 @@ export class TaskboardService extends TypertRemoteService {
           type: 'boolean' as const,
           description: 'When true, only tickets assigned to the calling agent.',
         },
+        detail: {
+          type: 'string' as const,
+          enum: ['compact', 'full'],
+          description: 'compact (default) returns one line per card; full also includes description, devNotes and the pending review report for anomaly adjudication.',
+        },
       },
       output: {
         schema: {
@@ -3507,20 +3611,28 @@ export class TaskboardService extends TypertRemoteService {
             tickets: { type: 'array', required: true, items: TaskboardService.ticketRowSchema() },
           },
         },
-        render: (_args, value: { tickets: TicketRow[] }) => [{
+        render: (args: { detail?: string }, value: { tickets: TicketRow[] }) => [{
           type: 'text' as const,
           text: value.tickets.length === 0
             ? '0 tickets'
-            : String(value.tickets.length) + ' ticket(s):\n' + value.tickets.map(ticket => formatTicketRowLine(ticket)).join('\n'),
+            : String(value.tickets.length) + ' ticket(s):\n' + value.tickets.map(ticket =>
+              formatTicketRowLine(ticket)
+                + (args.detail === 'full'
+                  ? (ticket.description === '' || ticket.description === undefined ? '' : '\n  description: ' + ticket.description)
+                    + (ticket.devNotes === '' || ticket.devNotes === undefined ? '' : '\n  devNotes: ' + ticket.devNotes)
+                    + (ticket.reviewOutcome === null || ticket.reviewOutcome === undefined ? '' : '\n  reviewOutcome: ' + ticket.reviewOutcome.verdict + ' — ' + ticket.reviewOutcome.summary)
+                  : ''),
+            ).join('\n'),
         }],
       },
-      execute: async (args: { column?: string; mine?: boolean }, exec) => {
+      execute: async (args: { column?: string; mine?: boolean; detail?: string }, exec) => {
         const agent = TaskboardService.agentOf(exec)
         const column = args.column === undefined ? null : args.column as ColumnId
         if (column !== null && !isColumn(column)) {
           throw new TaskboardError('unknown column "' + String(column) + '"', 'TASKBOARD_INVALID_COLUMN')
         }
-        const tickets = await this.listRows(column, args.mine === true, agent.id)
+        const detail = args.detail === 'full' ? 'full' : 'compact'
+        const tickets = await this.listRows(column, args.mine === true, agent.id, detail)
         return { tickets }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'List taskboard tickets', kind: 'other' as const, rawInput: args.column ?? null }),

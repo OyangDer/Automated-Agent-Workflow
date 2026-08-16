@@ -1319,7 +1319,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_list`
 
-List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up.
+List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up. detail "compact" (default) returns one compact line per card; detail "full" also carries description, devNotes and the pending review report — use full only when a compact line leaves an anomaly unresolved.
 
 ```json
 {
@@ -1339,6 +1339,14 @@ List taskboard tickets. Tickets come back sorted by implementation order (positi
     "mine": {
       "type": "boolean",
       "description": "When true, only tickets assigned to the calling agent."
+    },
+    "detail": {
+      "type": "string",
+      "description": "compact (default) returns one line per card; full also includes description, devNotes and the pending review report for anomaly adjudication.",
+      "enum": [
+        "compact",
+        "full"
+      ]
     }
   }
 }

@@ -2116,6 +2116,28 @@ describe('TaskboardService workflow', () => {
     expect(MASTER_SECTION).not.toContain('Workers and reviewers never claim')
   })
 
+  it('teaches the event-driven master discipline: dispatch, then wait for the notice — never poll (V3-21)', () => {
+    // After taskboard_assign confirms the card is In progress, the turn ends:
+    // no looping taskboard_list/notices/view waiting for a worker, no reading
+    // unrelated cards, no filesystem probing.
+    expect(MASTER_SECTION).toContain('Event-driven master, never poll')
+    expect(MASTER_SECTION).toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
+    expect(MASTER_SECTION).toContain('do not read unrelated cards or probe the filesystem')
+    expect(MASTER_SECTION).toContain('end the current turn')
+    expect(MASTER_SECTION).toContain('A proactive refresh')
+    expect(MASTER_SECTION).toContain('genuine anomalies')
+    // The notice channel carries the compact event line the master adjudicates from.
+    expect(MASTER_SECTION).toContain('compact event line')
+    expect(MASTER_SECTION).toContain('ticket/title/state/scope/commit/verdict/blocker/anomaly')
+    // The workflow section repeats the same no-polling rule for every session.
+    expect(WORKFLOW_SECTION).toContain('Event-driven master, never poll')
+    expect(WORKFLOW_SECTION).toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
+    // Card read layering: compact by default, full only when an anomaly needs it.
+    expect(MASTER_SECTION).toContain('Read cards in layers')
+    expect(MASTER_SECTION).toContain('default compact')
+    expect(MASTER_SECTION).toContain('anomaly unresolved')
+  })
+
   it('writes and reads the declared filesScope on cards', async () => {
     const { service, devA } = await harness()
     // Declared at create: read back through the Remote surface and the view.
@@ -2771,6 +2793,49 @@ it('returns the structured handover snapshot from the claim tool, even without a
   expect(listText).toContain(underReview.id)
 })
 
+it('lists cards compact by default and full when detail "full" is requested (V3-21)', async () => {
+  const { ctx, service, devA } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await service.createRemote(devA, {
+    title: 'layered card', description: 'the full description', priority: 'normal',
+    dependsOn: [], filesScope: 'src/domain.ts',
+  })
+  await scheduleToNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  // Default detail: compact one-line rows (no description/devNotes/reviewOutcome).
+  const compact = await ctx.tools.execute({
+    callId: CallId('tool-list-compact'),
+    name: 'taskboard_list',
+    arguments: {},
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(compact.isError).toBe(false)
+  const compactValue = (compact as { value: { tickets: Array<Record<string, unknown>> } }).value
+  expect(compactValue.tickets[0]!.description).toBeUndefined()
+  expect(compactValue.tickets[0]!.devNotes).toBeUndefined()
+  const compactText = compact.content.map(block => block.type === 'text' ? block.text : '').join('')
+  expect(compactText).toContain(card.id)
+  expect(compactText).not.toContain('the full description')
+
+  // detail "full": the rows carry description/devNotes/reviewOutcome and the
+  // model-visible render shows them.
+  const full = await ctx.tools.execute({
+    callId: CallId('tool-list-full'),
+    name: 'taskboard_list',
+    arguments: { detail: 'full' },
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(full.isError).toBe(false)
+  const fullValue = (full as { value: { tickets: Array<{ description?: string; devNotes?: string; reviewOutcome?: unknown }> } }).value
+  expect(fullValue.tickets[0]!.description).toBe('the full description')
+  expect(fullValue.tickets[0]!.devNotes).toBeDefined()
+  const fullText = full.content.map(block => block.type === 'text' ? block.text : '').join('')
+  expect(fullText).toContain('the full description')
+})
+
 it('rejects handover on an unknown board', async () => {
   const { service, devA } = await harness()
   await expect(service.handover('no-such-board', devA)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
@@ -2824,6 +2889,74 @@ it('notifies the master inbox when a worker reports and when a verdict lands', a
   expect(second.source.kind).toBe('taskboard')
   expect(textOf(second)).toContain('approve')
   expect(textOf(second)).toContain('taskboard_resolve_review')
+})
+
+it('carries the compact event line (ticket/state/scope/verdict/anomaly) in every worker-lifecycle notice (V3-21)', async () => {
+  let settle!: (result: RunResultStub) => void
+  const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+  const { service, devA, workerChild } = await harness({ reviewerRunResult: runResult })
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await service.createRemote(devA, {
+    title: 'compact notice card', description: '', priority: 'normal', dependsOn: [], filesScope: 'src/domain.ts',
+  })
+  await scheduleToNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  // Worker done: WORKER_DONE ticket=... title=... state=in_testing scope=...
+  await service.report(workerChild, card.id, 'implemented and tested')
+  const done = textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })
+  expect(done).toContain('WORKER_DONE ticket=' + card.id)
+  expect(done).toContain('state=in_testing')
+  expect(done).toContain('scope=src/domain.ts')
+  expect(done).toContain('taskboard_resolve_review')
+
+  // Review verdict: REVIEW_VERDICT ticket=... verdict=approve state=in_testing.
+  settle({ output: [], stopReason: 'completed', structured: { verdict: 'approve', summary: 'verified', problems: [] } })
+  await vi.waitFor(() => { expect(followup.mock.calls.length).toBeGreaterThanOrEqual(2) })
+  const verdict = textOf(followup.mock.calls[1]![0] as { content: { type: string; text: string }[] })
+  expect(verdict).toContain('REVIEW_VERDICT ticket=' + card.id)
+  expect(verdict).toContain('verdict=approve')
+  expect(verdict).toContain('state=in_testing')
+})
+
+it('carries the compact event line (ticket/state/scope/blocker/anomaly) in fail and lost-worker notices (V3-21)', async () => {
+  const { service, devA, workerChild } = await harness()
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  const card = await createTicket(service, 'compact doomed card')
+  await scheduleToNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  // Worker failed: WORKER_FAILED ticket=... state=in_progress/blocked blocker=...
+  const blocked = await service.fail(workerChild, card.id, 'dependency is down')
+  expect(blocked.status).toBe('blocked')
+  const failed = textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })
+  expect(failed).toContain('WORKER_FAILED ticket=' + card.id)
+  expect(failed).toContain('state=in_progress/blocked')
+  expect(failed).toContain('blocker="dependency is down"')
+  expect(failed).toContain('taskboard_reassign')
+
+  // A terminated worker is auto-redispatched: WORKER_REDISPATCHED ticket=...
+  // state=in_progress/running anomaly=lost (worker terminated (...)).
+  let settle!: (result: RunResultStub) => void
+  const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+  const { service: service2, devA: devA2 } = await harness({ workerRunResults: [runResult] })
+  await service2.claimMaster('default', devA2)
+  const followup2 = vi.spyOn(devA2, 'followup')
+  const silent = await createTicket(service2, 'compact silent worker')
+  await scheduleToNotStarted(service2, devA2, silent)
+  await service2.assign(devA2, silent.id)
+  settle({ output: [], stopReason: 'aborted' })
+  await vi.waitFor(async () => {
+    expect((await service2.viewTicket(silent.id)).autoRetries).toBe(1)
+  })
+  const redispatched = textOf(followup2.mock.calls[0]![0] as { content: { type: string; text: string }[] })
+  expect(redispatched).toContain('WORKER_REDISPATCHED ticket=' + silent.id)
+  expect(redispatched).toContain('state=in_progress/running')
+  expect(redispatched).toContain('anomaly=')
+  expect(redispatched).toContain('lost')
+  expect(redispatched).toContain('auto-redispatched')
 })
 
 it('notifies the master inbox when a worker reports failure', async () => {
