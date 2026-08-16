@@ -39,7 +39,7 @@ import type {
   TicketWorkerStatus,
 } from './types.ts'
 import {
-  agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildReviewPrompt,
+  agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildHandoverSnapshot, buildReviewPrompt,
   buildReviewReportPrompt, buildWorkerPrompt, MASTER_SECTION, masterModelNote, reviewerLabel,
   TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
@@ -3625,6 +3625,53 @@ export class TaskboardService extends TypertRemoteService {
             name: { type: 'string', required: true },
             masterAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
             handoverNotes: { type: 'string', required: true },
+            backlogSummary: { type: 'string', required: true },
+            pendingAdjudications: {
+              type: 'array', required: true,
+              items: { type: 'string' },
+            },
+            cards: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  ticketId: { type: 'string', required: true },
+                  title: { type: 'string', required: true },
+                  column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+                  status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+                  type: { type: 'string', required: true },
+                  priority: { type: 'string', required: true },
+                  workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
+                  reviewer: {
+                    oneOf: [
+                      { type: 'object', additionalProperties: false, properties: { agentId: { type: 'string', required: true }, label: { type: 'string', required: true } } },
+                      { type: 'null' },
+                    ] as const, required: true,
+                  },
+                  dependsOn: { type: 'array', required: true, items: { type: 'string' } },
+                  lastReviewOutcome: { oneOf: [{ type: 'string', enum: ['approved', 'rejected'] }, { type: 'null' }] as const, required: true },
+                  reviewOutcome: {
+                    oneOf: [
+                      {
+                        type: 'object', additionalProperties: false,
+                        properties: {
+                          verdict: { type: 'string', required: true },
+                          summary: { type: 'string', required: true },
+                          problems: { type: 'array', required: true, items: { type: 'string' } },
+                        },
+                      },
+                      { type: 'null' },
+                    ] as const, required: true,
+                  },
+                  failure: {
+                    oneOf: [
+                      { type: 'object', additionalProperties: false, properties: { reason: { type: 'string', required: true }, at: { type: 'number', required: true } } },
+                      { type: 'null' },
+                    ] as const, required: true,
+                  },
+                },
+              },
+            },
             notices: {
               type: 'array', required: true,
               items: {
@@ -3639,18 +3686,35 @@ export class TaskboardService extends TypertRemoteService {
             },
           },
         },
-        render: (_args, value: { boardId: string; masterAgentId: string | null; handoverNotes: string; notices: BoardNotice[] }) => [{
+        render: (_args, value: {
+          boardId: string
+          masterAgentId: string | null
+          backlogSummary: string
+          cards: unknown[]
+          notices: BoardNotice[]
+        }) => [{
           type: 'text' as const,
           text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId)
-            + (value.handoverNotes === '' ? '' : '; handover notes available in the claim result')
+            + '; ' + value.backlogSummary
+            + '; ' + String(value.cards.length) + ' active card(s) in the claim snapshot'
             + (value.notices.length === 0 ? '' : '; ' + String(value.notices.length) + ' notice(s) available in the claim result'),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
         const board = await this.claimMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        const table = await this.tickets()
+        const tickets: TicketView[] = []
+        for (const [, ticket] of table.entries()) {
+          if (ticket.boardId === board.boardId) tickets.push(ticket)
+        }
+        const snapshot = buildHandoverSnapshot(board, tickets)
         return {
-          boardId: board.boardId, name: board.name, masterAgentId: board.masterAgentId,
-          handoverNotes: board.handoverNotes, notices: board.notices ?? [],
+          boardId: snapshot.boardId, name: snapshot.name, masterAgentId: snapshot.masterAgentId,
+          handoverNotes: snapshot.handoverNotes,
+          backlogSummary: snapshot.backlogSummary,
+          pendingAdjudications: snapshot.pendingAdjudications,
+          cards: snapshot.cards,
+          notices: board.notices ?? [],
         }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Claim taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),

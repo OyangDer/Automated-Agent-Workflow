@@ -7,7 +7,7 @@
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { BoardNotice, BoardView, ColumnId, TicketHistoryEntry, TicketView } from './types.ts'
+import type { BoardNotice, BoardView, ColumnId, TicketHistoryEntry, TicketView, TicketWorkerStatus } from './types.ts'
 
 /** Stable error codes for rejected taskboard reads and mutations. */
 export type TaskboardErrorCode =
@@ -355,6 +355,95 @@ export function buildHandoverNotes(board: BoardView, tickets: TicketView[]): str
   return lines.join('\n')
 }
 
+/**
+ * One compact card row of the claim-time handover snapshot: the concrete
+ * facts a successor master needs to continue without guessing — ticket id,
+ * title, column, worker lifecycle, in-flight worker/reviewer identities,
+ * dependencies, the latest review decision, and the pending review report.
+ * A read-only view of the board's current state; never a second source of truth.
+ */
+export interface HandoverCardRow {
+  ticketId: string
+  title: string
+  column: ColumnId
+  status: TicketWorkerStatus
+  type: string
+  priority: string
+  workerAgentId: string | null
+  reviewer: { agentId: string; label: string } | null
+  dependsOn: string[]
+  lastReviewOutcome: 'approved' | 'rejected' | null
+  reviewOutcome: { verdict: string; summary: string; problems: string[] } | null
+  failure: { reason: string; at: number } | null
+}
+
+/**
+ * The structured handover snapshot returned by taskboard_claim_master: every
+ * non-Done card with its concrete state, the per-column counts, the pending
+ * adjudications (In testing cards whose review verdict landed), the stored
+ * handover notes, and the board's durable notices. Computed fresh at claim
+ * time from the live board state — a crash succession (no prior
+ * taskboard_handover call) still yields a complete snapshot.
+ */
+export interface HandoverSnapshot {
+  boardId: string
+  name: string
+  masterAgentId: string | null
+  handoverNotes: string
+  cards: HandoverCardRow[]
+  backlogSummary: string
+  pendingAdjudications: string[]
+}
+
+/**
+ * Build the claim-time handover snapshot from the board row and its tickets.
+ * @param board - the board being claimed.
+ * @param tickets - every ticket of this board (any order).
+ * @returns the structured snapshot (read-only view of the current state).
+ */
+export function buildHandoverSnapshot(board: BoardView, tickets: TicketView[]): HandoverSnapshot {
+  const order: ColumnId[] = ['backlog', 'not_started', 'in_progress', 'in_testing', 'done']
+  const active = tickets
+    .filter(ticket => ticket.column !== 'done')
+    .sort((a, b) => {
+      const col = order.indexOf(a.column) - order.indexOf(b.column)
+      return col !== 0 ? col : a.position - b.position
+    })
+  const cards: HandoverCardRow[] = active.map(ticket => ({
+    ticketId: ticket.id,
+    title: ticket.title,
+    column: ticket.column,
+    status: ticket.status,
+    type: ticket.type,
+    priority: ticket.priority,
+    workerAgentId: ticket.workerAgentId ?? null,
+    reviewer: ticket.reviewer,
+    dependsOn: ticket.dependsOn,
+    lastReviewOutcome: ticket.lastReview?.outcome ?? null,
+    reviewOutcome: ticket.reviewOutcome === null || ticket.reviewOutcome === undefined
+      ? null
+      : { verdict: ticket.reviewOutcome.verdict, summary: ticket.reviewOutcome.summary, problems: ticket.reviewOutcome.problems },
+    failure: ticket.failure,
+  }))
+  const counts: Record<ColumnId, number> = {
+    backlog: 0, not_started: 0, in_progress: 0, in_testing: 0, done: 0,
+  }
+  for (const ticket of tickets) counts[ticket.column] += 1
+  const pendingAdjudications = tickets
+    .filter(ticket => ticket.column === 'in_testing' && ticket.reviewOutcome !== null && ticket.reviewOutcome !== undefined)
+    .map(ticket => ticket.id)
+  return {
+    boardId: board.boardId,
+    name: board.name,
+    masterAgentId: board.masterAgentId,
+    handoverNotes: board.handoverNotes,
+    cards,
+    backlogSummary: 'Backlog ' + counts.backlog + ' · Not started ' + counts.not_started
+      + ' · In progress ' + counts.in_progress + ' · In testing ' + counts.in_testing + ' · Done ' + counts.done,
+    pendingAdjudications,
+  }
+}
+
 /** The model-facing workflow section injected into every session's system prompt. */
 export const WORKFLOW_SECTION = [
   '# Taskboard workflow',
@@ -430,6 +519,13 @@ export const MASTER_SECTION = [
   '- Every card carries a filesScope field (\'\' by default): the paths (files or directories) the card affects. Declare it when creating or editing a card — during planning you and the user agree on which files the work touches.',
   '- When dispatching with taskboard_assign, read the filesScope of every In-flight and Not started card before starting new workers: two workers whose scopes overlap must not run in parallel (serialize them or tighten the scopes), and a card whose scope depends on another card\'s output is a soft dependency — order it after that card even without a dependsOn edge.',
   '- When a card has no filesScope declared, ask the user or record one before dispatching so parallel safety is judged on facts, not guesses.',
+  '',
+  '# Handover data contract (fail closed)',
+  '',
+  'The claim-time handover snapshot is the successor\'s single entry point into the board state:',
+  '- taskboard_claim_master returns the fresh structured snapshot (every active card\'s ticketId, title, column, status, worker/reviewer identity, dependencies, latest review, plus the per-column summary and the pending adjudications). Read it before anything else.',
+  '- If the claim result\'s cards snapshot is missing or unreadable, or taskboard_list returns no rows while the snapshot promises active cards: fail closed — stop dispatching, report "handover data unavailable" to the user, and wait for instructions.',
+  '- Never guess ticket ids, never create probe cards, and never use write operations (move/pause/reassign) to reverse-engineer board state. Read only via the claim snapshot, taskboard_list, and taskboard_view.',
 ].join('\n')
 
 /**

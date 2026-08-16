@@ -2434,6 +2434,69 @@ it('hands over the master seat with structured notes and continues cross-session
   expect(assigned.ticket.column).toBe('in_progress')
 })
 
+it('returns the structured handover snapshot from the claim tool, even without a prior handover', async () => {
+  let settle!: (result: RunResultStub) => void
+  const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+  const { ctx, service, devA, devB, workerChild } = await harness({ reviewerRunResult: runResult })
+  await service.claimMaster('default', devA)
+  const planned = await createTicket(service, 'planned card')
+  const inFlight = await createTicket(service, 'in flight')
+  await toNotStarted(service, devA, inFlight)
+  await service.assign(devA, inFlight.id)
+  const underReview = await createTicket(service, 'under review')
+  await toNotStarted(service, devA, underReview)
+  await service.assign(devA, underReview.id)
+  await service.report(workerChild, underReview.id, 'implemented')
+  settle({
+    output: [],
+    stopReason: 'completed',
+    structured: { verdict: 'approve', summary: 'ok', problems: [] },
+  })
+  await vi.waitFor(async () => {
+    expect((await service.viewTicket(underReview.id)).reviewOutcome).not.toBeNull()
+  })
+  // Crash succession: the old master never called taskboard_handover, so the
+  // stored notes are empty — the claim tool must still deliver the complete
+  // structured snapshot computed fresh from the live board state.
+  await service.releaseMaster('default', devA)
+  const claim = await ctx.tools.execute({
+    callId: CallId('tool-claim-snapshot'),
+    name: 'taskboard_claim_master',
+    arguments: {},
+    agent: devB,
+    signal: new AbortController().signal,
+  })
+  expect(claim.isError).toBe(false)
+  const value = (claim as { value: {
+    cards: Array<{
+      ticketId: string
+      title: string
+      column: string
+      status: string
+      workerAgentId: string | null
+      reviewer: { agentId: string } | null
+      reviewOutcome: { verdict: string } | null
+      dependsOn: string[]
+    }>
+    backlogSummary: string
+    pendingAdjudications: string[]
+    handoverNotes: string
+  } }).value
+  expect(value.handoverNotes).toBe('')
+  expect(value.cards.map(card => card.ticketId).sort()).toEqual([planned.id, inFlight.id, underReview.id].sort())
+  const inFlightRow = value.cards.find(card => card.ticketId === inFlight.id)!
+  expect(inFlightRow).toMatchObject({ title: 'in flight', column: 'in_progress', status: 'running' })
+  expect(inFlightRow.workerAgentId).toBe('worker-child-agent')
+  const underReviewRow = value.cards.find(card => card.ticketId === underReview.id)!
+  expect(underReviewRow).toMatchObject({ title: 'under review', column: 'in_testing' })
+  expect(underReviewRow.reviewer?.agentId).toBe('reviewer-child-agent')
+  expect(underReviewRow.reviewOutcome?.verdict).toBe('approve')
+  expect(value.backlogSummary).toContain('Backlog 1')
+  expect(value.backlogSummary).toContain('In progress 1')
+  expect(value.backlogSummary).toContain('In testing 1')
+  expect(value.pendingAdjudications).toEqual([underReview.id])
+})
+
 it('rejects handover on an unknown board', async () => {
   const { service, devA } = await harness()
   await expect(service.handover('no-such-board', devA)).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
