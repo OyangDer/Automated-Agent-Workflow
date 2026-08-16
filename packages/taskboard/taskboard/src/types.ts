@@ -231,6 +231,54 @@ export interface BoardSnapshot {
   notices?: BoardNotice[]
 }
 
+/**
+ * The base/candidate relationship of one repo HEAD against the canonical
+ * base commit (V3-20): 'equal' when HEAD sits exactly on the base, 'ahead'
+ * when HEAD descends from the base, 'behind' when the base descends from
+ * HEAD, 'diverged' when the two share no ancestor relationship, and
+ * 'unknown' when the canonical commit could not be resolved at all.
+ */
+export type BaseCandidateRelationship = 'equal' | 'ahead' | 'behind' | 'diverged' | 'unknown'
+
+/**
+ * One deterministic repo/worktree preflight report (V3-20), computed fresh
+ * at dispatch time from live git facts — never cached. Carries the raw,
+ * checkable facts (canonical base branch+commit, assigned worktree, actual
+ * branch, HEAD, dirty-file list, base/candidate relationship, declared file
+ * scope, cross-card conflicts) plus the invariant judgment: {@link safe} is
+ * true only when every invariant holds. A false report fails the dispatch
+ * closed (card blocked, no worker spawned); a true report is inlined into
+ * the worker prompt so the worker starts from deterministic facts instead of
+ * archaeologying the repository. Pure data — the browser outlet imports this
+ * module without dragging host services into the client program.
+ */
+export interface PreflightReport {
+  /** True only when every invariant holds; false = the dispatch must fail closed. */
+  safe: boolean
+  /** Every concrete invariant violation; empty when safe. */
+  violations: string[]
+  /** The repo root the preflight ran against (git top-level). */
+  repoRoot: string
+  /** The authoritative baseline: branch + commit. */
+  canonicalBase: { branch: string; commit: string }
+  /** The worktree assigned to this dispatch (absolute path). */
+  assignedWorktree: string
+  /** The branch actually checked out ('(detached)' on a detached HEAD). */
+  actualBranch: string
+  /** The HEAD commit actually checked out. */
+  head: string
+  /** Uncommitted changes as porcelain entries (untracked included). */
+  dirtyFiles: string[]
+  /** Whether the current HEAD sits on/above/away from the canonical base. */
+  baseCandidateRelationship: BaseCandidateRelationship
+  /** The card's declared file scope. */
+  filesScope: string
+  /** Cross-card file-scope conflicts with other in-flight cards of the same board. */
+  conflicts: string[]
+  /** Unix epoch milliseconds when the facts were gathered. */
+  checkedAt: number
+}
+
 /** Mutation verbs surfaced by the forwarded `taskboard/changed` event. */
 export type TaskboardOperation =
   | 'create' | 'move' | 'edit' | 'remove'

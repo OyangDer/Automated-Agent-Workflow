@@ -34,10 +34,14 @@ import {
 import type {
   ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardSnapshot, BoardView, ColumnId,
   CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry,
-  MoveTicketRequest, Priority, RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest,
+  MoveTicketRequest, PreflightReport, Priority, RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest,
   TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView,
   TicketWorkerStatus,
 } from './types.ts'
+import {
+  isInsidePath, normalizePath, preflightPromptSection, runPreflight,
+  type RepoPreflightConfig,
+} from './preflight.ts'
 import {
   agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildHandoverSnapshot, buildReviewPrompt,
   buildReviewReportPrompt, buildWorkerPrompt, formatHandoverSnapshotText, formatTicketRowLine, MASTER_SECTION,
@@ -169,6 +173,7 @@ const NOTICE_KIND = {
   reviewerReleased: 'reviewer-released',
   userScheduled: 'user-scheduled',
   workerPaused: 'worker-paused',
+  preflightBlocked: 'preflight-blocked',
 } as const
 
 /**
@@ -316,6 +321,19 @@ export interface Config {
    * released immediately). Defaults to 900000 (15 minutes).
    */
   reviewerStaleTimeoutMs?: number
+  /**
+   * V3-20: per-repo deterministic preflight contracts, keyed by absolute repo
+   * root path. When non-empty, every assign/retry dispatch resolves the
+   * card's repo from the master session cwd (the shared workspace) and
+   * refuses to spawn a worker unless the live git facts satisfy the
+   * invariants — the canonical base (branch + commit) is checked out, the
+   * working tree is clean, no reserved worktree (e.g. the integration
+   * worktree) is occupied, and no in-flight card of the same board has an
+   * overlapping file scope. A failing dispatch lands the card blocked with
+   * the concrete violations and never spawns a worker (fail closed). An
+   * empty/absent map keeps the legacy dispatch path (no preflight).
+   */
+  preflightRepos?: Record<string, RepoPreflightConfig>
 }
 
 /** Schemastery configuration for the taskboard consumer. */
@@ -336,6 +354,12 @@ export const Config: z<Config> = z.object({
   lostWorkerTimeoutMs: z.number().default(600000),
   workerAutoRetryLimit: z.number().default(2),
   reviewerStaleTimeoutMs: z.number().default(900000),
+  preflightRepos: z.dict(z.object({
+    canonicalBranch: z.string(),
+    canonicalCommit: z.string(),
+    worktree: z.string(),
+    reservedWorktrees: z.array(z.string()),
+  })),
 })
 
 /** One worker-spawn outcome. The controller owns the request signal; the
@@ -552,6 +576,8 @@ export class TaskboardService extends TypertRemoteService {
     lostWorkerTimeoutMs: number
     workerAutoRetryLimit: number
     reviewerStaleTimeoutMs: number
+    /** V3-20: normalized per-repo preflight contracts keyed by absolute repo root. */
+    preflightRepos: Record<string, RepoPreflightConfig>
   }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
@@ -569,6 +595,32 @@ export class TaskboardService extends TypertRemoteService {
     // inherits the workerModel, an unset reviewerEffort the workerEffort.
     const workerEffort = resolveEffort(config.workerEffort)
     const workerModel = config.workerModel ?? 'deepseek-v4-flash'
+    // V3-20: normalize the per-repo preflight contracts at load time. A repo
+    // without a canonical branch is misconfigured and must never govern
+    // dispatch silently — it is dropped with a warning (fail closed would
+    // block every dispatch of that repo, which is worse than refusing it).
+    const preflightRepos: Record<string, RepoPreflightConfig> = {}
+    for (const [root, repo] of Object.entries(config.preflightRepos ?? {})) {
+      if (repo === undefined || repo === null || typeof repo !== 'object') {
+        ctx.logger.warn('taskboard: preflight repo "' + root + '" has an invalid config; ignoring it')
+        continue
+      }
+      if (typeof repo.canonicalBranch !== 'string' || repo.canonicalBranch.trim() === '') {
+        ctx.logger.warn('taskboard: preflight repo "' + root + '" has no canonicalBranch; ignoring it')
+        continue
+      }
+      preflightRepos[root] = {
+        canonicalBranch: repo.canonicalBranch.trim(),
+        ...(typeof repo.canonicalCommit === 'string' && repo.canonicalCommit.trim() !== ''
+          ? { canonicalCommit: repo.canonicalCommit.trim() } : {}),
+        ...(typeof repo.worktree === 'string' && repo.worktree.trim() !== ''
+          ? { worktree: repo.worktree.trim() } : {}),
+        ...(Array.isArray(repo.reservedWorktrees)
+          ? { reservedWorktrees: repo.reservedWorktrees
+            .filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '')
+            .map(entry => entry.trim()) } : {}),
+      }
+    }
     this.resolved = {
       maxInProgress: resolveMaxInProgress(config.maxInProgress ?? 4),
       reviewProvider: config.reviewProvider ?? 'spawn',
@@ -586,6 +638,7 @@ export class TaskboardService extends TypertRemoteService {
       lostWorkerTimeoutMs: resolveLostWorkerTimeout(config.lostWorkerTimeoutMs ?? 600000),
       workerAutoRetryLimit: resolveWorkerAutoRetryLimit(config.workerAutoRetryLimit ?? 2),
       reviewerStaleTimeoutMs: resolveReviewerStaleTimeout(config.reviewerStaleTimeoutMs ?? 900000),
+      preflightRepos,
     }
     if (config.workerEffort !== undefined && this.resolved.workerEffort === undefined) {
       ctx.logger.warn('taskboard: workerEffort "' + config.workerEffort + '" is not a supported effort level (off|high|max); falling back to the adapter default')
@@ -1289,8 +1342,18 @@ export class TaskboardService extends TypertRemoteService {
   /**
    * Spawn the worker child for one ticket and attach termination
    * reclamation to its run result.
+   * @param parent - the master session agent the child spawns under.
+   * @param ticket - the card being dispatched.
+   * @param workerLabel - optional display label for the worker child.
+   * @param preflight - the V3-20 dispatch-time preflight report; when present
+   * its raw facts (canonical base, assigned worktree, actual branch, HEAD,
+   * dirty list, base/candidate relationship) are inlined into the worker
+   * prompt so the worker starts from deterministic facts. Auto-redispatch
+   * (liveness recovery) passes none — its working tree is dirty by design.
    */
-  private async spawnWorker(parent: Agent, ticket: TicketView, workerLabel?: string): Promise<WorkerSpawnResult> {
+  private async spawnWorker(
+    parent: Agent, ticket: TicketView, workerLabel?: string, preflight?: PreflightReport,
+  ): Promise<WorkerSpawnResult> {
     const subagents = this.ctx.get('subagents')
     if (subagents === undefined) {
       return { ok: false, reason: 'unavailable' }
@@ -1319,8 +1382,11 @@ export class TaskboardService extends TypertRemoteService {
         label: workerLabel ?? ticket.title,
         // The master session id names the worker's independent branch
         // (taskboard/<session-short-id>/<ticket-id>), keeping parallel
-        // workers in a shared workspace from colliding.
-        prompt: [{ type: 'text', text: buildWorkerPrompt(ticket, cwd, parent.id) }],
+        // workers in a shared workspace from colliding. V3-20: a dispatch-time
+        // preflight report appends its raw repo facts to the worker prompt.
+        prompt: [{ type: 'text', text: preflight === undefined
+          ? buildWorkerPrompt(ticket, cwd, parent.id)
+          : buildWorkerPrompt(ticket, cwd, parent.id) + '\n' + preflightPromptSection(preflight) }],
         parent,
         signal: controller.signal,
         agentOptions: TaskboardService.agentOptionsFor(modelCfg.workerModel, modelCfg.workerEffort, supportsEffort),
@@ -2414,6 +2480,109 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * V3-20: resolve the repo a card dispatches against, from configuration
+   * only (never guessed). The master session cwd names the shared workspace;
+   * the configured preflight repo root that prefixes it wins (longest match).
+   * @param cwd - the master session's working directory.
+   * @returns the matched repo root and its preflight contract, or null when no configured root governs the cwd.
+   */
+  private resolvePreflightRepo(cwd: string | undefined): { repoRoot: string; config: RepoPreflightConfig } | null {
+    if (cwd === undefined || cwd === '') return null
+    const cwdNorm = normalizePath(cwd)
+    let best: { repoRoot: string; config: RepoPreflightConfig } | null = null
+    for (const [root, config] of Object.entries(this.resolved.preflightRepos)) {
+      if (!isInsidePath(root, cwdNorm)) continue
+      if (best === null || normalizePath(root).length > normalizePath(best.repoRoot).length) {
+        best = { repoRoot: root, config }
+      }
+    }
+    return best
+  }
+
+  /**
+   * V3-20: other in-flight (In progress, running) cards of the same board,
+   * for the cross-card file-scope conflict check.
+   * @param ticket - the card being dispatched.
+   * @returns the in-flight cards' id + declared scope.
+   */
+  private async inFlightScopes(ticket: TicketView): Promise<{ ticketId: string; filesScope: string }[]> {
+    const table = await this.tickets()
+    const scopes: { ticketId: string; filesScope: string }[] = []
+    for (const [, other] of table.entries()) {
+      if (other.id === ticket.id) continue
+      if (other.boardId !== ticket.boardId) continue
+      if (other.column !== 'in_progress' || other.status !== 'running') continue
+      scopes.push({ ticketId: other.id, filesScope: other.filesScope })
+    }
+    return scopes
+  }
+
+  /**
+   * V3-20: run the deterministic repo/worktree preflight for one dispatch,
+   * computed fresh at dispatch time (never cached). Returns null when
+   * preflight is not enabled (no configured repos — legacy dispatch path);
+   * otherwise always a report, and a safe=false report carries the concrete
+   * violations the caller must fail the dispatch with (fail closed).
+   * @param ticket - the card being dispatched.
+   * @param agent - the master session agent (its cwd names the workspace repo).
+   * @returns the preflight outcome, or null when preflight is disabled.
+   */
+  private async preflightDispatch(ticket: TicketView, agent: Agent): Promise<{ report: PreflightReport } | null> {
+    if (Object.keys(this.resolved.preflightRepos).length === 0) return null
+    const cwd = agent.session.header.cwd
+    const mapping = this.resolvePreflightRepo(cwd)
+    const filesScope = ticket.filesScope
+    const inFlightScopes = await this.inFlightScopes(ticket)
+    if (mapping === null) {
+      const now = Date.now()
+      return {
+        report: {
+          safe: false,
+          violations: ['no repo mapping for ticket "' + ticket.id + '": the master cwd "'
+            + (typeof cwd === 'string' && cwd !== '' ? cwd : '(none)')
+            + '" is not inside any configured preflight repo root (fail closed)'],
+          repoRoot: typeof cwd === 'string' && cwd !== '' ? cwd : '(unknown)',
+          canonicalBase: { branch: '', commit: '' },
+          assignedWorktree: '',
+          actualBranch: '',
+          head: '',
+          dirtyFiles: [],
+          baseCandidateRelationship: 'unknown',
+          filesScope,
+          conflicts: [],
+          checkedAt: now,
+        },
+      }
+    }
+    return { report: runPreflight(mapping.repoRoot, mapping.config, filesScope, inFlightScopes) }
+  }
+
+  /**
+   * V3-20: land one preflight-blocked dispatch: the card is marked blocked
+   * with the concrete violations as its failure reason (never a worker
+   * spawn), and the master is notified.
+   * @param running - the card in its In progress/running post-assign state.
+   * @param report - the failing preflight report.
+   * @returns the blocked card.
+   */
+  private async blockPreflight(running: TicketView, report: PreflightReport): Promise<TicketView> {
+    const reason = 'preflight blocked: ' + report.violations.join(' | ')
+    /* v8 ignore next -- defensive: the fail-mutate only throws when the card vanished
+       mid-block (a concurrent removal race the harnessed lanes never interleave); the
+       pre-existing spawn-failure paths carry the same guard. */
+    const blocked = await this.mutate(running.id, 'fail', ticket => ({
+      ...ticket,
+      status: 'blocked',
+      failure: { reason, at: Date.now() },
+      updatedAt: Date.now(),
+    })).catch(() => running)
+    await this.notifyMaster(blocked.boardId,
+      'Taskboard notice: dispatch of ticket ' + blocked.id + ' ("' + blocked.title + '") blocked by repo preflight (no worker spawned): ' + report.violations.join(' | '),
+      NOTICE_KIND.preflightBlocked, blocked.id)
+    return blocked
+  }
+
+  /**
    * Master assigns a Backlog or Not started ticket to a freshly spawned
    * worker: the card moves to In progress, status running, and a worker
    * subagent is spawned immediately; on success its id is recorded on the
@@ -2456,7 +2625,15 @@ export class TaskboardService extends TypertRemoteService {
         'assigned to a worker by master ' + agentLabel(agent),
       )
     })
-    const spawn = await this.spawnWorker(agent, running, workerLabel)
+    // V3-20: deterministic repo/worktree preflight before any worker spawn.
+    // A violated repo fails the dispatch closed — the card is blocked with
+    // the concrete violations and no worker is ever spawned.
+    const preflight = await this.preflightDispatch(running, agent)
+    if (preflight !== null && !preflight.report.safe) {
+      const blocked = await this.blockPreflight(running, preflight.report)
+      return { ticket: blocked, worker: 'failed', workerAgentId: null }
+    }
+    const spawn = await this.spawnWorker(agent, running, workerLabel, preflight === null ? undefined : preflight.report)
     if (!spawn.ok) {
       const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
         ? 'worker spawn failed: ' + spawn.errorMessage
@@ -2639,7 +2816,14 @@ export class TaskboardService extends TypertRemoteService {
           : 're-dispatched by master',
       )
     })
-    const spawn = await this.spawnWorker(agent, running, workerLabel)
+    // V3-20: deterministic repo/worktree preflight before any re-dispatch
+    // spawn; a violated repo fails the retry closed (card blocked, no worker).
+    const preflight = await this.preflightDispatch(running, agent)
+    if (preflight !== null && !preflight.report.safe) {
+      const blocked = await this.blockPreflight(running, preflight.report)
+      return { ticket: blocked, worker: 'failed', workerAgentId: null }
+    }
+    const spawn = await this.spawnWorker(agent, running, workerLabel, preflight === null ? undefined : preflight.report)
     if (!spawn.ok) {
       const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
         ? 'worker spawn failed: ' + spawn.errorMessage
@@ -3856,7 +4040,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_assign',
-      description: 'Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
+      description: 'Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The Backlog or Not started ticket to dispatch.' },
         workerLabel: {
@@ -3875,11 +4059,13 @@ export class TaskboardService extends TypertRemoteService {
             workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
           },
         },
-        render: (_args, value: { ticketId: string; worker: string; workerAgentId: string | null }) => [{
+        render: (_args, value: { ticketId: string; status: string; worker: string; workerAgentId: string | null }) => [{
           type: 'text' as const,
           text: value.worker === 'spawned'
             ? 'ticket ' + value.ticketId + ' dispatched; worker ' + String(value.workerAgentId) + ' started'
-            : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker,
+            : value.status === 'blocked'
+              ? 'ticket ' + value.ticketId + ' blocked before a worker was spawned (see the card failure for the reason)'
+              : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker,
         }],
       },
       execute: async (args: { ticketId: string; workerLabel?: string }, exec) => {
