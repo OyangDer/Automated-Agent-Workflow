@@ -105,7 +105,7 @@ const OUT = 'docs/tool-catalog.md'
 function registerCatalogSubagentProvider(ctx: Context, name: string): void {
   const provider: SubagentProvider = {
     name,
-    capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
+    capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true, effort: true },
     inheritsParentContext: false,
     start: () => Promise.reject(new Error('tool-catalog provider cannot start a child')),
     // Declared so consumers configured for continuable background mode mount.
@@ -375,7 +375,7 @@ const TOOL_PACKAGES: ToolPackage[] = [
       await ctx.plugin(TaskboardService)
     },
     note:
-      'The nineteen taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.',
+      'The twenty-one taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.',
   },
   {
     pkg: '@deepseek-ai/dsh-schedule',

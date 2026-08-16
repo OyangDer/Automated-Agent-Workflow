@@ -484,6 +484,10 @@ export class SubagentRuntime extends Service {
       { when: request.maxDepth !== undefined, cap: 'depthLimit' },
       { when: request.toolFilter !== undefined, cap: 'toolFilter' },
       { when: request.persona !== undefined, cap: 'persona' },
+      // Effort is advisory for coordinators that downgrade; a caller that
+      // still demands an explicit effort on an unsupporting provider fails
+      // loud instead of silently dropping the knob.
+      { when: request.agentOptions?.reasoningEffort !== undefined, cap: 'effort' },
     ]
     for (const { when, cap } of needs) {
       if (when && !provider.capabilities[cap]) {

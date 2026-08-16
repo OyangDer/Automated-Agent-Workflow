@@ -88,6 +88,18 @@ export interface SubagentCapabilities {
   readonly depthLimit: boolean
   readonly toolFilter: boolean
   readonly persona: boolean
+  /**
+   * Whether the provider honors agentOptions.reasoningEffort by passing it
+   * through to the child agent's creation (true for in-process providers,
+   * which create the child in the same runtime; false for out-of-process
+   * backends, whose child runs under its own model configuration). Unlike
+   * the flags above this is ADVISORY, not seam-enforced per request option:
+   * coordinators read it to omit the effort on unsupporting providers
+   * (capability downgrade) instead of letting the request fail, while a
+   * caller that still demands an effort on an unsupporting provider is
+   * rejected by the service's own assertion.
+   */
+  readonly effort: boolean
 }
 
 /**

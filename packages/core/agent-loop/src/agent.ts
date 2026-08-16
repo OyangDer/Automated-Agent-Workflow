@@ -416,14 +416,17 @@ export class ReactLoopAgent implements Agent {
 
     // A loop instance starts from its declared route, restoring only an explicit
     // effort owned by that exact model. Later steps re-resolve marked defaults.
+    // An effort carried on AgentOptions (e.g. a coordinator-configured worker)
+    // seeds the route when no persisted header effort applies to this route.
     const persistedHeader = session.requestHeader()
     const persistedConfig = persistedHeader?.config
     const route = { provider: this.options.provider ?? '', model: this.options.model ?? '' }
+    const optionEffort = this.options.reasoningEffort
     const reasoningEffort = persistedConfig?.provider === route.provider
       && persistedConfig.model === route.model
       && persistedHeader?.adapterDefaults?.reasoningEffort !== true
       ? persistedConfig.reasoningEffort
-      : undefined
+      : optionEffort
     const maxTokens = this.options.maxTokens
     const seedConfig = deepFreeze(structuredClone(
       this.requestHeaderLogged
