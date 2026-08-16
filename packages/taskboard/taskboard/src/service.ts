@@ -40,9 +40,10 @@ import type {
 } from './types.ts'
 import {
   agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildHandoverSnapshot, buildReviewPrompt,
-  buildReviewReportPrompt, buildWorkerPrompt, MASTER_SECTION, masterModelNote, reviewerLabel,
-  TaskboardError, WORKFLOW_SECTION,
+  buildReviewReportPrompt, buildWorkerPrompt, formatHandoverSnapshotText, formatTicketRowLine, MASTER_SECTION,
+  masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
+import type { HandoverCardRow } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
 const ticketSchema = zod.object({
@@ -3324,7 +3325,9 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: { tickets: TicketRow[] }) => [{
           type: 'text' as const,
-          text: String(value.tickets.length) + ' ticket(s)',
+          text: value.tickets.length === 0
+            ? '0 tickets'
+            : String(value.tickets.length) + ' ticket(s):\n' + value.tickets.map(ticket => formatTicketRowLine(ticket)).join('\n'),
         }],
       },
       execute: async (args: { column?: string; mine?: boolean }, exec) => {
@@ -3414,7 +3417,31 @@ export class TaskboardService extends TypertRemoteService {
             },
           },
         },
-        render: (_args, value: { id: string; title: string }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ': ' + value.title }],
+        render: (_args, value: {
+          id: string
+          title: string
+          column: ColumnId
+          status: TicketWorkerStatus
+          type: TicketType
+          priority: Priority
+          workerAgentId: string | null
+          reviewer: { agentId: string } | null
+          dependsOn: string[]
+          lastReviewOutcome?: 'approved' | 'rejected' | null | undefined
+          failure?: { reason: string } | null | undefined
+          description: string
+          devNotes: string
+          filesScope: string
+          reviewOutcome: { verdict: string; summary: string } | null
+        }) => [{
+          type: 'text' as const,
+          text: formatTicketRowLine(value) + '\n'
+            + (value.description === '' ? '' : 'description: ' + value.description + '\n')
+            + (value.devNotes === '' ? '' : 'devNotes: ' + value.devNotes + '\n')
+            + (value.filesScope === '' ? '' : 'filesScope: ' + value.filesScope + '\n')
+            + (value.dependsOn.length === 0 ? '' : 'dependsOn: ' + value.dependsOn.join(', ') + '\n')
+            + (value.reviewOutcome === null ? '' : 'reviewOutcome: ' + value.reviewOutcome.verdict + ' — ' + value.reviewOutcome.summary + '\n'),
+        }],
       },
       execute: async (args: { ticketId: string }) => {
         const ticket = await this.viewTicket(args.ticketId)
@@ -3688,16 +3715,25 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: {
           boardId: string
+          name: string
           masterAgentId: string | null
           backlogSummary: string
-          cards: unknown[]
+          pendingAdjudications: string[]
+          cards: HandoverCardRow[]
+          handoverNotes: string
           notices: BoardNotice[]
         }) => [{
           type: 'text' as const,
-          text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId)
-            + '; ' + value.backlogSummary
-            + '; ' + String(value.cards.length) + ' active card(s) in the claim snapshot'
-            + (value.notices.length === 0 ? '' : '; ' + String(value.notices.length) + ' notice(s) available in the claim result'),
+          text: 'master seat of board ' + value.boardId + ' claimed by ' + String(value.masterAgentId) + '\n'
+            + formatHandoverSnapshotText({
+              boardId: value.boardId,
+              name: value.name,
+              masterAgentId: value.masterAgentId,
+              handoverNotes: value.handoverNotes,
+              cards: value.cards,
+              backlogSummary: value.backlogSummary,
+              pendingAdjudications: value.pendingAdjudications,
+            }, value.notices),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
@@ -3750,7 +3786,10 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: { boardId: string; notices: BoardNotice[] }) => [{
           type: 'text' as const,
-          text: String(value.notices.length) + ' notice(s) on board ' + value.boardId,
+          text: value.notices.length === 0
+            ? '0 notices on board ' + value.boardId
+            : String(value.notices.length) + ' notice(s) on board ' + value.boardId + ':\n'
+              + value.notices.map(notice => '- [' + notice.kind + '] ' + notice.ticketId + ': ' + notice.text).join('\n'),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {

@@ -444,6 +444,85 @@ export function buildHandoverSnapshot(board: BoardView, tickets: TicketView[]): 
   }
 }
 
+/**
+ * One-line model-visible rendering of a ticket row: the concrete facts
+ * (ticketId, title, column, status, worker/reviewer identity, dependencies,
+ * review state, failure) a successor master needs to act without guessing.
+ * The tool layer renders this text into the model-visible result.
+ * @param ticket - the row (TicketRow or HandoverCardRow) to render.
+ * @returns the compact line.
+ */
+export function formatTicketRowLine(ticket: {
+  id: string
+  title: string
+  column: string
+  status: string
+  type?: string | undefined
+  priority?: string | undefined
+  workerAgentId?: string | null | undefined
+  reviewer?: { agentId: string } | null | undefined
+  dependsOn?: string[] | undefined
+  lastReviewOutcome?: 'approved' | 'rejected' | null | undefined
+  failure?: { reason: string } | null | undefined
+}): string {
+  const bits = [
+    ticket.id,
+    JSON.stringify(ticket.title),
+    'column=' + ticket.column,
+    'status=' + ticket.status,
+  ]
+  if (ticket.type !== undefined) bits.push('type=' + ticket.type)
+  if (ticket.priority !== undefined) bits.push('priority=' + ticket.priority)
+  if (ticket.workerAgentId) bits.push('worker=' + ticket.workerAgentId)
+  if (ticket.reviewer) bits.push('reviewer=' + ticket.reviewer.agentId)
+  if (ticket.dependsOn !== undefined && ticket.dependsOn.length > 0) bits.push('dependsOn=' + ticket.dependsOn.join(','))
+  if (ticket.lastReviewOutcome) bits.push('lastReview=' + ticket.lastReviewOutcome)
+  if (ticket.failure) bits.push('failure=' + ticket.failure.reason)
+  return '- ' + bits.join(' ')
+}
+
+/**
+ * Render the claim-time handover snapshot as the model-visible text: the
+ * per-column summary, every active card's concrete line, the pending
+ * adjudications, the stored handover notes body, and every durable notice.
+ * This is the successor's single entry point — it must carry the facts, not
+ * just counts.
+ * @param snapshot - the structured snapshot from buildHandoverSnapshot.
+ * @param notices - the board's durable notices (newest last).
+ * @returns the full model-visible snapshot text.
+ */
+export function formatHandoverSnapshotText(
+  snapshot: HandoverSnapshot,
+  notices: { kind: string; text: string; at: number; ticketId: string }[],
+): string {
+  const lines: string[] = [
+    'Handover snapshot for board ' + JSON.stringify(snapshot.boardId) + ' ("' + snapshot.name + '")',
+    snapshot.backlogSummary,
+  ]
+  if (snapshot.cards.length === 0) {
+    lines.push('Active cards: (none)')
+  } else {
+    lines.push('Active cards:')
+    for (const card of snapshot.cards) lines.push(formatTicketRowLine({ ...card, id: card.ticketId }))
+  }
+  lines.push('Pending adjudications: ' + (snapshot.pendingAdjudications.length === 0
+    ? '(none)'
+    : snapshot.pendingAdjudications.join(', ')))
+  if (snapshot.handoverNotes !== '') {
+    lines.push('Handover notes:')
+    lines.push(snapshot.handoverNotes)
+  }
+  if (notices.length === 0) {
+    lines.push('Notices: (none)')
+  } else {
+    lines.push('Notices:')
+    for (const notice of notices) {
+      lines.push('- [' + notice.kind + '] ' + notice.ticketId + ': ' + notice.text)
+    }
+  }
+  return lines.join('\n')
+}
+
 /** The model-facing workflow section injected into every session's system prompt. */
 export const WORKFLOW_SECTION = [
   '# Taskboard workflow',

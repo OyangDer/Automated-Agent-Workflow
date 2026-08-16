@@ -2495,6 +2495,40 @@ it('returns the structured handover snapshot from the claim tool, even without a
   expect(value.backlogSummary).toContain('In progress 1')
   expect(value.backlogSummary).toContain('In testing 1')
   expect(value.pendingAdjudications).toEqual([underReview.id])
+
+  // The MODEL-VISIBLE result (the rendered content the agent actually reads)
+  // must carry the concrete facts, not just counts: this is the real P0-0
+  // acceptance line that the previous review missed.
+  const visible = (claim as { content: { type: string; text: string }[] }).content
+  const claimText = visible.map(block => block.text).join('\n')
+  expect(claimText).toContain(planned.id)
+  expect(claimText).toContain('"planned card"')
+  expect(claimText).toContain(inFlight.id)
+  expect(claimText).toContain('"in flight"')
+  expect(claimText).toContain('column=in_progress')
+  expect(claimText).toContain('status=running')
+  expect(claimText).toContain('worker=worker-child-agent')
+  expect(claimText).toContain(underReview.id)
+  expect(claimText).toContain('reviewer=reviewer-child-agent')
+  expect(claimText).toContain('Pending adjudications: ' + underReview.id)
+  expect(claimText).toContain('Backlog 1 · Not started 0 · In progress 1 · In testing 1')
+
+  // taskboard_list's model-visible result carries the concrete rows too.
+  const list = await ctx.tools.execute({
+    callId: CallId('tool-list-snapshot'),
+    name: 'taskboard_list',
+    arguments: {},
+    agent: devB,
+    signal: new AbortController().signal,
+  })
+  expect(list.isError).toBe(false)
+  const listVisible = (list as { content: { type: string; text: string }[] }).content
+  const listText = listVisible.map(block => block.text).join('\n')
+  expect(listText).toContain(inFlight.id)
+  expect(listText).toContain('"in flight"')
+  expect(listText).toContain('column=in_progress')
+  expect(listText).toContain('status=running')
+  expect(listText).toContain(underReview.id)
 })
 
 it('rejects handover on an unknown board', async () => {
