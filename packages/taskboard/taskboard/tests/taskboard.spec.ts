@@ -27,8 +27,14 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
 import {
-  branchNameFor, buildHandoverNotes, buildWorkerPrompt, MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
+  branchNameFor, buildHandoverNotes, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
+  MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
 } from '../src/domain.ts'
+import {
+  compileReviewerCapsule, compileWorkerCapsule, parseSections, parseWorkerClaims, reviewerFactsFromPreflight,
+} from '../src/capsule.ts'
+import type { ReviewerGitFacts } from '../src/capsule.ts'
+import type { PreflightReport } from '../src/types.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
 function stubAgentForSession(session: Session): Agent {
@@ -2105,8 +2111,9 @@ describe('TaskboardService workflow', () => {
     // The master section names claim among the master-only scheduling tools.
     expect(MASTER_SECTION).toContain('Claiming a Not started ticket (taskboard_claim) is your scheduling action')
     expect(MASTER_SECTION).toContain('only the current master may claim')
-    expect(MASTER_SECTION).toContain('taskboard_assign (dispatch)')
-    expect(MASTER_SECTION).toContain('taskboard_reassign (re-dispatch)')
+    // V3-19 dedup: the worker/reviewer claim rule lives once, in the workflow
+    // section — the master section no longer repeats the same sentence.
+    expect(MASTER_SECTION).not.toContain('Workers and reviewers never claim')
   })
 
   it('writes and reads the declared filesScope on cards', async () => {
@@ -2215,6 +2222,239 @@ describe('TaskboardService workflow', () => {
     const plainPrompt = (plainCall[1].prompt as { type: string; text: string }[])[0]!.text
     expect(plainPrompt).toContain('Declared file scope: (not declared)')
     expect(plainPrompt).not.toContain('stays inside the declared file scope')
+  })
+
+  // ── V3-19: role context capsules (worker/reviewer) ────────────────────────
+
+  describe('role context capsules (V3-19)', () => {
+    /** A minimal TicketView fixture for the pure prompt builders. */
+    function capsuleTicket(partial: Partial<TicketView> = {}): TicketView {
+      return {
+        id: 'ticket-capsule', title: 'capsule card', description: '', column: 'not_started',
+        priority: 'normal', boardId: 'default', type: 'feature', status: 'ready',
+        failure: null, autoRetries: 0, createdAt: 1, updatedAt: 1, position: 0,
+        assignee: null, reviewer: null, reviewAttempts: 0, lastReview: null, reviewOutcome: null,
+        devNotes: '', targetBranch: '', filesScope: '', dependsOn: [], history: [],
+        ...partial,
+      }
+    }
+
+    /** A dispatch-time preflight report fixture ([B] V3-20 shape). */
+    const preflightReport = (over: Partial<PreflightReport> = {}): PreflightReport => ({
+      safe: true, violations: [], repoRoot: 'C:/repo',
+      canonicalBase: { branch: 'main', commit: 'base-commit-1' },
+      assignedWorktree: 'C:/repo', actualBranch: 'main', head: 'candidate-head-1',
+      dirtyFiles: [], baseCandidateRelationship: 'equal', filesScope: 'src/a.ts',
+      conflicts: [], checkedAt: 1,
+      ...over,
+    })
+
+    const countOccurrences = (text: string, needle: string): number =>
+      text.split(needle).length - 1
+
+    const MARKER_DESCRIPTION = [
+      '【目标】build the capsule compiler',
+      '',
+      '【验收】the prompt carries the acceptance verbatim; nothing duplicated.',
+      '',
+      '【硬约束】no LLM summary may replace the original text.',
+      '',
+      '【纪律】do not merge or push; recompile fresh on retry.',
+    ].join('\n')
+
+    it('worker capsule: acceptance verbatim, description content exactly once, no permission paragraphs', () => {
+      const ticket = capsuleTicket({
+        description: MARKER_DESCRIPTION,
+        filesScope: 'src/capsule.ts, tests/capsule.spec.ts',
+      })
+      const prompt = buildWorkerPrompt(ticket, 'C:/work', 'master-session-1', preflightReport())
+      // The capsule carries exactly the field set: goal, acceptance, git
+      // facts, declared scope, constraints.
+      expect(prompt).toContain('# Worker capsule')
+      expect(prompt).toContain('【目标】build the capsule compiler')
+      expect(prompt).toContain('【验收】the prompt carries the acceptance verbatim; nothing duplicated.')
+      expect(prompt).toContain('【硬约束】no LLM summary may replace the original text.')
+      expect(prompt).toContain('【纪律】do not merge or push; recompile fresh on retry.')
+      // Verbatim acceptance: every section appears exactly once (no duplication).
+      expect(countOccurrences(prompt, '【验收】the prompt carries the acceptance verbatim; nothing duplicated.')).toBe(1)
+      expect(countOccurrences(prompt, '【目标】build the capsule compiler')).toBe(1)
+      // The raw description is decomposed into the capsule fields, never
+      // inlined whole on top of them.
+      expect(countOccurrences(prompt, MARKER_DESCRIPTION)).toBe(0)
+      // Git facts come from the preflight report, not an appendix.
+      expect(prompt).toContain('canonical base: main @ base-commit-1')
+      expect(prompt).toContain('assigned worktree: C:/repo')
+      expect(prompt).toContain('actual branch: main')
+      expect(prompt).toContain('HEAD: candidate-head-1')
+      expect(prompt).toContain('dirty files: (none)')
+      expect(prompt).toContain('Declared file scope: src/capsule.ts, tests/capsule.spec.ts')
+      // The old per-card permission paragraph is gone (runtime tool filter
+      // and the workflow section own the role permissions).
+      expect(prompt).not.toContain('You may not claim')
+      expect(prompt).not.toContain('Do not call any other taskboard tool')
+    })
+
+    it('worker capsule: a marker-less description lands once in the additional details', () => {
+      const ticket = capsuleTicket({ description: 'plain goal text with no markers' })
+      const prompt = buildWorkerPrompt(ticket, 'C:/work', 'master-session-1')
+      expect(prompt).toContain('(no 【目标】 section in the card description)')
+      expect(prompt).toContain('(no 【验收】 section in the card description)')
+      expect(prompt).toContain('Additional card details (verbatim):')
+      expect(countOccurrences(prompt, 'plain goal text with no markers')).toBe(1)
+      // Without preflight facts the capsule names the working directory and
+      // tells the worker to verify with git directly.
+      expect(prompt).toContain('preflight not computed at dispatch')
+      expect(prompt).toContain('git branch --show-current')
+      expect(prompt).toContain('working directory: C:/work')
+    })
+
+    it('worker capsule: retry recompiles a fresh capsule — no stale facts, no appended notes', () => {
+      const first = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/a.ts' })
+      const p1 = buildWorkerPrompt(first, 'C:/work', 'master-session-1', preflightReport({ head: 'old-head', dirtyFiles: [' M stale.ts'] }))
+      expect(p1).toContain('HEAD: old-head')
+      expect(p1).toContain('dirty files:  M stale.ts')
+      // Retry: the same card re-dispatched — description annotated, facts fresh.
+      const retry = capsuleTicket({
+        description: MARKER_DESCRIPTION + '\n\n[auto-redispatch #2] 续做勿回滚：previous worker lost; continue from the preserved working tree.',
+        filesScope: 'src/a.ts',
+      })
+      const p2 = buildWorkerPrompt(retry, 'C:/work', 'master-session-1', preflightReport({ head: 'fresh-head', dirtyFiles: [] }))
+      // Fresh facts only: the new HEAD is in, the old one is gone.
+      expect(p2).toContain('HEAD: fresh-head')
+      expect(p2).not.toContain('HEAD: old-head')
+      expect(p2).not.toContain('stale.ts')
+      // The previous prompt's appendix pattern is never carried over.
+      expect(p2).not.toContain('Deterministic repo preflight')
+      // The current card state (the recovery annotation) is present once.
+      expect(countOccurrences(p2, '[auto-redispatch #2]')).toBe(1)
+    })
+
+    it('worker capsule: deterministic — same inputs yield identical prompts', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/a.ts' })
+      const report = preflightReport()
+      expect(buildWorkerPrompt(ticket, 'C:/work', 'master-session-1', report))
+        .toBe(buildWorkerPrompt(ticket, 'C:/work', 'master-session-1', report))
+    })
+
+    it('reviewer capsule: base/candidate/touched files, compact claims and the diff-first path', () => {
+      const ticket = capsuleTicket({
+        description: MARKER_DESCRIPTION,
+        filesScope: 'src/capsule.ts',
+        devNotes: [
+          'Root cause: duplicate prompt sections',
+          'Files changed: src/capsule.ts, src/domain.ts',
+          'Tests run: taskboard.spec.ts',
+          'Known anomaly: none',
+        ].join('\n'),
+      })
+      const facts: ReviewerGitFacts = {
+        available: true, repoRoot: 'C:/repo', baseCommit: 'base-commit-1',
+        candidateCommit: 'candidate-head-1', touchedFiles: ['src/capsule.ts', 'src/domain.ts'],
+      }
+      const prompt = buildReviewPrompt(ticket, facts)
+      expect(prompt).toContain('# Reviewer capsule')
+      expect(prompt).toContain('【验收】the prompt carries the acceptance verbatim; nothing duplicated.')
+      expect(prompt).toContain('Base commit: base-commit-1')
+      expect(prompt).toContain('Candidate commit: candidate-head-1')
+      expect(prompt).toContain('Touched files / diff:')
+      expect(prompt).toContain('  - src/capsule.ts')
+      expect(prompt).toContain('  - src/domain.ts')
+      expect(prompt).toContain('Declared file scope: src/capsule.ts')
+      // Compact claims structured from devNotes.
+      expect(prompt).toContain("Worker's claims")
+      expect(prompt).toContain('Root cause: duplicate prompt sections')
+      expect(prompt).toContain('Files changed: src/capsule.ts, src/domain.ts')
+      expect(prompt).toContain('Tests run: taskboard.spec.ts')
+      expect(prompt).toContain('Known anomaly: none')
+      // The independent diff-first verification path, with scope and claims checks.
+      expect(prompt).toContain('Independent verification (diff-first, not diff-only)')
+      expect(prompt).toContain('Acceptance → diff')
+      expect(prompt).toContain('stays inside the declared file scope')
+      expect(prompt).toContain('a claim is never a fact')
+    })
+
+    it('reviewer capsule: unlabeled devNotes become one compact claim; no exploration dump', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, devNotes: 'implemented the compiler; ran tests' })
+      const prompt = buildReviewReportPrompt(ticket)
+      expect(prompt).toContain('Root cause: (not claimed)')
+      expect(prompt).toContain('devNotes: implemented the compiler; ran tests')
+      expect(prompt).toContain('verdict: "approve"')
+      expect(prompt).not.toContain('Ticket content:')
+    })
+
+    it('reviewer capsule without git facts instructs computing base/candidate/diff', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/capsule.ts' })
+      const prompt = buildReviewPrompt(ticket)
+      expect(prompt).toContain('Base commit: to be determined by the reviewer')
+      expect(prompt).toContain('Candidate commit: to be determined by the reviewer')
+      expect(prompt).toContain('(to be determined — compute the diff between the base and candidate commits and list the files)')
+    })
+
+    it('reviewer capsule: the worker root cause is a claim, never a fact', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, devNotes: 'Root cause: fixed the bug' })
+      const prompt = buildReviewPrompt(ticket)
+      expect(prompt).toContain('CLAIMS to verify independently, never facts')
+      expect(prompt).toContain('Root cause: fixed the bug')
+    })
+
+    it('workflow and master sections keep one copy of the claim rule (V3-19 dedup)', () => {
+      // The worker/reviewer claim rule is taught once, in the workflow section.
+      expect(WORKFLOW_SECTION).toContain('Workers and reviewers never claim')
+      expect(WORKFLOW_SECTION).toContain('taskboard_assign (dispatch)')
+      expect(WORKFLOW_SECTION).toContain('taskboard_reassign (re-dispatch)')
+      // The master section no longer repeats the same sentence.
+      expect(MASTER_SECTION).not.toContain('Workers and reviewers never claim')
+      expect(MASTER_SECTION).toContain('only the current master may claim')
+    })
+
+    it('capsule compilers are pure and expose the schema', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/a.ts' })
+      const report = preflightReport()
+      const capsule = compileWorkerCapsule(ticket, report)
+      expect(capsule.goal).toContain('build the capsule compiler')
+      expect(capsule.acceptance).toContain('acceptance verbatim')
+      expect(capsule.constraints).toContain('no LLM summary may replace')
+      expect(capsule.gitFacts.available).toBe(true)
+      expect(capsule.gitFacts.head).toBe('candidate-head-1')
+      expect(capsule.gitFacts.canonicalBase).toEqual({ branch: 'main', commit: 'base-commit-1' })
+      expect(capsule.gitFacts.dirtyFiles).toEqual([])
+      expect(capsule.additionalDetails).toBe('')
+      // Reviewer side: the preflight facts map onto base/candidate.
+      const reviewFacts = reviewerFactsFromPreflight(report)
+      expect(reviewFacts.baseCommit).toBe('base-commit-1')
+      expect(reviewFacts.candidateCommit).toBe('candidate-head-1')
+      const reviewCapsule = compileReviewerCapsule({ ...ticket, devNotes: 'Root cause: x' }, reviewFacts)
+      expect(reviewCapsule.acceptance).toContain('acceptance verbatim')
+      expect(reviewCapsule.claims.rootCause).toBe('x')
+      expect(reviewCapsule.git.baseCommit).toBe('base-commit-1')
+    })
+
+    it('parseWorkerClaims fills the four claim slots from labeled devNotes', () => {
+      const claims = parseWorkerClaims([
+        'Root cause: mislabeled cache key',
+        'Files changed: src/a.ts, tests/a.spec.ts',
+        'Tests run: vitest run',
+        'Known anomaly: flaky timing test',
+      ].join('\n'))
+      expect(claims.rootCause).toBe('mislabeled cache key')
+      expect(claims.filesChanged).toBe('src/a.ts, tests/a.spec.ts')
+      expect(claims.testsRun).toBe('vitest run')
+      expect(claims.knownAnomaly).toBe('flaky timing test')
+      // Unlabeled devNotes keep the text but claim nothing.
+      const plain = parseWorkerClaims('implemented it')
+      expect(plain.rootCause).toBe('')
+      expect(plain.devNotes).toBe('implemented it')
+    })
+
+    it('parseSections decomposes the description once and keeps the preamble', () => {
+      const sections = parseSections('preamble text\n【目标】goal body\n【验收】accept body\n\n【纪律】discipline body')
+      expect(sections.map(section => section.title)).toEqual(['', '目标', '验收', '纪律'])
+      expect(sections[0]!.marker).toBeNull()
+      expect(sections[0]!.body).toBe('preamble text')
+      expect(sections[1]!.body).toBe('goal body')
+      expect(sections[2]!.body).toBe('accept body')
+      expect(sections[3]!.body).toBe('discipline body')
+    })
   })
 
   // ── V3-5: customizable worker/reviewer model + reasoning effort ──────────

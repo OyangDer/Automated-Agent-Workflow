@@ -7,7 +7,11 @@
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { BoardNotice, BoardView, ColumnId, TicketHistoryEntry, TicketView, TicketWorkerStatus } from './types.ts'
+import type { BoardNotice, BoardView, ColumnId, PreflightReport, TicketHistoryEntry, TicketView, TicketWorkerStatus } from './types.ts'
+import {
+  compileReviewerCapsule, compileWorkerCapsule, renderReviewerCapsule, renderWorkerCapsule,
+} from './capsule.ts'
+import type { ReviewerGitFacts } from './capsule.ts'
 
 /** Stable error codes for rejected taskboard reads and mutations. */
 export type TaskboardErrorCode =
@@ -134,34 +138,23 @@ declare module '@deepseek-ai/dsh-llm' {
 /**
  * The prompt a freshly spawned reviewer runs with. Self-contained: the child
  * has no shared conversation with the developer, so everything it needs —
- * ticket content, the developer's notes, and the exact finishing contract —
- * is inlined here.
+ * the reviewer capsule (acceptance verbatim, base/candidate commits, declared
+ * scope, touched files, the worker's compact claims) and the exact finishing
+ * contract — is inlined here. The capsule is compiled fresh per review from
+ * the current board state; the worker's long exploration process is never
+ * part of it.
  * @param ticket - the ticket under review.
+ * @param facts - the review-time git facts (base/candidate commits and
+ * touched files), when computed; otherwise the reviewer determines them
+ * itself during verification.
  * @returns the child's user prompt text.
  */
-export function buildReviewPrompt(ticket: TicketView): string {
-  const assignee = ticket.assignee === null ? '(unassigned)' : ticket.assignee.label
-  const description = ticket.description.trim() === '' ? '(none)' : ticket.description
-  const devNotes = ticket.devNotes.trim() === '' ? '(none)' : ticket.devNotes
+export function buildReviewPrompt(ticket: TicketView, facts?: ReviewerGitFacts | null): string {
+  const capsule = compileReviewerCapsule(ticket, facts)
   return [
     ['You are the reviewer for taskboard ticket', ticket.id, '("' + ticket.title + '"), currently In testing.'].join(' '),
     '',
-    'Ticket content:',
-    '  Title: ' + ticket.title,
-    '  Priority: ' + ticket.priority,
-    '  Description: ' + description,
-    '  Developer: ' + assignee,
-    '  Review attempt: ' + String(ticket.reviewAttempts + 1),
-    '  Developer notes: ' + devNotes,
-    '  Declared file scope: ' + (ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope),
-    '',
-    'Review the implementation against the description and acceptance criteria:',
-    '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
-    '2. Run the relevant tests and builds where the ticket concerns code.',
-    '3. Check edge cases and error paths named in the description, not just the happy path.',
-    ...(ticket.filesScope.trim() === '' ? [] : [
-      '4. Check the change stays inside the declared file scope: flag any edit outside "' + ticket.filesScope + '".',
-    ]),
+    renderReviewerCapsule(capsule),
     ...(ticket.type === 'merge' ? [
       '',
       'Merge ticket specifics — also verify:',
@@ -187,31 +180,16 @@ export function buildReviewPrompt(ticket: TicketView): string {
  * { verdict, summary, problems }. The master reads that conclusion and acts
  * on it with taskboard_resolve_review.
  * @param ticket - the ticket under review.
+ * @param facts - the review-time git facts, when computed (see
+ * {@link buildReviewPrompt}).
  * @returns the child's user prompt text.
  */
-export function buildReviewReportPrompt(ticket: TicketView): string {
-  const assignee = ticket.assignee === null ? '(unassigned)' : ticket.assignee.label
-  const description = ticket.description.trim() === '' ? '(none)' : ticket.description
-  const devNotes = ticket.devNotes.trim() === '' ? '(none)' : ticket.devNotes
+export function buildReviewReportPrompt(ticket: TicketView, facts?: ReviewerGitFacts | null): string {
+  const capsule = compileReviewerCapsule(ticket, facts)
   return [
     ['You are the reviewer for taskboard ticket', ticket.id, '("' + ticket.title + '"), currently In testing.'].join(' '),
     '',
-    'Ticket content:',
-    '  Title: ' + ticket.title,
-    '  Priority: ' + ticket.priority,
-    '  Description: ' + description,
-    '  Developer: ' + assignee,
-    '  Review attempt: ' + String(ticket.reviewAttempts + 1),
-    '  Developer notes: ' + devNotes,
-    '  Declared file scope: ' + (ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope),
-    '',
-    'Review the implementation against the description and acceptance criteria:',
-    '1. Inspect the workspace changes (git status / diff / log) and read the relevant files.',
-    '2. Run the relevant tests and builds where the ticket concerns code.',
-    '3. Check edge cases and error paths named in the description, not just the happy path.',
-    ...(ticket.filesScope.trim() === '' ? [] : [
-      '4. Check the change stays inside the declared file scope: flag any edit outside "' + ticket.filesScope + '".',
-    ]),
+    renderReviewerCapsule(capsule),
     ...(ticket.type === 'merge' ? [
       '',
       'Merge ticket specifics — also verify:',
@@ -221,7 +199,7 @@ export function buildReviewReportPrompt(ticket: TicketView): string {
       "- The target branch was confirmed by the master (the confirmed branch is recorded in the ticket's targetBranch field or devNotes); flag any mismatch.",
     ] : []),
     '',
-    'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool.',
+    'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool; the master resolves the card from your verdict.',
     'Finish by calling the structured_output tool exactly once with:',
     '  - verdict: "approve" when the work passes, "reject" when it must be reworked,',
     '  - summary: what you inspected and why it passes or fails,',
@@ -231,56 +209,47 @@ export function buildReviewReportPrompt(ticket: TicketView): string {
 
 /**
  * The prompt a freshly spawned worker runs with. Self-contained: the spawned
- * child has no shared conversation with the master, so the ticket content,
- * the working directory, the shared-workspace branch convention, and the
- * exact finishing contract are all inlined.
+ * child has no shared conversation with the master, so the worker capsule
+ * (goal, acceptance verbatim, dispatch-time git facts, declared scope,
+ * constraints), the shared-workspace branch convention, and the exact
+ * finishing contract are all inlined. The capsule is compiled fresh on every
+ * dispatch — retry/recovery recompiles from the current board state and git
+ * facts instead of appending supplementary notes to a previous prompt. Tool
+ * permissions are runtime rules (the spawn tool filter plus the workflow
+ * section), never repeated here per card.
  * @param ticket - the ticket to implement.
  * @param cwd - the master session's working directory, when known.
  * @param sessionId - the master session id; its short form names the worker branch.
+ * @param preflight - the dispatch-time preflight report ([B] V3-20), when
+ * computed; its raw git facts fill the capsule's repository-facts field.
  * @returns the child's user prompt text.
  */
-export function buildWorkerPrompt(ticket: TicketView, cwd?: string, sessionId?: string): string {
-  const description = ticket.description.trim() === '' ? '(none)' : ticket.description
-  const dependsOn = ticket.dependsOn.length === 0
-    ? '(none)'
-    : ticket.dependsOn.map(dependencyId => '  - ' + dependencyId).join('\n')
-  const workspace = cwd === undefined ? '(inherited from the spawning session)' : cwd
+export function buildWorkerPrompt(
+  ticket: TicketView, cwd?: string, sessionId?: string, preflight?: PreflightReport | null,
+): string {
+  const capsule = compileWorkerCapsule(ticket, preflight)
   const branch = sessionId === undefined ? undefined : branchNameFor(sessionId, ticket.id)
-  const filesScope = ticket.filesScope.trim() === '' ? '(not declared)' : ticket.filesScope
   return [
     ['You are the worker assigned to taskboard ticket', ticket.id, '("' + ticket.title + '").'].join(' '),
     '',
-    'Ticket content:',
-    '  Title: ' + ticket.title,
-    '  Type: ' + ticket.type,
-    '  Priority: ' + ticket.priority,
-    '  Board: ' + ticket.boardId,
-    '  Description: ' + description,
-    '  Depends on: ' + dependsOn,
-    '',
-    'Working directory: ' + workspace,
-    '',
+    renderWorkerCapsule(capsule, cwd),
     ...(branch === undefined ? [] : [
+      '',
       'Shared-workspace branch convention (parallel sessions must not clash):',
       '  - Before starting, check the git status and the current branch in the working directory.',
       '  - Work on the session branch "' + branch + '": create it if missing (git switch -c ' + branch + ' from the current base) and keep every change of this ticket on it.',
       '  - Do not merge, push, or rebase: the master aggregates the branches when the work is done.',
       '  - If the working tree is not clean or another branch is checked out, switch to the session branch without touching the other session\'s changes.',
-      '',
     ]),
-    'Declared file scope: ' + filesScope,
-    '  The card declares which files/directories it affects; stay inside that scope and do not edit files outside it (other parallel workers may own them). An undeclared scope means you are responsible for reporting exactly which paths you touched in devNotes.',
     '',
-    'Implement the ticket end to end against its description and acceptance criteria:',
+    'Implement the ticket end to end against the goal, acceptance criteria and constraints in the capsule above:',
     '1. Inspect the workspace (git status / diff / log) and read the relevant files.',
     '2. Make the changes and run the relevant tests and builds where the ticket concerns code.',
-    '3. Verify edge cases and error paths named in the description, not just the happy path.',
+    '3. Verify edge cases and error paths named in the card, not just the happy path.',
     '',
     'When the work is done and verified, finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing what changed, which files were touched, and how it was verified.',
     '',
     'If you cannot complete the work (blocked, missing access, irrecoverable error), finish with EXACTLY ONE call to taskboard_fail with ticketId "' + ticket.id + '" and a concrete reason.',
-    '',
-    'You may not claim, list, view, move, complete, or review cards; the master drives the board. Do not call any other taskboard tool.',
   ].join('\n')
 }
 
@@ -573,7 +542,7 @@ export const MASTER_SECTION = [
   '- Seat self-healing keeps cards moving without you: a lost worker is auto-redispatched (working tree preserved, card description annotated "续做勿回滚") up to the per-card cap, and a stale or ghost reviewer seat is released and re-reviewed. A "worker-redispatched" or "reviewer-released" notice tells you it happened; only when the automatic budget is exhausted does the card land blocked for manual taskboard_reassign.',
   '- Pause a running card with taskboard_pause (master only): the worker run is aborted, the card is marked paused (column unchanged; history records the pauser and reason) and the master is notified. Paused cards are exempt from settlement reclamation and the liveness reconciliation; resume with taskboard_reassign action "retry" (spawns a fresh worker) or return them to Not started with action "backlog".',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
-  '- Claiming a Not started ticket (taskboard_claim) is your scheduling action, not the worker\'s: only the current master may claim. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
+  '- Claiming a Not started ticket (taskboard_claim) is your scheduling action, not the worker\'s: only the current master may claim.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
   '- User-scheduled Not started cards wake you: when the user moves a card into Not started, a "user-scheduled" notice (card id, title, priority, type, dependsOn with all-Done status, filesScope) lands in your inbox and on the board. Adjudicate whether to start it: when every dependency is Done and the In-progress cap allows, dispatch with taskboard_assign — the card moves to In progress and the workflow starts. When the card cannot start, tell the user the refusal reason in the conversation (name the unfinished dependency cards, or the capacity reason) and record the reason in the card\'s history or devNotes so the decision leaves a durable trace.',
   '',
