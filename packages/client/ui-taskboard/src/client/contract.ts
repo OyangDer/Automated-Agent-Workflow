@@ -62,6 +62,15 @@ export interface CreateBoardRequest {
   name: string
   /** Session-private (default) or project-shared. */
   scope: BoardScope
+  /**
+   * TODO(V3-5): board-level worker/reviewer model+effort overrides
+   * (workerModel/workerEffort/reviewerModel/reviewerEffort). The host board
+   * record supports modelConfig and the master tool taskboard_board_config
+   * writes it; the new-board form and a board settings path should offer
+   * model/effort dropdowns (each with a "default" option). Deferred to keep
+   * this UI change small — see the package README "Model and effort
+   * selectors (V3-5, TODO)" section.
+   */
 }
 
 /** The browser actions one TaskboardView surface may take. */

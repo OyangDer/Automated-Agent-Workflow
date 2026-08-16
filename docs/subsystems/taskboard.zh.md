@@ -6,7 +6,7 @@
 
 ## 列与工作流
 
-五列固定为规范顺序：`backlog`、`not_started`、`in_progress`、`in_testing`、`done`。用户在 Backlog 新建工单，把它拖到 Not started 表示"可以开始"；Agent 领取 Not started 的工单（依赖与容量门控）、实现、并交付进入 In testing。看板指派一名全新审核 Agent，其唯一权限是通过进入 Done，或驳回工单并附上具体反馈打回 In progress。
+五列固定为规范顺序：`backlog`、`not_started`、`in_progress`、`in_testing`、`done`。master 与用户一起规划需求（每个达成一致的需求都会落成 Backlog 卡片），并用 `taskboard_assign` 派发本阶段卡片——assign 直接接受 Backlog 或 Not started 卡片，派单前无需搬卡。Not started 是「下一步队列」的排期展示列：master 可以用 `taskboard_move` 把卡片移过去展示接下来要做什么而暂不开工，用户把卡片拖进 Not started 也仍会以 "user-scheduled" 通知唤醒 master。Agent 领取 Not started 的工单（依赖与容量门控）、实现、并交付进入 In testing。看板指派一名全新审核 Agent，其唯一权限是通过进入 Done，或驳回工单并附上具体反馈打回 In progress。
 
 ```ts
 /** The five workflow columns in canonical left-to-right order. */
@@ -74,7 +74,9 @@ interface TaskboardChanged {
 
 ## 服务行为
 
-[`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（领取归属、依赖门控、进行中容量、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授按序领取与不得自审自卡的规则。
+[`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（仅 master 领取归属、依赖门控、进行中容量、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授仅 master 领卡的规则（worker/reviewer 通过 `taskboard_assign` / `taskboard_reassign` 获得卡片）与不得自审自卡的规则。
+
+席位自愈通道（`reconcileLostWorkers` + `reconcileStaleReviewers`，启动时与配置的周期扫描运行）闭合失联席位闭环：worker 会话不在 live agent 注册表立即判失联，已注册但空闲且超过 `lostWorkerTimeoutMs` 无活动判卡死，reviewer 席位超过 `reviewerStaleTimeoutMs` 仍无结论（或会话已消失）则释放。失联 worker 每卡最多自动重派 `workerAutoRetryLimit` 次——卡片描述会附加"续做勿回滚"标注，让新 worker 从保留的工作树继续——预算耗尽后卡片标 blocked 并通知 master。所有恢复动作防重入（每次失联每卡只恢复一次）、与 worker run 结算回调共存去重（二者只有一个生效）、写入卡片历史，且通知故障不会阻断恢复。
 
 ## 席位与交接
 
@@ -100,33 +102,57 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 
 ```ts cordis-catalog
 /**
- * One worker-liveness reconciliation pass: every In progress card whose
- * worker is still marked running and whose worker session id is absent from
- * the live agent registry is marked blocked — durable failure with reason
- * RECONCILE_REASON, one 'fail' history row, and a master notice. Shared by
- * the startup scan and the periodic scanner.
+ * One worker-liveness reconciliation pass: every In progress/running card
+ * whose worker is lost — absent from the live agent registry (restart /
+ * hard death) or registered but idle with no activity past the configured
+ * timeout — is recovered through {@link recoverLostWorker}: auto-redispatch
+ * while the per-card budget lasts, block with a master notice once
+ * exhausted. Shared by the startup scan and the periodic scanner.
  *
  * Liveness authority research (service dependency surface): the agent
  * registry is the exact "is this session's agent alive right now" authority
  * — agents.get(id) returns the live Agent or undefined; presence means
  * live (an idle agent is still alive, only an unregistered session is
  * lost), which is precisely the restart scenario where the in-memory run
- * settlement callbacks are gone. The subagent seam's listChildren /
- * listDescendants are parent-rooted tree listings that throw without a
- * mounted projection registry + session store, and the session store tracks
- * persisted sessions rather than live agent loops — neither is a general
- * flat liveness probe, so the registry is used directly, and a missing
- * registry (never in the host, where 'agents' is an injected dependency)
- * degrades to a silent skip without blocking anything.
+ * settlement callbacks are gone. The session event log supplies the
+ * activity tail for the idle-staleness arm. The subagent seam's
+ * listChildren / listDescendants are parent-rooted tree listings that
+ * throw without a mounted projection registry + session store, and the
+ * session store tracks persisted sessions rather than live agent loops —
+ * neither is a general flat liveness probe, so the registry is used
+ * directly, and a missing registry (never in the host, where 'agents' is
+ * an injected dependency) degrades to a silent skip without blocking
+ * anything.
  *
  * Idempotent by construction and coexistent with the settlement callback:
- * only running cards are considered, and the guarded mutate re-checks
+ * only running cards are considered, and the guarded recovery re-checks
  * column/status/worker identity atomically on the committed record, so a
- * card the settlement callback already blocked (or whose worker came back)
- * is returned untouched — exactly one 'fail' row ever lands per card.
- * @returns how many cards this pass marked blocked.
+ * card the settlement callback already recovered (or whose worker came
+ * back) is returned untouched — exactly one recovery ever lands per card.
+ * @returns how many cards this pass recovered (redispatched or blocked).
  */
 async reconcileLostWorkers(): Promise<number>
+
+/**
+ * One reviewer-staleness reconciliation pass: every In testing card that
+ * still has a review seat but no reviewOutcome is checked against the live
+ * agent registry and the review-start clock:
+ * - a reviewer session absent from the registry is a ghost seat and is
+ *   released immediately (no ghost seats, per the spec);
+ * - a reviewer that is registered but idle — no running tool — with the
+ *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
+ *   the seat is released.
+ * On release the card history gets one 'review-release' row, the master is
+ * notified, and a fresh reviewer is auto-redispatched when a live master
+ * session exists to spawn from; otherwise the seat is left vacant so
+ * taskboard_claim_review can take it.
+ *
+ * Reentry-safe: the guarded mutate only releases a seat that still names
+ * the same reviewer and is still In testing without an outcome, so a card
+ * another path already released (or resolved) is returned untouched.
+ * @returns how many seats this pass released.
+ */
+async reconcileStaleReviewers(): Promise<number>
 
 /**
  * Whole-board snapshot, sorted by column then position, scoped to one
@@ -270,11 +296,14 @@ async handover(boardId: string, agent: Agent): Promise<HandoverResult>
 async transferMaster(boardId: string, fromAgent: Agent, toAgentId: string, handoverNotes: string): Promise<BoardView>
 
 /**
- * Master assigns a Not started ticket to a freshly spawned worker: the
- * card moves to In progress, status running, and a worker subagent is
- * spawned immediately; on success its id is recorded on the card.
+ * Master assigns a Backlog or Not started ticket to a freshly spawned
+ * worker: the card moves to In progress, status running, and a worker
+ * subagent is spawned immediately; on success its id is recorded on the
+ * card. Not started remains the scheduling display for the next queue,
+ * but a card needs no move before dispatch — assign accepts it straight
+ * from Backlog (V3-6 relaxation).
  * @param agent - the master session agent.
- * @param ticketId - the Not started ticket to dispatch.
+ * @param ticketId - the Backlog or Not started ticket to dispatch.
  * @param workerLabel - optional display label for the worker child.
  * @returns the card plus the worker-spawn outcome.
  */
@@ -312,6 +341,23 @@ async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView>
 async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult>
 
 /**
+ * Master pauses one In progress/running card (taskboard_pause): the
+ * in-flight worker run is aborted through the card's recorded handle, the
+ * card status flips to 'paused' (column unchanged, one 'pause' history row
+ * naming the pauser and the reason), and the master is notified. A paused
+ * card is never marked blocked: the settlement callback and the
+ * worker-liveness reconciliation only ever act on status 'running', so the
+ * paused status alone keeps the card out of V3-13/V3-9 reclamation. Resume
+ * with taskboard_reassign action "retry", which clears the paused status
+ * and spawns a fresh worker.
+ * @param agent - the master session agent.
+ * @param ticketId - the In progress card whose worker to pause.
+ * @param reason - why the master pauses the card (recorded in history).
+ * @returns the paused card.
+ */
+async pause(agent: Agent, ticketId: string, reason: string): Promise<TicketView>
+
+/**
  * Master records a new ticket on a board's Backlog (the discussion
  * whiteboard: the plan the master agreed with the user is written down).
  * Unlike the Remote create surface, the master tool also sets the ticket
@@ -347,9 +393,12 @@ async moveAsMaster(agent: Agent, request: MoveTicketRequest): Promise<TicketView
 async planAsMaster( agent: Agent, ticketId: string, dependsOn: string[] | undefined, priority: Priority | undefined, position: number | undefined, ): Promise<TicketView>
 
 /**
- * Agent claims a Not started ticket and becomes its owner (v1 path, kept
- * for boards without a master seat).
- * @param agent - the claiming agent.
+ * Master claims a Not started ticket and schedules it to In progress.
+ * V3-7 closes the free claim: under the dispatch system only the master
+ * of the ticket's board may claim — workers and reviewers receive cards
+ * through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch),
+ * never by claiming. The caller must hold the master seat.
+ * @param agent - the master session agent.
  * @param ticketId - the Not started ticket to claim.
  * @returns the claimed ticket, now In progress.
  */
@@ -449,7 +498,7 @@ async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; no
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:427`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts:532`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -472,5 +521,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:308`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts:338`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

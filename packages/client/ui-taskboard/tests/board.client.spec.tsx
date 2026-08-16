@@ -29,6 +29,7 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     type: 'feature',
     status: 'claimed',
     failure: null,
+    autoRetries: 0,
     createdAt: 1,
     updatedAt: 1,
     position: 0,
@@ -130,6 +131,39 @@ function dragTransfer() {
   return { setData: vi.fn(), getData: vi.fn(() => ''), effectAllowed: '' }
 }
 
+/**
+ * Dispatch a drag event with real pointer coordinates. jsdom's DragEvent
+ * drops clientX/clientY, so the drag is dispatched as a MouseEvent carrying a
+ * dataTransfer property — React's synthetic handlers read both normally.
+ */
+function dragEvent(type: string, x: number, y: number, transfer: ReturnType<typeof dragTransfer>) {
+  // React listens for the lowercase native name ('dragover', 'dragend').
+  const event = new MouseEvent(type.toLowerCase(), { bubbles: true, cancelable: true, clientX: x, clientY: y })
+  Object.defineProperty(event, 'dataTransfer', { value: transfer, configurable: true })
+  return event
+}
+
+/** A DOMRect-shaped stub for getBoundingClientRect mocks. */
+function rect(top: number, bottom: number, left = 0, right = 200): DOMRect {
+  return { top, right, bottom, left, width: right - left, height: bottom - top, x: left, y: top, toJSON: () => ({}) }
+}
+
+/**
+ * Override getBoundingClientRect for specific elements with the given
+ * extents; everything else keeps the real (zero) jsdom geometry. jsdom
+ * reports zero rects for all elements, so drag auto-scroll and insertion-slot
+ * tests install real extents through this seam. Returns a restore function.
+ */
+function mockRects(rects: Map<HTMLElement, { top: number; bottom: number; left?: number; right?: number }>): () => void {
+  const spy = vi.spyOn(Element.prototype, 'getBoundingClientRect')
+  spy.mockImplementation(function (this: Element) {
+    const extent = rects.get(this as HTMLElement)
+    if (extent !== undefined) return rect(extent.top, extent.bottom, extent.left ?? 0, extent.right ?? 200)
+    return rect(0, 0)
+  })
+  return () => { spy.mockRestore() }
+}
+
 describe('TaskboardView', () => {
   it('renders the five canonical columns in order', () => {
     render(createElement(TaskboardView, propsOf({ board: [] })))
@@ -161,6 +195,14 @@ describe('TaskboardView', () => {
     expect(screen.getByText('审核中')).toBeTruthy()
     expect(screen.getByText('已驳回，返修中')).toBeTruthy()
     expect(screen.getByText('审核 1 次')).toBeTruthy()
+  })
+
+  it('shows the paused badge on a master-paused card', () => {
+    const paused = ticket({ id: 'ticket-0004', title: '暂停的卡片', column: 'in_progress', status: 'paused' })
+    render(createElement(TaskboardView, propsOf({ board: [paused] })))
+    expect(screen.getByText('暂停的卡片')).toBeTruthy()
+    const badge = screen.getByText('已暂停')
+    expect(badge).toBeTruthy()
   })
 
   it('opens the detail panel on card click through the viewing store', () => {
@@ -444,6 +486,28 @@ describe('TaskboardView', () => {
     expect(screen.queryByText('租期将尽')).toBeNull()
   })
 
+  it('shows the expired banner copy once the lease has lapsed', () => {
+    // A seat whose lease ended is no longer "about to expire": the banner
+    // switches to the preemptable copy and re-offers the takeover script.
+    const boards = [{
+      ...boardRow('default', 'default'),
+      masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 3600000,
+      masterExpiresAt: Date.now() - 60000,
+    }]
+    render(createElement(TaskboardView, propsOf({
+      board: [], boards, masterAgentId: 'session-abcdef0123456789',
+      masterClaimedAt: Date.now() - 3600000, masterExpiresAt: Date.now() - 60000,
+    })))
+    expect(screen.getByText('已过期，可抢占')).toBeTruthy()
+    const banner = document.querySelector('[data-seat="expired"]')
+    expect(banner).not.toBeNull()
+    expect(banner?.querySelector('[data-expired="true"]')).not.toBeNull()
+    expect(screen.queryByText(/席位由/)).toBeNull()
+    expect(screen.queryByText('租期将尽')).toBeNull()
+    expect(screen.getByText('复制接管指令')).toBeTruthy()
+  })
+
   it('reports a failed clipboard copy', async () => {
     Object.defineProperty(navigator, 'clipboard', {
       value: { writeText: vi.fn(async () => { throw new Error('denied') }) },
@@ -467,4 +531,111 @@ describe('TaskboardView', () => {
       expect(archiveBoard).toHaveBeenCalledWith('board-1')
     })
   })
+
+  it('highlights the hovered column and shows an insertion line in it', () => {
+    const move = vi.fn(async () => ticket())
+    const card = ticket({ id: 'ticket-0100', title: '拖拽卡片' })
+    render(createElement(TaskboardView, propsOf({ board: [card], move })))
+    const cardEl = screen.getByText('拖拽卡片').closest('article')
+    expect(cardEl).not.toBeNull()
+    fireEvent.dragStart(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+    const target = document.querySelector('[data-column="in_progress"]')
+    expect(target).not.toBeNull()
+    fireEvent.dragOver(target as HTMLElement, { dataTransfer: dragTransfer() })
+    // The whole column is armed as a drop target...
+    expect(target?.getAttribute('data-column')).toBe('in_progress')
+    // ...and the insertion line renders inside the hovered column.
+    const indicators = target?.querySelectorAll('[data-testid="drop-indicator"]')
+    expect(indicators?.length).toBeGreaterThan(0)
+    // Other columns stay unarmed.
+    const done = document.querySelector('[data-column="done"]')
+    expect(done?.querySelectorAll('[data-testid="drop-indicator"]').length).toBe(0)
+  })
+
+  it('inserts the dragged card before the card under the pointer', () => {
+    const move = vi.fn(async () => ticket())
+    const source = ticket({ id: 'ticket-0101', title: '源卡' })
+    const first = ticket({ id: 'ticket-0102', title: '目标列第一张', column: 'in_progress' })
+    const second = ticket({ id: 'ticket-0103', title: '目标列第二张', column: 'in_progress' })
+    render(createElement(TaskboardView, propsOf({ board: [source, first, second], move })))
+    const cardEl = screen.getByText('源卡').closest('article')
+    expect(cardEl).not.toBeNull()
+    fireEvent.dragStart(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+    // Give the target column's cards real vertical extents so the pointer
+    // position picks the slot: hovering below the first card's midpoint
+    // inserts before the second card.
+    const target = document.querySelector('[data-column="in_progress"]') as HTMLElement
+    const rects = new Map<HTMLElement, { top: number; bottom: number }>()
+    const spans = [
+      { id: 'ticket-0102', top: 0 },
+      { id: 'ticket-0103', top: 48 },
+    ]
+    for (const span of spans) {
+      const element = target.querySelector('[data-ticket-id="' + span.id + '"]') as HTMLElement | null
+      if (element !== null) rects.set(element, { top: span.top, bottom: span.top + 40 })
+    }
+    const restoreRects = mockRects(rects)
+    try {
+      fireEvent(target, dragEvent('dragOver', 100, 30, dragTransfer()))
+      // Pointer at y=30 sits below card A's midpoint (20) and above card B's
+      // midpoint (68), so the insertion slot is before card B.
+      fireEvent.drop(target, { dataTransfer: dragTransfer() })
+    } finally {
+      restoreRects()
+    }
+    expect(move).toHaveBeenCalledWith({
+      ticketId: 'ticket-0101', column: 'in_progress', beforeTicketId: 'ticket-0103', afterTicketId: null,
+    })
+  })
+
+  it('auto-scrolls the hovered column while dragging near its bottom edge', () => {
+    vi.useFakeTimers()
+    const move = vi.fn(async () => ticket())
+    const card = ticket({ id: 'ticket-0104', title: '自动滚动卡' })
+    render(createElement(TaskboardView, propsOf({ board: [card], move })))
+    const cardEl = screen.getByText('自动滚动卡').closest('article')
+    expect(cardEl).not.toBeNull()
+    fireEvent.dragStart(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+    const target = document.querySelector('[data-column="backlog"]') as HTMLElement
+    // The column is tall and scrollable; the pointer rests near its bottom.
+    Object.defineProperty(target, 'scrollHeight', { value: 800, configurable: true })
+    Object.defineProperty(target, 'clientHeight', { value: 300, configurable: true })
+    const restoreRects = mockRects(new Map([[target, { top: 0, bottom: 300, left: 0, right: 200 }]]))
+    try {
+      fireEvent(target, dragEvent('dragOver', 100, 290, dragTransfer()))
+      vi.advanceTimersByTime(100)
+      expect(target.scrollTop).toBeGreaterThan(0)
+    } finally {
+      restoreRects()
+      fireEvent.dragEnd(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+      vi.useRealTimers()
+    }
+  })
+
+  it('auto-scrolls the board horizontally near its right edge', () => {
+    vi.useFakeTimers()
+    const move = vi.fn(async () => ticket())
+    const card = ticket({ id: 'ticket-0105', title: '横向滚动卡' })
+    render(createElement(TaskboardView, propsOf({ board: [card], move })))
+    const cardEl = screen.getByText('横向滚动卡').closest('article')
+    expect(cardEl).not.toBeNull()
+    fireEvent.dragStart(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+    const board = document.querySelector('[data-column="backlog"]')?.parentElement as HTMLElement
+    Object.defineProperty(board, 'scrollWidth', { value: 1400, configurable: true })
+    Object.defineProperty(board, 'clientWidth', { value: 700, configurable: true })
+    const restoreRects = mockRects(new Map([[board, { top: 0, bottom: 300, left: 0, right: 700 }]]))
+    try {
+      // Hover the board itself near its right edge (a column's dragover
+      // bubbles to the board, but the board handler only claims the pointer
+      // when the board is the direct target).
+      fireEvent(board, dragEvent('dragOver', 690, 100, dragTransfer()))
+      vi.advanceTimersByTime(100)
+      expect(board.scrollLeft).toBeGreaterThan(0)
+    } finally {
+      restoreRects()
+      fireEvent.dragEnd(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
+      vi.useRealTimers()
+    }
+  })
+
 })

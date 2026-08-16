@@ -18,7 +18,6 @@ export interface TicketCardProps {
   onSelect: () => void
   onDragStart: () => void
   onDragEnd: () => void
-  onDragOverCard: () => void
 }
 
 /** Priority → accent token (local custom property consumed by the CSS). */
@@ -43,15 +42,17 @@ function typeAccent(type: TicketView['type']): string {
 
 export function TicketCard({
   ticket, selected, dragging, t,
-  onSelect, onDragStart, onDragEnd, onDragOverCard,
+  onSelect, onDragStart, onDragEnd,
 }: TicketCardProps) {
   const rejected = ticket.lastReview?.outcome === 'rejected'
   const reviewing = ticket.column === 'in_testing'
   const approved = ticket.lastReview?.outcome === 'approved'
+  const paused = ticket.status === 'paused'
   return (
     <article
       className={css.card + (selected ? ' ' + css.cardSelected : '') + (dragging ? ' ' + css.cardDragging : '')}
       draggable
+      data-ticket-id={ticket.id}
       style={{
         '--taskboard-card-accent': PRIORITY_ACCENT[ticket.priority],
         '--taskboard-card-type-accent': typeAccent(ticket.type),
@@ -63,13 +64,6 @@ export function TicketCard({
         onDragStart()
       }}
       onDragEnd={onDragEnd}
-      onDragOver={(event) => {
-        if (event.dataTransfer.types.includes('text/plain')) {
-          event.preventDefault()
-          event.stopPropagation()
-          onDragOverCard()
-        }
-      }}
     >
       <div className={css.cardTop}>
         <span className={css.cardTopLeft}>
@@ -93,6 +87,7 @@ export function TicketCard({
         {reviewing && <span className={css.badge + ' ' + css.badgeReviewing}>{t('state.reviewing')}</span>}
         {rejected && <span className={css.badge + ' ' + css.badgeRejected}>{t('state.rejected')}</span>}
         {approved && <span className={css.badge + ' ' + css.badgeApproved}>{t('state.approved')}</span>}
+        {paused && <span className={css.badge + ' ' + css.badgePaused}>{t('state.paused')}</span>}
         {ticket.reviewAttempts > 0 && (
           <span className={css.metaLabel}>{t('state.attempts').replace('{count}', String(ticket.reviewAttempts))}</span>
         )}

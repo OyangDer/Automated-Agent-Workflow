@@ -118,3 +118,8 @@
   color: var(--dsw-alias-state-success-primary);
   background: var(--dsw-alias-state-success-tertiary);
 }
+
+.badgePaused {
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-module-secondary);
+}

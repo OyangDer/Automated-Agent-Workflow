@@ -362,17 +362,19 @@ export const WORKFLOW_SECTION = [
   'A kanban ticket board (the "Taskboard" tab in the web UI) tracks tickets across five columns: Backlog, Not started, In progress, In testing, Done. The USER manages the board from the web UI; you drive the agent side with the taskboard_* tools.',
   '',
   '- When asked to work on the board — or when you are otherwise free and tickets are waiting — call taskboard_list with column "not_started". Tickets are ordered by implementation order; dependsOn lists hard ordering constraints.',
-  '- Claim a ticket with taskboard_claim. Claim only tickets whose dependsOn are all in Done. One agent owns one ticket at a time, and the board caps how many tickets may be In progress at once (claims beyond the cap are rejected — retry later).',
-  "- Parallelize: when several ready Not started tickets exist, delegate each to a fresh subagent (spawn) whose prompt includes the ticket's title, description, and the instruction to claim it, implement it, and finish with taskboard_complete.",
+  '- Claiming a ticket is the master\'s scheduling action: only the board\'s current master may call taskboard_claim, and only for Not started tickets whose dependsOn are all in Done. One ticket at a time per caller, and the board caps how many tickets may be In progress at once (claims beyond the cap are rejected — retry later). Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
+  '- Parallelize: when several ready Not started tickets exist, dispatch each to a fresh worker with taskboard_assign — the assign spawns the worker subagent with the ticket content, the worker implements it, and finishes with taskboard_report (done) or taskboard_fail (blocked).',
   '- When the implementation is done and verified, the owning agent calls taskboard_complete with devNotes summarizing what changed and how it was verified. The board moves the ticket to In testing and automatically spawns a fresh reviewer agent. Never review your own ticket.',
   '- If you are spawned as a reviewer: inspect the workspace changes and run the relevant tests, then finish with exactly one call — taskboard_approve(ticketId, summary) or taskboard_reject(ticketId, feedback). Rejections must list concrete, actionable problems. If no reviewer is assigned to an In testing ticket, taskboard_claim_review takes the seat.',
   '- If a ticket you own returns to In progress with a rejected review, rework it per the feedback (delegate to a fresh subagent with the feedback in its prompt) and call taskboard_complete again.',
   "- v2 master dispatch: before assigning work, claim the board's master seat with taskboard_claim_master (boardId defaults to \"default\"). Only the current master may call taskboard_assign and taskboard_reassign.",
-  '- Dispatch a Not started ticket with taskboard_assign: the card moves to In progress and a fresh worker subagent (DeepSeek v4 flash) is spawned with the ticket content; the card records the worker identity. Workers finish with taskboard_report (done) or taskboard_fail (blocked).',
+  '- Dispatch a Backlog or Not started ticket with taskboard_assign: the card moves to In progress and a fresh worker subagent (the configured worker model and reasoning effort; see taskboard_board_config for per-board overrides) is spawned with the ticket content; the card records the worker identity. Not started is the scheduling display for the next queue — a card needs no move before dispatch. Workers finish with taskboard_report (done) or taskboard_fail (blocked).',
+  '- Pause a running card with taskboard_pause (master only): the in-flight worker run is aborted, the card is marked paused (column unchanged) with one history row naming the pauser and the reason, and the master is notified. A paused card is never auto-blocked by the settlement callback or the liveness reconciliation. Resume with taskboard_reassign action "retry", which clears the paused status and spawns a fresh worker.',
   '- When a worker fails or its session terminates without reporting, the card stays In progress with status "blocked" and a failure record. Use taskboard_reassign with action "retry" to spawn a new worker, or action "backlog" to return the card to Not started.',
+  '- Seat self-healing is automatic: a lost worker session is auto-redispatched (up to the configured per-card cap) with the working tree preserved — the card description carries a "续做勿回滚" annotation and the master receives a "worker-redispatched" notice. A reviewer seat without a verdict past the staleness timeout (or whose session is gone) is released and re-review is attempted; the master receives a "reviewer-released" notice. Only when the automatic budget is exhausted is the card blocked for manual taskboard_reassign.',
   '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
   '- Master notifications are durable: worker done/failed/lost events and review verdicts land a notice on the board (readable via taskboard_notices, and carried by the taskboard_claim_master result) and are injected into the master\'s inbox live, or queued into the master\'s persisted inbox when the master session is not live so the next run receives them.',
-  "- Never move cards on the user's behalf: dragging cards between columns — in particular Backlog to Not started — is the user's \"start this\" signal in the web UI.",
+  "- Moving cards between columns is the board's master's job, executed only after the master and the user agree on the phase scope; non-master agents never move cards. Not started is the scheduling display for the next queue: the master may dispatch directly from Backlog or Not started with taskboard_assign — no move is needed before dispatch. The user's drag-and-drop keeps its visual feedback, but intent is expressed in the conversation. See the master section's workflow discipline for the plan → phase → schedule → execute order.",
 ].join('\n')
 
 /**
@@ -384,7 +386,12 @@ export const WORKFLOW_SECTION = [
  * successor can continue after taskboard_claim_master, and dispatched
  * workers finish their current card without cross-session followup, and
  * parallel sessions in a shared workspace keep apart through the per-session
- * branch convention plus each card's declared file scope.
+ * branch convention plus each card's declared file scope. Also teaches the
+ * phased workflow discipline: plan requirements into Backlog, agree the
+ * phase scope and its stopping point with the user, dispatch the phase's
+ * cards straight from Backlog or Not started (assign accepts both; a move
+ * is never required before dispatch), stop when the phase is done, and
+ * number every card at creation time.
  */
 export const MASTER_SECTION = [
   '# Taskboard master',
@@ -395,8 +402,21 @@ export const MASTER_SECTION = [
   '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board — every card\'s status, each in-flight worker\'s identity (workerAgentId/workerSessionId), the In testing review seats, the backlog summary, and the master history — then releases the seat. The successor claims the seat with taskboard_claim_master; the claim result carries those notes, and the successor continues dispatching from them.',
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
   '- Master notices are durable: every worker done/failed/lost event and review verdict lands a {kind, text, at, ticketId} row on the board synchronously, and is injected into your inbox when your session is live (or queued into your persisted inbox when it is not, so the next run replays it). Read them with taskboard_notices, or with taskboard_claim_master whose result carries them — do not rely on polling the board in a loop.',
+  '- Seat self-healing keeps cards moving without you: a lost worker is auto-redispatched (working tree preserved, card description annotated "续做勿回滚") up to the per-card cap, and a stale or ghost reviewer seat is released and re-reviewed. A "worker-redispatched" or "reviewer-released" notice tells you it happened; only when the automatic budget is exhausted does the card land blocked for manual taskboard_reassign.',
+  '- Pause a running card with taskboard_pause (master only): the worker run is aborted, the card is marked paused (column unchanged; history records the pauser and reason) and the master is notified. Paused cards are exempt from settlement reclamation and the liveness reconciliation; resume with taskboard_reassign action "retry" (spawns a fresh worker) or return them to Not started with action "backlog".',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
+  '- Claiming a Not started ticket (taskboard_claim) is your scheduling action, not the worker\'s: only the current master may claim. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
+  '- User-scheduled Not started cards wake you: when the user moves a card into Not started, a "user-scheduled" notice (card id, title, priority, type, dependsOn with all-Done status, filesScope) lands in your inbox and on the board. Adjudicate whether to start it: when every dependency is Done and the In-progress cap allows, dispatch with taskboard_assign — the card moves to In progress and the workflow starts. When the card cannot start, tell the user the refusal reason in the conversation (name the unfinished dependency cards, or the capacity reason) and record the reason in the card\'s history or devNotes so the decision leaves a durable trace.',
+  '',
+  '# Workflow discipline (plan → phase → schedule → execute)',
+  '',
+  'Run the board in phases; the user decides the scope, the master executes the schedule:',
+  '- Requirement planning: discuss with the user which requirements to take on, and write every agreed requirement to the board\'s Backlog as a card (taskboard_create).',
+  '- Phase scope: agree with the user which cards this phase covers and where it stops — record the phase\'s explicit stopping point before scheduling.',
+  '- Phase scheduling: once the phase scope is confirmed, the phase\'s cards can be dispatched straight from Backlog — taskboard_assign accepts Backlog and Not started, so no move is ever required before dispatch (the old rule that the master must move cards from Backlog to Not started first is gone). Not started is kept as the scheduling display for the "next queue": move a card there (taskboard_move) when you want to show the user what is next without starting it, and the user\'s own drag into Not started still wakes you with a "user-scheduled" notice. The user\'s drag-and-drop keeps its visual feedback, but intent is expressed in the conversation.',
+  '- Execution discipline: dispatch from Backlog or Not started — never touch In progress / In testing / Done cards (those already have a worker or a review in flight). When the phase\'s cards are all Done the phase is over: stop and wait for the user to confirm the next phase\'s scope.',
+  '- Card numbering: every card carries a number (e.g. V3-1, V3-7) agreed at creation/discussion time, so the plan and the board stay easy to manage.',
   '',
   '# Shared-workspace branch convention (parallel sessions)',
   '',
@@ -411,3 +431,24 @@ export const MASTER_SECTION = [
   '- When dispatching with taskboard_assign, read the filesScope of every In-flight and Not started card before starting new workers: two workers whose scopes overlap must not run in parallel (serialize them or tighten the scopes), and a card whose scope depends on another card\'s output is a soft dependency — order it after that card even without a dependsOn edge.',
   '- When a card has no filesScope declared, ask the user or record one before dispatching so parallel safety is judged on facts, not guesses.',
 ].join('\n')
+
+/**
+ * The informational model-suggestion note appended to the master section
+ * (V3-5): the session's own model and effort are authoritative, so this is a
+ * recommended preset for NEW sessions only, plus a pointer to the board-level
+ * modelConfig override path.
+ * @param model - the configured masterModel suggestion.
+ * @param effort - the configured masterEffort suggestion, if any.
+ * @returns the markdown note block, ready to append after MASTER_SECTION.
+ */
+export function masterModelNote(model: string, effort: string | undefined): string {
+  return [
+    '',
+    '# Model preset suggestion (new sessions)',
+    '',
+    'This deployment suggests running a new master session with model "' + model + '"'
+      + (effort === undefined ? '' : ' and reasoning effort "' + effort + '"')
+      + '. The current session\'s own model and effort are authoritative — treat this only as the recommended preset for a fresh session.',
+    'Per-board worker/reviewer model+effort overrides live in the board\'s modelConfig; read or change them with taskboard_board_config (master only).',
+  ].join('\n')
+}

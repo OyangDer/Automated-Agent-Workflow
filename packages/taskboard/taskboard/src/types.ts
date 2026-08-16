@@ -27,7 +27,7 @@ export const TASKBOARD_TYPES = ['feature', 'bugfix', 'refactor', 'docs', 'test',
 export type TicketType = typeof TASKBOARD_TYPES[number]
 
 /** The worker lifecycle of one card (v2 dispatch protocol). */
-export const TASKBOARD_WORKER_STATUSES = ['ready', 'claimed', 'running', 'blocked'] as const
+export const TASKBOARD_WORKER_STATUSES = ['ready', 'claimed', 'running', 'blocked', 'paused'] as const
 
 /** One worker lifecycle state. */
 export type TicketWorkerStatus = typeof TASKBOARD_WORKER_STATUSES[number]
@@ -91,7 +91,7 @@ export interface TicketView {
   boardId: string
   /** Ticket kind badge. */
   type: TicketType
-  /** Worker lifecycle; blocked marks a failed/terminated worker (card stays In progress). */
+  /** Worker lifecycle; blocked marks a failed/terminated worker, paused a master-paused card (both stay In progress). */
   status: TicketWorkerStatus
   /** The spawned worker agent/session id; absent until taskboard_assign spawns one. */
   workerAgentId?: string | undefined
@@ -99,6 +99,14 @@ export interface TicketView {
   workerSessionId?: string | undefined
   /** Last worker failure; null while the card is healthy. */
   failure: TicketFailure | null
+  /**
+   * Automatic worker redispatch attempts for this card (V3-9 liveness
+   * self-healing): every time the reconcile pass finds the worker lost and
+   * auto-redispatches a replacement, this counter increments. When it reaches
+   * the configured workerAutoRetryLimit the card is blocked instead of being
+   * redispatched again.
+   */
+  autoRetries: number
   createdAt: number
   updatedAt: number
   /** Sort key inside a column; lower sorts first. */
@@ -145,6 +153,23 @@ export interface BoardNotice {
   ticketId: string
 }
 
+/**
+ * Per-board model/effort overrides for spawned workers and reviewers (V3-5).
+ * Every field is optional: an absent field inherits the host config's
+ * workerModel/workerEffort (and the reviewer knobs default to the worker
+ * ones), so a board overrides only what it names.
+ */
+export interface BoardModelConfig {
+  /** Board-level worker model; inherits the host workerModel when absent. */
+  workerModel?: string | undefined
+  /** Board-level worker reasoning effort; inherits the host workerEffort when absent. */
+  workerEffort?: string | undefined
+  /** Board-level reviewer model; inherits the host reviewerModel (default workerModel) when absent. */
+  reviewerModel?: string | undefined
+  /** Board-level reviewer reasoning effort; inherits the host reviewerEffort (default workerEffort) when absent. */
+  reviewerEffort?: string | undefined
+}
+
 /** One durable master-seat transition recorded on the board, for hierarchy-tree rendering. */
 export interface MasterHistoryEntry {
   /** The previous master session id; null when the seat was empty. */
@@ -188,6 +213,11 @@ export interface BoardView {
   masterHistory?: MasterHistoryEntry[]
   /** Durable master notices (the in-board fallback inbox); oldest rows drop past NOTICE_LIMIT. */
   notices?: BoardNotice[]
+  /**
+   * Per-board worker/reviewer model+effort overrides (V3-5); absent on old
+   * records means the host config governs every spawn.
+   */
+  modelConfig?: BoardModelConfig
   /** When the board was archived; null while active. */
   archivedAt: number | null
 }
@@ -204,8 +234,8 @@ export interface BoardSnapshot {
 /** Mutation verbs surfaced by the forwarded `taskboard/changed` event. */
 export type TaskboardOperation =
   | 'create' | 'move' | 'edit' | 'remove'
-  | 'claim' | 'complete' | 'approve' | 'reject' | 'review-claim'
-  | 'assign' | 'report' | 'fail' | 'reassign' | 'resolve-review'
+  | 'claim' | 'complete' | 'approve' | 'reject' | 'review-claim' | 'review-release'
+  | 'assign' | 'report' | 'fail' | 'reassign' | 'resolve-review' | 'pause'
 
 /** The durable-change notification forwarded to the browser. */
 export interface TaskboardChanged {

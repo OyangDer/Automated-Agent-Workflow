@@ -67,6 +67,7 @@ export const zh = {
   'seat.vacant': '席位空缺',
   'seat.holder': '席位由 {holder} 持有',
   'seat.expiring': '租期将尽',
+  'seat.expired': '已过期，可抢占',
   'seat.copyTakeover': '复制接管指令',
   'seat.copied': '已复制',
   'seat.copyFailed': '复制失败',
@@ -76,6 +77,7 @@ export const zh = {
   'state.reviewing': '审核中',
   'state.rejected': '已驳回，返修中',
   'state.approved': '已通过',
+  'state.paused': '已暂停',
   'state.attempts': '审核 {count} 次',
   'error.generic': '操作失败，请重试。',
 } satisfies Record<string, string>
@@ -150,6 +152,7 @@ export const en = {
   'seat.vacant': 'Master seat vacant',
   'seat.holder': 'Master seat held by {holder}',
   'seat.expiring': 'lease expiring soon',
+  'seat.expired': 'expired, preemptable',
   'seat.copyTakeover': 'Copy takeover script',
   'seat.copied': 'Copied',
   'seat.copyFailed': 'Copy failed',
@@ -159,6 +162,7 @@ export const en = {
   'state.reviewing': 'Under review',
   'state.rejected': 'Rejected, reworking',
   'state.approved': 'Approved',
+  'state.paused': 'Paused',
   'state.attempts': '{count} review round(s)',
   'error.generic': 'The operation failed. Try again.',
 } satisfies Record<TaskboardKey, string>

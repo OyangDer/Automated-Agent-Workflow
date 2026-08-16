@@ -4,13 +4,18 @@
  * detail panel and the new-ticket form overlay the board. All verbs come from
  * the injected face, all live data from the bound useBoard hook.
  */
-import { useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import type { DragEvent } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { InjectFace, PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
   ColumnId, MoveTicketRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { BoardScope, BoardView, TaskboardInjected } from './contract.ts'
+import {
+  DRAG_AUTO_SCROLL_DEFAULTS, autoScrollDelta, insertionIndexAt, insertionSlot,
+  type DragAutoScrollOptions,
+} from './dragScroll.ts'
 import { createTaskboardStore } from './stores.ts'
 import { TicketCard } from './TicketCard.tsx'
 import { TicketDetail } from './TicketDetail.tsx'
@@ -33,6 +38,10 @@ export type TaskboardViewProps = ConvViewProps
   & InjectFace<TaskboardInjected>
   & PropsLocale<'taskboard'>
   & PropsStore<ReturnType<typeof createTaskboardStore>>
+  & {
+    /** Edge auto-scroll tuning while a card drag is active (optional). */
+    dragAutoScroll?: Partial<DragAutoScrollOptions>
+  }
 
 /** One drop target: a column plus the card to insert before (null = append). */
 interface DropTarget {
@@ -42,7 +51,7 @@ interface DropTarget {
 
 export function TaskboardView({
   useBoard, useStore, actions, create, move, edit, remove, requestReview,
-  selectBoard, createBoard, archiveBoard, t,
+  selectBoard, createBoard, archiveBoard, t, dragAutoScroll,
 }: TaskboardViewProps) {
   const boardState = useBoard(state => state)
   const board = boardState.snapshot
@@ -56,6 +65,33 @@ export function TaskboardView({
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+
+  /** The scrollable board strip (horizontal auto-scroll while dragging). */
+  const boardRef = useRef<HTMLDivElement | null>(null)
+  /** Last drag pointer position plus the column under it (vertical scroll). */
+  const dragPointRef = useRef<{ clientX: number; clientY: number; columnEl: HTMLElement | null } | null>(null)
+  /** Pending animation-frame id of the drag auto-scroll loop. */
+  const autoScrollRafRef = useRef<number | null>(null)
+
+  /** Edge auto-scroll tuning; caller-supplied values win over the defaults. */
+  const autoScrollConfig: DragAutoScrollOptions = {
+    threshold: dragAutoScroll?.threshold ?? DRAG_AUTO_SCROLL_DEFAULTS.threshold,
+    speed: dragAutoScroll?.speed ?? DRAG_AUTO_SCROLL_DEFAULTS.speed,
+  }
+
+  /** Stop the drag auto-scroll loop and forget the pointer. */
+  const stopAutoScroll = (): void => {
+    if (autoScrollRafRef.current !== null) cancelAnimationFrame(autoScrollRafRef.current)
+    autoScrollRafRef.current = null
+    dragPointRef.current = null
+  }
+
+  // A drag in flight when the tab unmounts must not keep the rAF loop alive.
+  useEffect(() => () => {
+    if (autoScrollRafRef.current !== null) cancelAnimationFrame(autoScrollRafRef.current)
+    autoScrollRafRef.current = null
+    dragPointRef.current = null
+  }, [])
 
   /** Column id → ordered tickets, derived purely from the snapshot. */
   const byColumn = useMemo(() => {
@@ -72,14 +108,20 @@ export function TaskboardView({
   const ticketCount = board?.tickets.length ?? 0
 
   /**
-   * Master-seat banner state for the active board: held (with a lease about
-   * to expire warning) or vacant. The host reports masterExpiresAt (claim
-   * time plus the configured lease), so the expiring state is exact.
+   * Master-seat banner state for the active board: vacant, held (with a
+   * lease about to expire warning) or expired. The host reports
+   * masterExpiresAt (claim time plus the configured lease), so the expiring
+   * and expired states are exact. A lapsed lease means the seat is
+   * preemptable again, so the banner reads as expired rather than being
+   * permanently "about to expire" and re-offers the takeover affordance.
    */
   const masterLabel = boardState.masterAgentId === null
     ? null
     : shortSessionId(boardState.masterAgentId)
-  const masterExpiring = boardState.masterAgentId !== null
+  const masterHeld = boardState.masterAgentId !== null && boardState.masterExpiresAt !== null
+  const masterExpired = masterHeld && boardState.masterExpiresAt !== null && boardState.masterExpiresAt <= Date.now()
+  const masterExpiring = masterHeld
+    && !masterExpired
     && boardState.masterExpiresAt !== null
     && boardState.masterExpiresAt - Date.now() < SEAT_LEASE_WARNING_MS
 
@@ -147,12 +189,45 @@ export function TaskboardView({
     }
   }
 
+  /** One auto-scroll tick: scroll the column vertically and the board horizontally. */
+  const autoScrollTick = (): void => {
+    autoScrollRafRef.current = null
+    const point = dragPointRef.current
+    if (point === null) return
+    const { clientX, clientY, columnEl } = point
+    if (columnEl !== null) {
+      const rect = columnEl.getBoundingClientRect()
+      const deltaY = autoScrollDelta(clientY, rect.top, rect.height, autoScrollConfig.threshold, autoScrollConfig.speed)
+      if (deltaY !== 0) {
+        columnEl.scrollTop = Math.max(0, columnEl.scrollTop + deltaY)
+      }
+    }
+    const board = boardRef.current
+    if (board !== null) {
+      const rect = board.getBoundingClientRect()
+      const deltaX = autoScrollDelta(clientX, rect.left, rect.width, autoScrollConfig.threshold, autoScrollConfig.speed)
+      if (deltaX !== 0) {
+        board.scrollLeft = Math.max(0, board.scrollLeft + deltaX)
+      }
+    }
+    autoScrollRafRef.current = requestAnimationFrame(autoScrollTick)
+  }
+
+  /** Keep the auto-scroll loop alive while a drag is in flight. */
+  const ensureAutoScroll = (clientX: number, clientY: number, columnEl: HTMLElement | null): void => {
+    dragPointRef.current = { clientX, clientY, columnEl }
+    if (autoScrollRafRef.current === null) {
+      autoScrollRafRef.current = requestAnimationFrame(autoScrollTick)
+    }
+  }
+
   /** Commit one drag-drop move and surface failures in the banner. */
   const handleDrop = async (column: ColumnId): Promise<void> => {
     const id = draggingId
     const before = dropTarget !== null && dropTarget.column === column ? dropTarget.beforeTicketId : null
     setDraggingId(null)
     setDropTarget(null)
+    stopAutoScroll()
     if (id === null) return
     const request: MoveTicketRequest = { ticketId: id, column, beforeTicketId: before, afterTicketId: null }
     try {
@@ -167,6 +242,28 @@ export function TaskboardView({
   const handleDragStart = (id: string): void => {
     setDraggingId(id)
     setDropTarget(null)
+    dragPointRef.current = null
+    if (autoScrollRafRef.current === null) {
+      autoScrollRafRef.current = requestAnimationFrame(autoScrollTick)
+    }
+  }
+
+  /** Track the pointer for auto-scroll while dragging over one column. */
+  const handleColumnDragOver = (event: DragEvent<HTMLElement>): void => {
+    if (draggingId === null) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    ensureAutoScroll(event.clientX, event.clientY, event.currentTarget)
+  }
+
+  /** Track the pointer for horizontal auto-scroll over the board strip. */
+  const handleBoardDragOver = (event: DragEvent<HTMLDivElement>): void => {
+    if (draggingId === null) return
+    // A dragover over a column bubbles here with a child target; only claim
+    // the pointer when the board itself is under it, so the column's vertical
+    // scroll anchor is not clobbered by the bubbling handler.
+    if (event.target !== event.currentTarget) return
+    ensureAutoScroll(event.clientX, event.clientY, null)
   }
 
   return (
@@ -228,10 +325,12 @@ export function TaskboardView({
             </span>
           )}
         </div>
-        <div className={css.seatBanner} data-seat={boardState.masterAgentId === null ? 'vacant' : 'held'}>
-          {boardState.masterAgentId === null ? (
+        <div className={css.seatBanner} data-seat={boardState.masterAgentId === null ? 'vacant' : masterExpired ? 'expired' : 'held'}>
+          {boardState.masterAgentId === null || masterExpired ? (
             <>
-              <span className={css.seatText}>{t('seat.vacant')}</span>
+              <span className={css.seatText} data-expired={masterExpired || undefined}>
+                {boardState.masterAgentId === null ? t('seat.vacant') : t('seat.expired')}
+              </span>
               <button type="button" className={css.copyButton} onClick={() => { void copyTakeover() }}>
                 {t('seat.copyTakeover')}
               </button>
@@ -292,21 +391,33 @@ export function TaskboardView({
           <button type="button" className={css.errorClose} onClick={() => setError(null)} aria-label={t('action.close')}>×</button>
         </div>
       )}
-      <div className={css.board}>
+      <div className={css.board} ref={boardRef} onDragOver={handleBoardDragOver}>
         {COLUMNS.map((column) => {
           const tickets = byColumn.get(column) ?? []
           const gloss = t(('column.' + column + '.gloss') as never)
           const isDropTarget = dropTarget !== null && dropTarget.column === column
+          /** Slot the drop lands in: the index to insert before (length = append). */
+          const dropSlot = isDropTarget
+            ? insertionSlot(tickets.map(ticket => ticket.id), dropTarget.beforeTicketId)
+            : -1
           return (
             <section
               key={column}
               className={css.column + (isDropTarget ? ' ' + css.columnDropTarget : '')}
               data-column={column}
               onDragOver={(event) => {
+                handleColumnDragOver(event)
                 if (draggingId === null) return
-                event.preventDefault()
-                event.dataTransfer.dropEffect = 'move'
-                setDropTarget({ column, beforeTicketId: null })
+                // The pointer's vertical position picks the insertion slot:
+                // above a card's midpoint inserts before it, below appends.
+                const spans = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[data-ticket-id]'))
+                  .map((element) => {
+                    const rect = element.getBoundingClientRect()
+                    return { top: rect.top, bottom: rect.bottom }
+                  })
+                const index = insertionIndexAt(event.clientY, spans)
+                const beforeTicketId = index < tickets.length ? tickets[index]?.id ?? null : null
+                setDropTarget({ column, beforeTicketId })
               }}
               onDrop={(event) => {
                 event.preventDefault()
@@ -319,22 +430,27 @@ export function TaskboardView({
                 <span className={css.columnCount}>{String(tickets.length)}</span>
               </div>
               <div className={css.cards}>
-                {tickets.map(ticket => (
-                  <TicketCard
-                    key={ticket.id}
-                    ticket={ticket}
-                    selected={ticket.id === selectedId}
-                    dragging={ticket.id === draggingId}
-                    t={t}
-                    onSelect={() => { actions.select(ticket.id) }}
-                    onDragStart={() => { handleDragStart(ticket.id) }}
-                    onDragEnd={() => {
-                      setDraggingId(null)
-                      setDropTarget(null)
-                    }}
-                    onDragOverCard={() => { setDropTarget({ column, beforeTicketId: ticket.id }) }}
-                  />
+                {tickets.map((ticket, index) => (
+                  <Fragment key={ticket.id}>
+                    {dropSlot === index && <div className={css.dropIndicator} data-testid="drop-indicator" />}
+                    <TicketCard
+                      ticket={ticket}
+                      selected={ticket.id === selectedId}
+                      dragging={ticket.id === draggingId}
+                      t={t}
+                      onSelect={() => { actions.select(ticket.id) }}
+                      onDragStart={() => { handleDragStart(ticket.id) }}
+                      onDragEnd={() => {
+                        setDraggingId(null)
+                        setDropTarget(null)
+                        stopAutoScroll()
+                      }}
+                    />
+                  </Fragment>
                 ))}
+                {dropSlot === tickets.length && (
+                  <div className={css.dropIndicator} data-testid="drop-indicator" />
+                )}
                 {tickets.length === 0 && ticketCount === 0 && column === 'backlog' && (
                   <p className={css.empty}>{t('board.empty')}</p>
                 )}

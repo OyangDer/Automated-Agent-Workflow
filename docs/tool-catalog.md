@@ -27,7 +27,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`, `grep` | `ctx.tools`, `ctx.subprocess`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | glob and grep are unconditional discovery tools that spawn the packaged ripgrep binary (`@vscode/ripgrep`) through ctx.subprocess as ordinary foreground calls (never background jobs) — no host `rg` install and no shell layer. The catalog uses `sampleOverCapGlobResults: true`; deployments must choose that behavior explicitly. Capped results save the complete formatted list through the optional ctx.spillStore backend; returned locators are follow-up-readable/searchable when the backend exposes local paths in co-located deployments. |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`, `terminal_list`, `terminal_open`, `terminal_read`, `terminal_send`, `terminal_signal` | `ctx.tools`, `ctx.terminals`, `ctx.systemPrompt`, `ctx.jobs at call time for run_in_background` | `tool/call`, `tool/result` | - | The six terminal tools are opt-in and complement one-shot shell/filesystem tools. `terminal_send(run_in_background: true)` registers with `ctx.jobs`; TUI, named key sequences, BEL, resize, auto-start, and cross-agent sharing are absent from the schema. |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`, `get_goal`, `update_goal` | `ctx.tools`, `ctx.agents`, `ctx.goals`, `ctx.systemPrompt`, `a calling Agent in an authorized open turn` | `tool/call`, `goal/change for mutations`, `tool/result` | - | create, edit, pause, and resume require direct-human root authority; complete and blocked also accept the exact current goal round. The default blocked lower bound is three admitted rounds. |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The nineteen taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-one taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`, `schedule_delete`, `schedule_list` | `ctx.tools`, `ctx.sessions`, `Session persistence`, `a future live root Agent` | `tool/call`, `schedule/change create or delete`, `tool/result` | - | Registered only inside live root Agent scopes created after the opt-in Schedule plugin loads. Version 1 accepts after_seconds, explicit absolute at, and bounded fixed-rate every_seconds, and discloses session-local delivery; management reads and mutations require the shared Session persistence barrier. |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`, `ctx.lsp`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | The lsp tool keeps provider selection and language-server subprocesses behind ctx.lsp, so its model-visible schema stays stable across providers. Requires a registered provider (e.g. `@deepseek-ai/dsh-lsp-stdio`) at runtime; without one, a query returns the structured `LSP_UNAVAILABLE` error rather than changing the schema. |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`, `ctx.workflowEngine`, `ctx.subagents`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents every fresh round)` | `tool/call`, `tool/result`, `workflow and child session events during execution` | - | A fixed foreground workflow starts one fresh structured child per round; the model selects only the immutable objective and an optional round cap. |
@@ -1065,7 +1065,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_assign`
 
-Dispatch a Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.
+Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.
 
 ```json
 {
@@ -1073,7 +1073,7 @@ Dispatch a Not started taskboard ticket (master only): the card moves to In prog
   "properties": {
     "ticketId": {
       "type": "string",
-      "description": "The Not started ticket to dispatch."
+      "description": "The Backlog or Not started ticket to dispatch."
     },
     "workerLabel": {
       "type": "string",
@@ -1088,9 +1088,43 @@ Dispatch a Not started taskboard ticket (master only): the card moves to In prog
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_board_config`
+
+Read or set the per-board worker/reviewer model and reasoning-effort overrides (V3-5, master only). Every configured field overrides the host config for the board's spawned workers/reviewers; omit a field to keep the current board override, pass "" to clear it back to the host default (and the reviewer knobs fall back to the worker ones). Effort levels are the deepseek vocabulary: off | high | max. Spawns after the change use the new overrides; the board record keeps them durably.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to configure. Omit for the default board."
+    },
+    "workerModel": {
+      "type": "string",
+      "description": "Board-level worker model override; \"\" clears it. Omit to keep the current override."
+    },
+    "workerEffort": {
+      "type": "string",
+      "description": "Board-level worker reasoning effort (off|high|max); \"\" clears it. Omit to keep the current override."
+    },
+    "reviewerModel": {
+      "type": "string",
+      "description": "Board-level reviewer model override; \"\" clears it. Omit to keep the current override."
+    },
+    "reviewerEffort": {
+      "type": "string",
+      "description": "Board-level reviewer reasoning effort (off|high|max); \"\" clears it. Omit to keep the current override."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_claim`
 
-Claim a Not started taskboard ticket for the calling agent: the card moves to In progress and this agent becomes its owner. Rejected when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Claim the oldest (lowest position) ready ticket first; use parallel subagents to claim several independent tickets at once.
+Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master's dispatch. Rejected when the caller is not the master of the ticket's board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).
 
 ```json
 {
@@ -1098,7 +1132,7 @@ Claim a Not started taskboard ticket for the calling agent: the card moves to In
   "properties": {
     "ticketId": {
       "type": "string",
-      "description": "The Not started ticket to claim."
+      "description": "The Not started ticket to claim (master only)."
     }
   },
   "required": [
@@ -1371,6 +1405,32 @@ Read the durable master notices of a taskboard board (default board "default"): 
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_pause`
+
+Pause one In progress/running taskboard ticket (master only): the in-flight worker run is aborted and the card is marked paused (column unchanged) with one history row naming the pauser and the reason. A paused card is never auto-blocked by settlement or liveness reconciliation. Resume it with taskboard_reassign action "retry", which clears paused and spawns a fresh worker.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In progress card whose worker to pause."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why the master pauses the card (recorded in the card history)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "reason"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_plan`
 
 Plan a taskboard ticket (master only): adjust dependency edges, priority, and the card's ordering position inside its column. Dependency changes take effect immediately on claim gates; position is an index in the column ordering (0 = first).
@@ -1613,7 +1673,7 @@ Read one full taskboard ticket: description, assignee, review state, rejection f
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
-The nineteen taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.
+The twenty-one taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.
 
 <a id="deepseek-aidsh-schedule"></a>
 

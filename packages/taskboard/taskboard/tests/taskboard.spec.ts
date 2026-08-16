@@ -27,7 +27,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
 import {
-  branchNameFor, buildHandoverNotes, buildWorkerPrompt, MASTER_SECTION,
+  branchNameFor, buildHandoverNotes, buildWorkerPrompt, MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
 } from '../src/domain.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
@@ -123,8 +123,14 @@ interface Harness {
   spawnedWorkerId: string
   /** The vi.fn backing the stubbed subagents.start seam. */
   subagentsStart: ReturnType<typeof vi.fn>
+  /** The request signals of every worker spawn, in spawn order (taskboard_pause aborts the latest one). */
+  workerSignals: AbortSignal[]
+  /** The request signals of every reviewer spawn, in spawn order. */
+  reviewerSignals: AbortSignal[]
   /** Remove the harness worker child from the live agent registry (simulates the worker session vanishing, e.g. a host restart). */
   unregisterWorker: () => void
+  /** Remove the harness reviewer child from the live agent registry (simulates the reviewer session vanishing, e.g. a host restart). */
+  unregisterReviewer: () => void
   /** Remove the harness master agent (devA) from the live agent registry (simulates the master session vanishing, e.g. a host restart). */
   unregisterMaster: () => void
 }
@@ -137,6 +143,13 @@ interface HarnessOptions {
   root?: string
   /** When set, worker spawns return a run carrying this result promise. */
   workerRunResult?: Promise<RunResultStub>
+  /**
+   * Per-spawn worker run results, consumed in order; a trailing undefined
+   * keeps that worker alive (no settlement). Falls back to workerRunResult.
+   */
+  workerRunResults?: Array<Promise<RunResultStub> | undefined>
+  /** Per-spawn worker session ids, consumed in order; falls back to the default id. */
+  workerSpawnIds?: string[]
   /** When set, reviewer spawns return a run carrying this result promise. */
   reviewerRunResult?: Promise<RunResultStub>
   /** The review protocol; defaults to "report". */
@@ -153,13 +166,30 @@ interface HarnessOptions {
     depthLimit: boolean
     toolFilter: boolean
     persona: boolean
+    effort: boolean
   }
+  /** Host workerModel passed to the service (default deepseek-v4-flash). */
+  workerModel?: string
+  /** Host workerEffort passed to the service (default unset). */
+  workerEffort?: string
+  /** Host reviewerModel passed to the service (defaults along the workerModel). */
+  reviewerModel?: string
+  /** Host reviewerEffort passed to the service (defaults along the workerEffort). */
+  reviewerEffort?: string
+  /** Host masterEffort passed to the service (informational note only). */
+  masterEffort?: string
   /** When set, only reviewer-label spawns throw; worker spawns still succeed. */
   failReviewerSpawn?: boolean
   /** Worker-liveness reconciliation interval passed to the plugin (0 disables the periodic scan). */
   reconcileIntervalMs?: number
   /** Master-notice dedupe window passed to the plugin (defaults to 10000). */
   noticeDedupeWindowMs?: number
+  /** Idle-staleness timeout passed to the plugin (defaults to 600000). */
+  lostWorkerTimeoutMs?: number
+  /** Per-card auto-redispatch cap passed to the plugin (defaults to 2). */
+  workerAutoRetryLimit?: number
+  /** Reviewer-staleness timeout passed to the plugin (defaults to 900000). */
+  reviewerStaleTimeoutMs?: number
   /** When set, a fake session-persistence seam (append/inspect) is provided to the service. */
   sessionPersistence?: ReturnType<typeof fakeSessionPersistence>
 }
@@ -178,18 +208,29 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   await ctx.plugin(ToolRuntime)
   const spawnedReviewerId = 'reviewer-child-agent'
   const spawnedWorkerId = 'worker-child-agent'
+  const workerIds = options.workerSpawnIds ?? ['worker-child-agent']
+  let workerSpawnCount = 0
+  const workerSignals: AbortSignal[] = []
+  const reviewerSignals: AbortSignal[] = []
   let subagentsStart: ReturnType<typeof vi.fn>
   if (spawn === 'spawn') {
     subagentsStart = vi.fn(async (_provider: string, request: SubagentStartRequest) => {
       if (options.failReviewerSpawn === true && request.label?.startsWith('review ')) {
         throw new Error('reviewer spawn exploded')
       }
-      const id = request.label?.startsWith('review ')
-        ? spawnedReviewerId
-        : spawnedWorkerId
-      const result = id === spawnedReviewerId
-        ? options.reviewerRunResult
-        : options.workerRunResult
+      if (request.label?.startsWith('review ')) {
+        reviewerSignals.push(request.signal)
+        const result = options.reviewerRunResult
+        return {
+          id: spawnedReviewerId,
+          ...(result === undefined ? {} : { result }),
+        }
+      }
+      workerSignals.push(request.signal)
+      const id = workerIds[Math.min(workerSpawnCount, workerIds.length - 1)]!
+      const perSpawn = options.workerRunResults?.[workerSpawnCount]
+      workerSpawnCount += 1
+      const result = perSpawn === undefined ? options.workerRunResult : perSpawn
       return {
         id,
         ...(result === undefined ? {} : { result }),
@@ -232,8 +273,16 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     maxInProgress,
     ...(options.masterSeatTimeoutMs === undefined ? {} : { masterSeatTimeoutMs: options.masterSeatTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
+    ...(options.workerModel === undefined ? {} : { workerModel: options.workerModel }),
+    ...(options.workerEffort === undefined ? {} : { workerEffort: options.workerEffort }),
+    ...(options.reviewerModel === undefined ? {} : { reviewerModel: options.reviewerModel }),
+    ...(options.reviewerEffort === undefined ? {} : { reviewerEffort: options.reviewerEffort }),
+    ...(options.masterEffort === undefined ? {} : { masterEffort: options.masterEffort }),
     ...(options.reconcileIntervalMs === undefined ? { reconcileIntervalMs: 0 } : { reconcileIntervalMs: options.reconcileIntervalMs }),
     ...(options.noticeDedupeWindowMs === undefined ? {} : { noticeDedupeWindowMs: options.noticeDedupeWindowMs }),
+    ...(options.lostWorkerTimeoutMs === undefined ? {} : { lostWorkerTimeoutMs: options.lostWorkerTimeoutMs }),
+    ...(options.workerAutoRetryLimit === undefined ? {} : { workerAutoRetryLimit: options.workerAutoRetryLimit }),
+    ...(options.reviewerStaleTimeoutMs === undefined ? {} : { reviewerStaleTimeoutMs: options.reviewerStaleTimeoutMs }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -244,11 +293,17 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const workerChild = stubAgent(spawnedWorkerId)
   const unregisterMaster = ctx.agents.register(devA)
   ctx.agents.register(devB)
-  ctx.agents.register(reviewerChild)
+  const unregisterReviewer = ctx.agents.register(reviewerChild)
   const unregisterWorker = ctx.agents.register(workerChild)
+  // Register every configured worker spawn id as a live stub agent so an
+  // auto-redispatched worker (which the real seam would register) is live.
+  for (const id of (options.workerSpawnIds ?? [])) {
+    if (id !== spawnedWorkerId) ctx.agents.register(stubAgent(id))
+  }
   return {
     ctx, service, root, changes, devA, devB, reviewerChild, workerChild,
-    spawnedReviewerId, spawnedWorkerId, subagentsStart, unregisterWorker, unregisterMaster,
+    spawnedReviewerId, spawnedWorkerId, subagentsStart, workerSignals, reviewerSignals,
+    unregisterWorker, unregisterReviewer, unregisterMaster,
   }
 }
 
@@ -275,6 +330,17 @@ async function createTicket(
 
 async function toNotStarted(service: TaskboardService, agent: Agent, ticket: TicketView): Promise<TicketView> {
   return await service.moveRemote(agent, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+}
+
+/**
+ * Schedule a card into Not started as the board master (the taskboard_move
+ * origin). Unlike the user drag (toNotStarted), a master-origin move never
+ * emits the user-scheduled master notice, so worker/report/reconcile tests
+ * can set up a Not started card without an extra notice polluting their
+ * followup/notice-count assertions.
+ */
+async function scheduleToNotStarted(service: TaskboardService, agent: Agent, ticket: TicketView): Promise<TicketView> {
+  return await service.moveAsMaster(agent, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
 }
 
 async function claimTicket(service: TaskboardService, agent: Agent, ticket: TicketView): Promise<TicketView> {
@@ -443,6 +509,35 @@ describe('TaskboardService workflow', () => {
     expect(done.column).toBe('done')
   })
 
+  it('assign dispatches a Backlog card directly without moving it (V3-6); other columns still reject', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    // A fresh Backlog card: dispatch straight from Backlog, no move first.
+    const ticket = await createTicket(service, 'backlog dispatch')
+    const result = await service.assign(devA, ticket.id)
+    expect(result.worker).toBe('spawned')
+    expect(result.workerAgentId).toBe('worker-child-agent')
+    expect(result.ticket.column).toBe('in_progress')
+    expect(result.ticket.status).toBe('running')
+    expect(result.ticket.assignee?.agentId).toBe(devA.id)
+    expect(result.ticket.workerAgentId).toBe('worker-child-agent')
+    // The assign transition records an 'assign' history row like any assign.
+    expect(result.ticket.history.at(-1)).toMatchObject({ kind: 'assign' })
+    // Direct-from-Backlog dispatch never emits the user-scheduled notice:
+    // the card goes straight to In progress, not through the Not started wake-up.
+    expect(followup).not.toHaveBeenCalled()
+    // The worker flow completes end to end from the Backlog origin.
+    const reported = await service.report(workerChild, ticket.id, 'implemented')
+    expect(reported.ticket.column).toBe('in_testing')
+    // Assign from In progress / In testing / Done still rejects.
+    await expect(service.assign(devA, ticket.id)).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+    await expect(service.assign(devA, reported.ticket.id)).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+    // A card already Done also rejects (assign requires Not started or Backlog).
+    const doneCard = await service.moveRemote(devA, { ticketId: reported.ticket.id, column: 'done', beforeTicketId: null, afterTicketId: null })
+    await expect(service.assign(devA, doneCard.id)).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+  })
+
   it('fail marks the card blocked in place; only the assigned worker may fail', async () => {
     const { service, devA, devB, workerChild } = await harness()
     await service.claimMaster('default', devA)
@@ -486,36 +581,159 @@ describe('TaskboardService workflow', () => {
     expect(subagentsStart.mock.calls).toHaveLength(3)
   })
 
-  it('requires the master seat for assign and reassign', async () => {
+  it('requires the master seat for assign, reassign and claim (V3-7)', async () => {
     const { service, devA, devB } = await harness()
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'guarded card')
     await toNotStarted(service, devA, ticket)
     await expect(service.assign(devB, ticket.id)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
     await expect(service.reassign(devB, ticket.id, 'backlog')).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    // The free claim is closed (V3-7): a non-master may not claim either,
+    // even though the ticket is ready and unowned.
+    await expect(service.claim(devB, ticket.id)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    // The master still claims directly.
+    const claimed = await service.claim(devA, ticket.id)
+    expect(claimed.column).toBe('in_progress')
+    expect(claimed.assignee?.agentId).toBe(devA.id)
+    // After a claim the non-master is still rejected at the master gate.
+    await expect(service.claim(devB, claimed.id)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
   })
 
-  it('reclaims a card whose worker run settles without reporting', async () => {
+  it('taskboard_pause aborts the in-flight worker run, marks the card paused and notifies the master', async () => {
+    const { service, devA, devB, workerSignals } = await harness()
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const ticket = await createTicket(service, 'pause me')
+    await scheduleToNotStarted(service, devA, ticket)
+    const assigned = await service.assign(devA, ticket.id)
+    expect(assigned.ticket.status).toBe('running')
+    expect(workerSignals).toHaveLength(1)
+    // The master pauses the card: the recorded run handle aborts the worker.
+    const paused = await service.pause(devA, ticket.id, 'user asked to stop the run')
+    expect(paused.status).toBe('paused')
+    expect(paused.column).toBe('in_progress')
+    expect(paused.failure).toBeNull()
+    expect(workerSignals[0]!.aborted).toBe(true)
+    // History names the pauser and the reason.
+    const pauseRow = paused.history.at(-1)
+    expect(pauseRow?.kind).toBe('pause')
+    expect(pauseRow?.detail).toContain('paused by')
+    expect(pauseRow?.detail).toContain('dev-agen')
+    expect(pauseRow?.detail).toContain('user asked to stop the run')
+    // The master is notified with the worker-paused notice kind.
+    expect(followup).toHaveBeenCalledTimes(1)
+    const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+    expect(message.source.kind).toBe('taskboard')
+    expect(textOf(message)).toContain(ticket.id)
+    expect(textOf(message)).toContain('taskboard_reassign')
+    const snapshot = await service.snapshot(devA)
+    const notice = snapshot.notices?.at(-1)
+    expect(notice).toMatchObject({ kind: 'worker-paused', ticketId: ticket.id })
+    // A second pause is rejected: the card is no longer running.
+    await expect(service.pause(devA, ticket.id, 'again')).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+    // A non-master cannot pause.
+    await expect(service.pause(devB, ticket.id, 'not my board')).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+  })
+
+  it('paused cards are never mislabeled blocked: aborted settlement and liveness reconciliation both skip them', async () => {
     let settle!: (result: RunResultStub) => void
     const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
-    const { service, devA } = await harness({ workerRunResult: runResult })
+    const { service, devA, workerSignals, unregisterWorker } = await harness({ workerRunResults: [runResult] })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'paused survivor')
+    await scheduleToNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    // Pause first, then let the aborted run settle with a non-report reason:
+    // the settlement callback must see status paused and skip reclamation.
+    const paused = await service.pause(devA, ticket.id, 'stop the world')
+    expect(paused.status).toBe('paused')
+    expect(workerSignals[0]!.aborted).toBe(true)
+    settle({ output: [], stopReason: 'aborted' })
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(ticket.id)
+      expect(current.status).toBe('paused')
+      expect(current.failure).toBeNull()
+      expect(current.autoRetries).toBe(0)
+    })
+    // The liveness reconciliation also skips paused cards: even with the
+    // worker absent from the registry, nothing is recovered or blocked.
+    unregisterWorker()
+    const recovered = await service.reconcileLostWorkers()
+    expect(recovered).toBe(0)
+    const current = await service.viewTicket(ticket.id)
+    expect(current.status).toBe('paused')
+    expect(current.failure).toBeNull()
+  })
+
+  it('reassign retry resumes a paused card with a fresh worker; backlog returns it to Not started', async () => {
+    const { service, devA, workerSignals, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'paused then resumed')
+    await scheduleToNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    await service.pause(devA, ticket.id, 'hold on')
+    // Backlog still works on a paused card: it returns to Not started ready.
+    const backlogged = await service.reassign(devA, ticket.id, 'backlog')
+    expect(backlogged.ticket.column).toBe('not_started')
+    expect(backlogged.ticket.status).toBe('ready')
+    // Re-dispatch, pause again, then retry: a fresh worker spawns and the
+    // paused status is cleared with a resume-annotated history row.
+    await scheduleToNotStarted(service, devA, backlogged.ticket)
+    await service.assign(devA, backlogged.ticket.id)
+    expect(workerSignals).toHaveLength(2)
+    const paused = await service.pause(devA, ticket.id, 'wait for review')
+    expect(paused.status).toBe('paused')
+    const retried = await service.reassign(devA, ticket.id, 'retry')
+    expect(retried.worker).toBe('spawned')
+    expect(retried.ticket.status).toBe('running')
+    expect(retried.ticket.failure).toBeNull()
+    expect(retried.ticket.workerSessionId).toBe('worker-child-agent')
+    expect(workerSignals).toHaveLength(3)
+    const resumeRow = retried.ticket.history.at(-1)
+    expect(resumeRow?.kind).toBe('reassign')
+    expect(resumeRow?.detail).toContain('resumed from pause')
+    expect(subagentsStart.mock.calls.length).toBe(3)
+  })
+
+  it('pause rejects cards that are not In progress running (edge paths)', async () => {
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'not running card')
+    await expect(service.pause(devA, ticket.id, 'backlog card')).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+    await toNotStarted(service, devA, ticket)
+    // A Not started card is not In progress.
+    await expect(service.pause(devA, ticket.id, 'not started card')).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_TRANSITION' })
+    await expect(service.pause(devA, ticket.id, '')).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
+    await expect(service.pause(devA, 'ticket-missing', 'gone')).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
+  })
+
+  it('auto-redispatches a card whose worker run settles without reporting', async () => {
+    let settle!: (result: RunResultStub) => void
+    const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
+    const { service, devA } = await harness({ workerRunResults: [runResult] })
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'vanishing worker')
     await toNotStarted(service, devA, ticket)
     const assigned = await service.assign(devA, ticket.id)
     expect(assigned.ticket.status).toBe('running')
     settle({ output: [], stopReason: 'error' })
+    // Mid-flight death: the settlement callback auto-redispatches a fresh
+    // worker (budget 1 of 2) and the card stays running.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(ticket.id)
-      expect(current.status).toBe('blocked')
-      expect(current.failure?.reason).toContain('worker terminated')
+      expect(current.status).toBe('running')
+      expect(current.autoRetries).toBe(1)
+      expect(current.failure).toBeNull()
     })
+    const current = await service.viewTicket(ticket.id)
+    expect(current.description).toContain('续做勿回滚')
+    expect(current.history.some(row => row.kind === 'reassign' && row.detail.includes('auto-redispatched'))).toBe(true)
   })
 
-  it('reclaims a card when the worker run infrastructure rejects', async () => {
+  it('auto-redispatches a card when the worker run infrastructure rejects', async () => {
     const runResult = Promise.reject(new Error('transport broke'))
     void runResult.catch(() => {})
-    const { service, devA } = await harness({ workerRunResult: runResult })
+    const { service, devA } = await harness({ workerRunResults: [runResult] })
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'crashing worker')
     await toNotStarted(service, devA, ticket)
@@ -523,8 +741,8 @@ describe('TaskboardService workflow', () => {
     expect(assigned.ticket.status).toBe('running')
     await vi.waitFor(async () => {
       const current = await service.viewTicket(ticket.id)
-      expect(current.status).toBe('blocked')
-      expect(current.failure?.reason).toContain('worker terminated (error)')
+      expect(current.status).toBe('running')
+      expect(current.autoRetries).toBe(1)
     })
   })
 
@@ -582,114 +800,406 @@ describe('TaskboardService workflow', () => {
     )
     const { service, devA, changes } = await harness({ root })
     const followup = vi.spyOn(devA, 'followup')
-    // The startup pass (scheduled once the domain is open) marks the card blocked.
+    // The startup pass (scheduled once the domain is open) recovers the card:
+    // the master session (devA) is live in the registry, so the lost worker
+    // is auto-redispatched — the card stays running with a fresh worker and
+    // the auto-retry budget incremented, instead of being blocked outright.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(orphan.id)
-      expect(current.status).toBe('blocked')
-      expect(current.failure?.reason).toBe('worker terminated (restart reconciliation)')
+      expect(current.status).toBe('running')
+      expect(current.autoRetries).toBe(1)
+      expect(current.failure).toBeNull()
+      expect(current.workerSessionId).toBe('worker-child-agent')
     })
-    const blocked = await service.viewTicket(orphan.id)
-    expect(blocked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    expect(blocked.history.at(-1)?.detail).toBe('worker terminated (restart reconciliation)')
+    const recovered = await service.viewTicket(orphan.id)
+    expect(recovered.history.some(row => row.kind === 'reassign' && row.detail.includes('auto-redispatched'))).toBe(true)
+    expect(recovered.description).toContain('续做勿回滚')
     // The master inbox received exactly one notice naming the card.
     expect(followup).toHaveBeenCalledTimes(1)
     const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
     expect(message.source.kind).toBe('taskboard')
     expect(textOf(message)).toContain(orphan.id)
-    expect(textOf(message)).toContain('taskboard_reassign')
-    // The forwarded change event carries the reconciliation mutation.
-    expect(changes.some(change => change.operation === 'fail' && change.ticketId === orphan.id)).toBe(true)
+    expect(textOf(message)).toContain('auto-redispatched')
+    // The forwarded change event carries the recovery mutation.
+    expect(changes.some(change => change.operation === 'reassign' && change.ticketId === orphan.id)).toBe(true)
   })
 
-  it('leaves a running card alone while its worker is live and blocks it once the worker leaves the registry', async () => {
+  it('blocks a running card on restart when no live master session exists to auto-redispatch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskboard-restart-nomaster-'))
+    const now = Date.now()
+    const orphan = {
+      id: 'ticket-restart-orphan-no-master',
+      title: 'restart orphan no master',
+      description: 'worker died with the old process',
+      column: 'in_progress',
+      priority: 'normal',
+      boardId: 'default',
+      type: 'bugfix',
+      status: 'running',
+      workerAgentId: 'ghost-worker-session',
+      workerSessionId: 'ghost-worker-session',
+      failure: null,
+      createdAt: now,
+      updatedAt: now,
+      position: 0,
+      assignee: { agentId: 'dev-agent-a', label: 'agent dev-agen' },
+      reviewer: null,
+      reviewAttempts: 0,
+      lastReview: null,
+      devNotes: '',
+      dependsOn: [],
+      history: [],
+    }
+    const masterBoard = {
+      boardId: 'default',
+      name: 'default',
+      workspaceId: '',
+      scope: 'project',
+      ownerSessionId: null,
+      masterAgentId: 'dev-agent-a',
+      masterClaimedAt: now,
+      handoverNotes: '',
+      masterHistory: [],
+      archivedAt: null,
+    }
+    await writeFile(
+      join(root, 'taskboard.json'),
+      JSON.stringify({
+        unit: { name: 'taskboard', version: 1 },
+        global: null,
+        tables: {
+          tickets: { [orphan.id]: orphan },
+          boards: { [masterBoard.boardId]: masterBoard },
+        },
+      }, null, 2),
+    )
+    const { service, unregisterMaster } = await harness({ root })
+    // A full restart leaves the master session absent too: auto-redispatch is
+    // impossible, so the V3-13 terminal path — blocked + notify — applies.
+    unregisterMaster()
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(orphan.id)
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toContain('restart reconciliation')
+    })
+    const blocked = await service.viewTicket(orphan.id)
+    expect(blocked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+  })
+
+  it('leaves a running card alone while its worker is live and auto-redispatches once the worker leaves the registry', async () => {
     const { service, devA, unregisterWorker } = await harness()
     await service.claimMaster('default', devA)
     const followup = vi.spyOn(devA, 'followup')
     const card = await createTicket(service, 'live worker card')
-    await toNotStarted(service, devA, card)
+    await scheduleToNotStarted(service, devA, card)
     await service.assign(devA, card.id)
     // The spawned worker is a registered live session: the pass touches nothing.
     expect(await service.reconcileLostWorkers()).toBe(0)
     let current = await service.viewTicket(card.id)
     expect(current.status).toBe('running')
     expect(followup).not.toHaveBeenCalled()
-    // The worker session vanishes (termination / host restart): the next pass blocks.
+    // The worker session vanishes (termination / host restart): the next pass
+    // auto-redispatches a fresh worker — the card stays running with the
+    // budget incremented and a master notice.
     unregisterWorker()
     expect(await service.reconcileLostWorkers()).toBe(1)
     current = await service.viewTicket(card.id)
-    expect(current.status).toBe('blocked')
-    expect(current.failure?.reason).toBe('worker terminated (restart reconciliation)')
-    expect(current.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(current.status).toBe('running')
+    expect(current.autoRetries).toBe(1)
+    expect(current.failure).toBeNull()
     expect(followup).toHaveBeenCalledTimes(1)
     const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
     expect(textOf(message)).toContain(card.id)
-    expect(textOf(message)).toContain('taskboard_reassign')
+    expect(textOf(message)).toContain('auto-redispatched')
+    // The replacement worker (same stub id) is not re-registered, so the next
+    // loss exhausts the budget and the card finally blocks.
+    expect(await service.reconcileLostWorkers()).toBe(1)
+    current = await service.viewTicket(card.id)
+    expect(current.status).toBe('running')
+    expect(current.autoRetries).toBe(2)
+    expect(await service.reconcileLostWorkers()).toBe(1)
+    current = await service.viewTicket(card.id)
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
+    expect(current.history.filter(row => row.kind === 'fail')).toHaveLength(1)
   })
 
-  it('periodically scans running cards and stays idempotent across repeats', async () => {
+  it('periodically scans running cards: auto-redispatch until the budget is exhausted, then one block', async () => {
     const { service, devA, unregisterWorker } = await harness({ reconcileIntervalMs: 20 })
     await service.claimMaster('default', devA)
-    const followup = vi.spyOn(devA, 'followup')
     const card = await createTicket(service, 'periodic scan card')
-    await toNotStarted(service, devA, card)
+    await scheduleToNotStarted(service, devA, card)
     await service.assign(devA, card.id)
     unregisterWorker()
+    // Each tick auto-redispatches (budget 1, then 2), and the third tick
+    // blocks the card — the periodic scanner closes the loop end to end.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(card.id)
       expect(current.status).toBe('blocked')
     })
     const blocked = await service.viewTicket(card.id)
-    expect(blocked.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    expect(blocked.autoRetries).toBe(2)
+    expect(blocked.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
     // Let several more interval ticks fire: the scan stays idempotent — one
-    // fail row and one notice for the whole lifetime.
+    // fail row and one notice for the whole lifetime (the redispatch notices
+    // dedupe by kind inside their own window).
     await new Promise(resolve => setTimeout(resolve, 80))
     const again = await service.viewTicket(card.id)
     expect(again.status).toBe('blocked')
     expect(again.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    expect(again.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    expect(again.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
+  })
+  it('judges a still-registered but idle worker lost and auto-redispatches it', async () => {
+    const { ctx, service, devA, unregisterWorker } = await harness({ lostWorkerTimeoutMs: 100 })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'idle worker card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    // Replace the registered worker with a stale twin under the same id: the
+    // session is present but its activity tail is older than the timeout, so
+    // the pass judges it lost on the idle-staleness arm and auto-redispatches.
+    unregisterWorker()
+    const oldSession = Session.create(SessionId('worker-child-agent'), undefined, {
+      version: 0,
+      id: SessionId('worker-child-agent'),
+      createdAt: Date.now() - 60_000,
+    })
+    const staleWorker = stubAgentForSession(oldSession)
+    ctx.agents.register(staleWorker)
+    expect(await service.reconcileLostWorkers()).toBe(1)
+    const current = await service.viewTicket(card.id)
+    expect(current.status).toBe('running')
+    expect(current.autoRetries).toBe(1)
     expect(followup).toHaveBeenCalledTimes(1)
+    expect(textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })).toContain('auto-redispatched')
   })
 
-  it('coexists with the settlement reclamation: one block wins, one fail row per card', async () => {
+  it('blocks the card once the per-card auto-redispatch budget is exhausted', async () => {
+    // Every worker spawn dies immediately, so the settlement callback keeps
+    // firing: attempt 1 and 2 auto-redispatch, attempt 3 blocks.
+    const failing = Promise.reject(new Error('always dies'))
+    void failing.catch(() => {})
+    const { service, devA } = await harness({
+      workerRunResults: [failing, failing, failing],
+      workerSpawnIds: ['worker-child-agent', 'worker-child-2', 'worker-child-3'],
+      noticeDedupeWindowMs: 0,
+    })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'budget card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(card.id)
+      expect(current.status).toBe('blocked')
+    })
+    const blocked = await service.viewTicket(card.id)
+    expect(blocked.autoRetries).toBe(2)
+    expect(blocked.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
+    expect(blocked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    // The master heard about both redispatches and the terminal block.
+    expect(followup).toHaveBeenCalledTimes(3)
+  })
+
+  it('releases a ghost reviewer seat and auto-redispatches a fresh reviewer', async () => {
+    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness()
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'ghost review card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
+    // The reviewer session vanishes: the seat is a ghost and must be released.
+    unregisterReviewer()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    const current = await service.viewTicket(card.id)
+    // The seat was released (a review-release history row landed) and a fresh
+    // reviewer was auto-redispatched through the live master.
+    expect(current.history.some(row => row.kind === 'review-release')).toBe(true)
+    expect(current.reviewer).not.toBeNull()
+    expect(followup).toHaveBeenCalled()
+    expect(textOf(followup.mock.calls.at(-1)![0] as { content: { type: string; text: string }[] })).toContain('review seat')
+  })
+
+  it('leaves the seat vacant for claim_review when no live master exists to re-review', async () => {
+    const { service, devA, workerChild, unregisterReviewer, unregisterMaster } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'no master re-review card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    unregisterMaster()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    const current = await service.viewTicket(card.id)
+    expect(current.reviewer).toBeNull()
+    // The seat is vacant: claim_review can take it.
+    await service.claimReview(devA, card.id)
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(devA.id)
+  })
+
+  it('releases a stale reviewer seat after the staleness timeout without a verdict', async () => {
+    const { ctx, service, devA, workerChild, unregisterReviewer } = await harness({ reviewerStaleTimeoutMs: 50 })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'stale review card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    // The reviewer is registered but idle with an old activity tail and no
+    // reviewOutcome: past the timeout the seat is released (and a fresh
+    // reviewer is auto-redispatched through the live master).
+    unregisterReviewer()
+    const oldSession = Session.create(SessionId('reviewer-child-agent'), undefined, {
+      version: 0,
+      id: SessionId('reviewer-child-agent'),
+      createdAt: Date.now() - 60_000,
+    })
+    const staleReviewer = stubAgentForSession(oldSession)
+    ctx.agents.register(staleReviewer)
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    const released = await service.viewTicket(card.id)
+    expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
+    // The fresh reviewer (same stub id) is re-attached by the auto-redispatch.
+    expect(released.reviewer).not.toBeNull()
+  })
+
+  it('reconciles In testing ghost seats on restart alongside running workers', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskboard-restart-review-'))
+    const now = Date.now()
+    const ghostReview = {
+      id: 'ticket-restart-review',
+      title: 'ghost review after restart',
+      description: 'reviewer died with the old process',
+      column: 'in_testing',
+      priority: 'normal',
+      boardId: 'default',
+      type: 'feature',
+      status: 'claimed',
+      failure: null,
+      autoRetries: 0,
+      createdAt: now,
+      updatedAt: now,
+      position: 0,
+      assignee: { agentId: 'dev-agent-a', label: 'agent dev-agen' },
+      reviewer: { agentId: 'ghost-reviewer-session', label: 'reviewer ghost' },
+      reviewAttempts: 0,
+      lastReview: null,
+      reviewOutcome: null,
+      devNotes: 'implemented',
+      dependsOn: [],
+      history: [],
+    }
+    const masterBoard = {
+      boardId: 'default',
+      name: 'default',
+      workspaceId: '',
+      scope: 'project',
+      ownerSessionId: null,
+      masterAgentId: 'dev-agent-a',
+      masterClaimedAt: now,
+      handoverNotes: '',
+      masterHistory: [],
+      archivedAt: null,
+    }
+    await writeFile(
+      join(root, 'taskboard.json'),
+      JSON.stringify({
+        unit: { name: 'taskboard', version: 1 },
+        global: null,
+        tables: {
+          tickets: { [ghostReview.id]: ghostReview },
+          boards: { [masterBoard.boardId]: masterBoard },
+        },
+      }, null, 2),
+    )
+    const { service } = await harness({ root })
+    // The startup pass releases the ghost review seat (no live reviewer) and
+    // re-review is attempted through the live master.
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(ghostReview.id)
+      expect(current.history.some(row => row.kind === 'review-release')).toBe(true)
+    })
+    const current = await service.viewTicket(ghostReview.id)
+    expect(current.reviewer).not.toBeNull()
+  })
+
+  it('recoveries are reentry-safe: concurrent passes recover each card exactly once', async () => {
+    const { service, devA, unregisterWorker } = await harness({
+      workerSpawnIds: ['worker-child-agent', 'worker-child-reentry'],
+    })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'reentry card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    unregisterWorker()
+    // Two overlapping passes (startup scan racing a periodic tick) both see
+    // the loss; the guarded recovery lets exactly one land and the second
+    // pass sees the card already running with a live replacement.
+    const [first, second] = await Promise.all([
+      service.reconcileLostWorkers(),
+      service.reconcileLostWorkers(),
+    ])
+    expect(first + second).toBe(1)
+    const current = await service.viewTicket(card.id)
+    expect(current.autoRetries).toBe(1)
+    expect(current.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
+  })
+
+  it('coexists with the settlement reclamation: one recovery wins, one redispatch per card', async () => {
     // Order A: the settlement callback wins; the reconciliation then skips.
     let settleA!: (result: RunResultStub) => void
     const runA = new Promise<RunResultStub>((resolve) => { settleA = resolve })
-    const { service, devA, unregisterWorker } = await harness({ workerRunResult: runA })
+    const { service, devA, unregisterWorker } = await harness({
+      workerRunResults: [runA],
+      workerSpawnIds: ['worker-child-agent', 'worker-child-a'],
+    })
     await service.claimMaster('default', devA)
     const followup = vi.spyOn(devA, 'followup')
     const cardA = await createTicket(service, 'dual path A')
-    await toNotStarted(service, devA, cardA)
+    await scheduleToNotStarted(service, devA, cardA)
     await service.assign(devA, cardA.id)
     unregisterWorker()
     settleA({ output: [], stopReason: 'cancelled' })
     await vi.waitFor(async () => {
       const current = await service.viewTicket(cardA.id)
-      expect(current.status).toBe('blocked')
+      expect(current.status).toBe('running')
+      expect(current.autoRetries).toBe(1)
     })
+    // The reconciliation sees the card already recovered: nothing to do.
     expect(await service.reconcileLostWorkers()).toBe(0)
-    const blockedA = await service.viewTicket(cardA.id)
-    expect(blockedA.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    expect(blockedA.failure?.reason).toContain('worker terminated (cancelled)')
+    const recoveredA = await service.viewTicket(cardA.id)
+    expect(recoveredA.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
     expect(followup).toHaveBeenCalledTimes(1)
 
     // Order B: the reconciliation wins; the stale settlement callback skips.
     let settleB!: (result: RunResultStub) => void
     const runB = new Promise<RunResultStub>((resolve) => { settleB = resolve })
-    const { service: serviceB, devA: devAB, unregisterWorker: unregisterB } = await harness({ workerRunResult: runB })
+    const { service: serviceB, devA: devAB, unregisterWorker: unregisterB } = await harness({
+      workerRunResults: [runB],
+      workerSpawnIds: ['worker-child-agent', 'worker-child-b'],
+    })
     await serviceB.claimMaster('default', devAB)
     const cardB = await createTicket(serviceB, 'dual path B')
-    await toNotStarted(serviceB, devAB, cardB)
+    await scheduleToNotStarted(serviceB, devAB, cardB)
     await serviceB.assign(devAB, cardB.id)
+    // The spawned worker session vanishes; the reconciliation wins and
+    // auto-redispatches (the replacement 'worker-child-b' is registered).
     unregisterB()
     expect(await serviceB.reconcileLostWorkers()).toBe(1)
-    const blockedB = await serviceB.viewTicket(cardB.id)
-    expect(blockedB.status).toBe('blocked')
-    expect(blockedB.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    const recoveredB = await serviceB.viewTicket(cardB.id)
+    expect(recoveredB.status).toBe('running')
+    expect(recoveredB.autoRetries).toBe(1)
+    expect(recoveredB.workerSessionId).toBe('worker-child-b')
+    // The stale settlement callback for the dead session must not
+    // double-recover: the card now names the replacement worker.
     settleB({ output: [], stopReason: 'error' })
     await new Promise(resolve => setTimeout(resolve, 20))
     const againB = await serviceB.viewTicket(cardB.id)
-    expect(againB.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    expect(againB.failure?.reason).toBe('worker terminated (restart reconciliation)')
+    expect(againB.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
+    expect(againB.autoRetries).toBe(1)
+    expect(againB.workerSessionId).toBe('worker-child-b')
   })
 
   it('emits a forwarded change per mutation and a tombstone on removal', async () => {
@@ -702,27 +1212,31 @@ describe('TaskboardService workflow', () => {
     await expect(service.removeRemote(devA, { ticketId: ticket.id })).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
   })
 
-  it('claims a Not started ticket and enforces ownership and capacity', async () => {
+  it('claims a Not started ticket as the master and enforces ownership and capacity (V3-7)', async () => {
     const { service, devA, devB } = await harness()
+    await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'parallel one')
     await toNotStarted(service, devA, ticket)
     const claimed = await claimTicket(service, devA, ticket)
     expect(claimed.column).toBe('in_progress')
     expect(claimed.assignee?.agentId).toBe(devA.id)
     expect(claimed.status).toBe('claimed')
-    // A second agent cannot steal the claim.
-    await expect(claimTicket(service, devB, claimed)).rejects.toMatchObject({ code: 'TASKBOARD_ALREADY_CLAIMED' })
+    // A non-master cannot claim at all (claim is master-only since V3-7).
+    await expect(claimTicket(service, devB, claimed)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    // The master cannot re-claim an already-owned ticket.
+    await expect(claimTicket(service, devA, claimed)).rejects.toMatchObject({ code: 'TASKBOARD_ALREADY_CLAIMED' })
     // Capacity: with maxInProgress 2, two more claims exhaust the board.
     const second = await createTicket(service, 'parallel two')
     await toNotStarted(service, devA, second)
     const third = await createTicket(service, 'parallel three')
-    await toNotStarted(service, devB, third)
-    await claimTicket(service, devB, second)
+    await toNotStarted(service, devA, third)
+    await claimTicket(service, devA, second)
     await expect(claimTicket(service, devA, third)).rejects.toMatchObject({ code: 'TASKBOARD_CAPACITY_EXCEEDED' })
   })
 
   it('gates claims on dependency order', async () => {
     const { service, devA, reviewerChild } = await harness()
+    await service.claimMaster('default', devA)
     const base = await createTicket(service, 'base task')
     const dependent = await createTicket(service, 'dependent task', [base.id])
     await toNotStarted(service, devA, base)
@@ -737,6 +1251,7 @@ describe('TaskboardService workflow', () => {
 
   it('complete spawns a reviewer; the designated reviewer approves into Done', async () => {
     const { service, devA, reviewerChild, changes } = await harness()
+    await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'ship it')
     await toNotStarted(service, devA, ticket)
     const claimed = await claimTicket(service, devA, ticket)
@@ -754,6 +1269,7 @@ describe('TaskboardService workflow', () => {
 
   it('reject returns the ticket for rework with feedback, then a second round passes', async () => {
     const { service, devA, reviewerChild } = await harness()
+    await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'flaky feature')
     await toNotStarted(service, devA, ticket)
     const claimed = await claimTicket(service, devA, ticket)
@@ -773,6 +1289,7 @@ describe('TaskboardService workflow', () => {
 
   it('falls back to claimReview when the reviewer seam is unavailable', async () => {
     const { service, devA, devB } = await harness({ spawn: 'absent' })
+    await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'manual review')
     await toNotStarted(service, devA, ticket)
     const claimed = await claimTicket(service, devA, ticket)
@@ -787,6 +1304,7 @@ describe('TaskboardService workflow', () => {
 
   it('leaves the review seat empty when the reviewer spawn fails', async () => {
     const { service, devA, devB } = await harness({ spawn: 'fail' })
+    await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'fragile review')
     await toNotStarted(service, devA, ticket)
     const claimed = await claimTicket(service, devA, ticket)
@@ -1522,6 +2040,75 @@ describe('TaskboardService workflow', () => {
     expect(branchNameFor('abc12345def', 'ticket-xyz')).toBe('taskboard/abc12345/ticket-xyz')
   })
 
+  it('teaches the master workflow discipline: plan → phase scope → schedule → execute → numbered cards', () => {
+    // Requirement planning: every agreed requirement lands in Backlog as a card.
+    expect(MASTER_SECTION).toContain('Requirement planning')
+    expect(MASTER_SECTION).toContain('Backlog')
+    expect(MASTER_SECTION).toContain('taskboard_create')
+    // Phase scope: master and user agree what the phase covers and its stopping point.
+    expect(MASTER_SECTION).toContain('Phase scope')
+    expect(MASTER_SECTION).toContain('stopping point')
+    // Phase scheduling (V3-6): assign accepts Backlog and Not started, so the
+    // phase's cards can be dispatched straight from Backlog — no move is ever
+    // required before dispatch. Not started is the "next queue" display.
+    expect(MASTER_SECTION).toContain('Phase scheduling')
+    expect(MASTER_SECTION).toContain('taskboard_assign accepts Backlog and Not started')
+    expect(MASTER_SECTION).toContain('no move is ever required before dispatch')
+    expect(MASTER_SECTION).toContain('taskboard_move')
+    expect(MASTER_SECTION).toContain('next queue')
+    expect(MASTER_SECTION).toContain('user-scheduled')
+    // Execution discipline: dispatch from Backlog or Not started, never the
+    // working columns; stop when the phase is done.
+    expect(MASTER_SECTION).toContain('Execution discipline')
+    expect(MASTER_SECTION).toContain('dispatch from Backlog or Not started')
+    expect(MASTER_SECTION).toContain('never touch In progress')
+    expect(MASTER_SECTION).toContain('stop and wait')
+    // Card numbering: cards carry a number agreed at creation/discussion time.
+    expect(MASTER_SECTION).toContain('Card numbering')
+    expect(MASTER_SECTION).toContain('V3-1')
+    expect(MASTER_SECTION).toContain('every card carries a number')
+    // The workflow section no longer tells agents that Backlog → Not started is the
+    // user's "start this" drag signal; the master dispatches directly, and the
+    // user's drag keeps visual feedback while intent lives in the conversation.
+    expect(WORKFLOW_SECTION).not.toContain('Never move cards')
+    expect(WORKFLOW_SECTION).toContain('no move is needed before dispatch')
+    expect(WORKFLOW_SECTION).toContain('scheduling display for the next queue')
+    expect(WORKFLOW_SECTION).toContain('phase scope')
+    expect(WORKFLOW_SECTION).toContain('master')
+  })
+
+  it('teaches the master to adjudicate user-scheduled Not started cards', () => {
+    // The user scheduling a card into Not started wakes the master with a
+    // "user-scheduled" notice carrying the card facts and the adjudication rule.
+    expect(MASTER_SECTION).toContain('user-scheduled')
+    expect(MASTER_SECTION).toContain('Adjudicate whether to start it')
+    expect(MASTER_SECTION).toContain('dependsOn')
+    expect(MASTER_SECTION).toContain('filesScope')
+    // Dispatch when every dependency is Done and the In-progress cap allows.
+    expect(MASTER_SECTION).toContain('every dependency is Done')
+    expect(MASTER_SECTION).toContain('In-progress cap')
+    expect(MASTER_SECTION).toContain('taskboard_assign')
+    // Refusal leaves a trace: explain to the user and record it on the card.
+    expect(MASTER_SECTION).toContain('refusal reason')
+    expect(MASTER_SECTION).toContain('durable trace')
+  })
+
+  it('teaches the master-only claim rule in the workflow and master sections (V3-7)', () => {
+    // Claiming is the master's scheduling action: the workflow section no
+    // longer instructs every session to claim tickets on its own.
+    expect(WORKFLOW_SECTION).toContain('only the board\'s current master may call taskboard_claim')
+    expect(WORKFLOW_SECTION).toContain('Workers and reviewers never claim')
+    expect(WORKFLOW_SECTION).toContain('taskboard_assign (dispatch)')
+    expect(WORKFLOW_SECTION).toContain('taskboard_reassign (re-dispatch)')
+    // The old free-claim instruction is gone.
+    expect(WORKFLOW_SECTION).not.toContain('Claim a ticket with taskboard_claim')
+    // The master section names claim among the master-only scheduling tools.
+    expect(MASTER_SECTION).toContain('Claiming a Not started ticket (taskboard_claim) is your scheduling action')
+    expect(MASTER_SECTION).toContain('only the current master may claim')
+    expect(MASTER_SECTION).toContain('taskboard_assign (dispatch)')
+    expect(MASTER_SECTION).toContain('taskboard_reassign (re-dispatch)')
+  })
+
   it('writes and reads the declared filesScope on cards', async () => {
     const { service, devA } = await harness()
     // Declared at create: read back through the Remote surface and the view.
@@ -1629,6 +2216,172 @@ describe('TaskboardService workflow', () => {
     expect(plainPrompt).toContain('Declared file scope: (not declared)')
     expect(plainPrompt).not.toContain('stays inside the declared file scope')
   })
+
+  // ── V3-5: customizable worker/reviewer model + reasoning effort ──────────
+
+  it('spawns workers and reviewers with the configured model and effort in agentOptions (V3-5)', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({
+      workerModel: 'deepseek-v4-flash',
+      workerEffort: 'max',
+      reviewerModel: 'deepseek-v4-pro-max',
+      reviewerEffort: 'off',
+    })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'effort card')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    expect(workerCall[1].agentOptions).toEqual({ model: 'deepseek-v4-flash', reasoningEffort: 'max' })
+    await service.report(workerChild, ticket.id, 'implemented')
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    expect(reviewCall[1].agentOptions).toEqual({ model: 'deepseek-v4-pro-max', reasoningEffort: 'off' })
+  })
+
+  it('defaults reviewer model/effort along the worker knobs and omits effort when unset (V3-5)', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({ workerEffort: 'high' })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'default knobs')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    // Worker: the flash default model plus the configured high effort.
+    expect((subagentsStart.mock.calls[0] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+    // Reviewer: model and effort default along the worker knobs.
+    await service.report(workerChild, ticket.id, 'done')
+    expect((subagentsStart.mock.calls[1] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+    // Without any effort configured the spawn carries the model only; the
+    // child model's adapter default governs.
+    const bare = await harness()
+    await bare.service.claimMaster('default', bare.devA)
+    const plain = await createTicket(bare.service, 'no effort')
+    await toNotStarted(bare.service, bare.devA, plain)
+    await bare.service.assign(bare.devA, plain.id)
+    expect((bare.subagentsStart.mock.calls[0] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'deepseek-v4-flash' })
+  })
+
+  it('falls back to the adapter default when a configured effort is not a deepseek level (V3-5)', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({
+      workerEffort: 'bogus',
+      reviewerEffort: 'ultra',
+      workerModel: 'deepseek-v4-flash',
+    })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'invalid effort')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    expect((subagentsStart.mock.calls[0] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'deepseek-v4-flash' })
+    await service.report(workerChild, ticket.id, 'done')
+    expect((subagentsStart.mock.calls[1] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'deepseek-v4-flash' })
+    // An invalid reviewerEffort falls back to the (valid) workerEffort.
+    const fb = await harness({ workerEffort: 'max', reviewerEffort: 'bogus' })
+    await fb.service.claimMaster('default', fb.devA)
+    const card = await createTicket(fb.service, 'fallback reviewer')
+    await toNotStarted(fb.service, fb.devA, card)
+    await fb.service.assign(fb.devA, card.id)
+    await fb.service.report(fb.workerChild, card.id, 'done')
+    const reviewCall = fb.subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    expect(reviewCall[1].agentOptions?.reasoningEffort).toBe('max')
+  })
+
+  it('board modelConfig overrides the host worker/reviewer model+effort per board (V3-5)', async () => {
+    const { ctx, service, devA, workerChild, subagentsStart } = await harness({
+      workerModel: 'host-flash',
+      workerEffort: 'high',
+    })
+    await service.claimMaster('default', devA)
+    const result = await ctx.tools.execute({
+      callId: CallId('tool-board-config'),
+      name: 'taskboard_board_config',
+      arguments: { workerModel: 'board-model', workerEffort: 'off', reviewerModel: 'board-reviewer', reviewerEffort: 'max' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(result.isError).toBe(false)
+    const rendered = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+    expect(rendered).toContain('board-model')
+    const ticket = await createTicket(service, 'board override')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    expect(workerCall[1].agentOptions).toEqual({ model: 'board-model', reasoningEffort: 'off' })
+    await service.report(workerChild, ticket.id, 'done')
+    const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+    expect(reviewCall[1].agentOptions).toEqual({ model: 'board-reviewer', reasoningEffort: 'max' })
+  })
+
+  it('a partial board modelConfig inherits host knobs; "" clears an override; bad effort is rejected (V3-5)', async () => {
+    const { ctx, service, devA, devB, subagentsStart } = await harness({ workerModel: 'host-flash', workerEffort: 'max' })
+    await service.claimMaster('default', devA)
+    // Set only the worker model: the effort and the reviewer knobs inherit the host config.
+    await ctx.tools.execute({
+      callId: CallId('bc-partial'), name: 'taskboard_board_config',
+      arguments: { workerModel: 'board-model' }, agent: devA, signal: new AbortController().signal,
+    })
+    const ticket = await createTicket(service, 'partial override')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    expect((subagentsStart.mock.calls[0] as [string, SubagentStartRequest])[1].agentOptions)
+      .toEqual({ model: 'board-model', reasoningEffort: 'max' })
+    // Clearing the worker model restores the host model.
+    await ctx.tools.execute({
+      callId: CallId('bc-clear'), name: 'taskboard_board_config',
+      arguments: { workerModel: '' }, agent: devA, signal: new AbortController().signal,
+    })
+    const card2 = await createTicket(service, 'cleared override')
+    await toNotStarted(service, devA, card2)
+    await service.assign(devA, card2.id)
+    expect((subagentsStart.mock.calls[1] as [string, SubagentStartRequest])[1].agentOptions?.model).toBe('host-flash')
+    // An invalid effort is rejected loudly by the master tool.
+    const denied = await ctx.tools.execute({
+      callId: CallId('bc-bad'), name: 'taskboard_board_config',
+      arguments: { workerEffort: 'ludicrous' }, agent: devA, signal: new AbortController().signal,
+    })
+    expect(denied.isError).toBe(true)
+    expect((denied as { error: { message: string } }).error.message).toContain('off|high|max')
+    // A non-master cannot configure the board.
+    const nonMaster = await ctx.tools.execute({
+      callId: CallId('bc-non-master'), name: 'taskboard_board_config',
+      arguments: { workerModel: 'nope' }, agent: devB, signal: new AbortController().signal,
+    })
+    expect(nonMaster.isError).toBe(true)
+    expect((nonMaster as { error: { message: string } }).error.message).toContain('master')
+  })
+
+  it('omits the reasoning effort and records a downgrade when the provider lacks the effort capability (V3-5)', async () => {
+    const { service, devA, subagentsStart } = await harness({
+      workerEffort: 'max',
+      providerCapabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true, effort: false },
+    })
+    await service.claimMaster('default', devA)
+    const ticket = await createTicket(service, 'downgrade card')
+    await toNotStarted(service, devA, ticket)
+    await service.assign(devA, ticket.id)
+    const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    // The model still flows; the unsupported effort is dropped (downgrade).
+    expect(workerCall[1].agentOptions).toEqual({ model: 'deepseek-v4-flash' })
+    // The downgrade is recorded on the card history.
+    const updated = await service.viewTicket(ticket.id)
+    expect(updated.history.some(row => row.kind === 'model-effort-downgrade' && row.detail.includes('max'))).toBe(true)
+  })
+
+  it('writes the masterModel/masterEffort informational suggestion into the master prompt (V3-5)', async () => {
+    const { ctx } = await harness({ masterEffort: 'high' })
+    const assembly = await ctx.systemPrompt.assemble({})
+    const master = assembly.sections.find(section => section.name === 'taskboard:master')
+    expect(master?.text).toContain('Model preset suggestion (new sessions)')
+    expect(master?.text).toContain('deepseek-v4-pro-max')
+    expect(master?.text).toContain('reasoning effort "high"')
+    expect(master?.text).toContain('authoritative')
+    // Without a configured master effort the note names only the model.
+    const bare = masterModelNote('deepseek-v4-pro-max', undefined)
+    expect(bare).not.toContain('reasoning effort')
+    // The static master section itself is untouched (existing tests cover it).
+    expect(master?.text).toContain('Taskboard master')
+  })
 })
 
 it('hands over the master seat with structured notes and continues cross-session', async () => {
@@ -1712,7 +2465,7 @@ it('notifies the master inbox when a worker reports and when a verdict lands', a
   await service.claimMaster('default', devA)
   const followup = vi.spyOn(devA, 'followup')
   const card = await createTicket(service, 'notice card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
 
   // Worker reports done: the master's inbox receives the adjudicate notice.
@@ -1741,7 +2494,7 @@ it('notifies the master inbox when a worker reports failure', async () => {
   await service.claimMaster('default', devA)
   const followup = vi.spyOn(devA, 'followup')
   const card = await createTicket(service, 'doomed card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   const blocked = await service.fail(workerChild, card.id, 'dependency is down')
   expect(blocked.status).toBe('blocked')
@@ -1752,25 +2505,90 @@ it('notifies the master inbox when a worker reports failure', async () => {
   expect(textOf(message)).toContain('taskboard_reassign')
 })
 
+it('notifies the master inbox when the user schedules a card into Not started', async () => {
+  const { service, devA } = await harness()
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  // A dependency that is already Done: the notice reports "all Done".
+  const dep = await createTicket(service, 'dependency done')
+  await service.moveRemote(devA, { ticketId: dep.id, column: 'done', beforeTicketId: null, afterTicketId: null })
+  const card = await createTicket(service, 'scheduled card', [dep.id])
+  await service.moveRemote(devA, { ticketId: card.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+  expect(followup).toHaveBeenCalledTimes(1)
+  const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
+  expect(message.source.kind).toBe('taskboard')
+  expect(message.source.boardId).toBe('default')
+  const text = textOf(message)
+  expect(text).toContain('user scheduled ticket ' + card.id)
+  expect(text).toContain('scheduled card')
+  expect(text).toContain('priority normal')
+  expect(text).toContain('type feature')
+  expect(text).toContain('dependsOn')
+  expect(text).toContain('all Done')
+  expect(text).toContain('filesScope')
+  expect(text).toContain('taskboard_assign')
+  // The durable board notice records the same event for cold reads.
+  const snapshot = await service.snapshot(devA)
+  expect(snapshot.notices).toHaveLength(1)
+  expect(snapshot.notices![0]).toMatchObject({ kind: 'user-scheduled', ticketId: card.id })
+  expect(snapshot.notices![0]!.text).toContain(card.id)
+
+  // A card whose dependency is still pending reports NOT all Done and names it.
+  const depPending = await createTicket(service, 'dependency pending')
+  const blocked = await createTicket(service, 'blocked scheduled', [depPending.id])
+  await service.moveRemote(devA, { ticketId: blocked.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+  expect(followup.mock.calls.length).toBe(2)
+  const secondMessage = followup.mock.calls[1]![0] as {
+    content: { type: string; text: string }[]
+    source: { kind: string; boardId: string }
+  }
+  const second = textOf(secondMessage)
+  expect(second).toContain('NOT all Done')
+  expect(second).toContain(depPending.id)
+})
+
+it("does not re-notify on the master's own move, a repeated move, or a card returning from In progress", async () => {
+  const { service, devA } = await harness()
+  await service.claimMaster('default', devA)
+  const followup = vi.spyOn(devA, 'followup')
+  // Master-origin scheduling (the taskboard_move tool) never notifies: the
+  // master already knows it scheduled the card.
+  const masterCard = await createTicket(service, 'master scheduled')
+  await service.moveAsMaster(devA, { ticketId: masterCard.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+  expect(followup).not.toHaveBeenCalled()
+  // A user-origin schedule notifies exactly once; dragging the same card
+  // within Not started does not re-notify.
+  const card = await createTicket(service, 'user scheduled')
+  await toNotStarted(service, devA, card)
+  expect(followup).toHaveBeenCalledTimes(1)
+  await toNotStarted(service, devA, card)
+  expect(followup).toHaveBeenCalledTimes(1)
+  // A card returning from In progress to Not started (reassign backlog) is
+  // not a fresh user schedule either.
+  await service.assign(devA, card.id)
+  await service.moveRemote(devA, { ticketId: card.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
+  expect(followup).toHaveBeenCalledTimes(1)
+})
+
 it('notifies the master when a worker run terminates without reporting', async () => {
   let settle!: (result: RunResultStub) => void
   const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
-  const { service, devA } = await harness({ workerRunResult: runResult })
+  const { service, devA } = await harness({ workerRunResults: [runResult] })
   await service.claimMaster('default', devA)
   const followup = vi.spyOn(devA, 'followup')
   const card = await createTicket(service, 'silent worker')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   settle({ output: [], stopReason: 'aborted' })
   await vi.waitFor(async () => {
     const current = await service.viewTicket(card.id)
-    expect(current.status).toBe('blocked')
+    expect(current.autoRetries).toBe(1)
   })
   expect(followup).toHaveBeenCalledTimes(1)
   const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
   expect(message.source.kind).toBe('taskboard')
-  expect(textOf(message)).toContain('terminated without reporting')
-  expect(textOf(message)).toContain('taskboard_reassign')
+  expect(textOf(message)).toContain('lost')
+  expect(textOf(message)).toContain('auto-redispatched')
 })
 
 it('skips the master notice while the seat is vacant', async () => {
@@ -1807,7 +2625,7 @@ it('queues a master notice into the persisted session inbox when the master is a
   const { service, devA, workerChild, unregisterMaster } = await harness({ sessionPersistence: persistence })
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'persistent notice card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   // The master session leaves the live registry (host restart): the live
   // followup path cannot reach it, so the notice must be queued durably.
@@ -1843,7 +2661,7 @@ it('records durable board notices readable via the claim result and the taskboar
   const { ctx, service, devA, workerChild } = await harness()
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'notice trail card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   await service.fail(workerChild, card.id, 'crashed')
   // The in-board fallback record carries the event with its stable kind.
@@ -1876,9 +2694,9 @@ it('dedupes repeated notices for the same ticket and kind inside the window and 
   await service.claimMaster('default', devA)
   const followup = vi.spyOn(devA, 'followup')
   const card = await createTicket(service, 'dedupe card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
-  // First loss: one 'worker-lost' notice reaches the master.
+  // First loss: one 'worker-redispatched' notice reaches the master.
   unregisterWorker()
   expect(await service.reconcileLostWorkers()).toBe(1)
   expect(followup).toHaveBeenCalledTimes(1)
@@ -1909,7 +2727,7 @@ it('never fails the triggering mutation when the notification path breaks', asyn
   const { service, devA, workerChild, unregisterMaster } = await harness({ sessionPersistence: persistence })
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'resilient card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   unregisterMaster()
   const blocked = await service.fail(workerChild, card.id, 'boom')
@@ -1926,7 +2744,7 @@ it('records a notice even when no persistence backend is configured (board-only 
   const ghost = stubAgent('ghost-master')
   await service.claimMaster('default', ghost)
   const card = await createTicket(service, 'board fallback card')
-  await toNotStarted(service, ghost, card)
+  await scheduleToNotStarted(service, ghost, card)
   await service.assign(ghost, card.id)
   // The master is not live and no persistence backend exists: the notice
   // still lands on the board for later reads.
@@ -1976,6 +2794,73 @@ it('executes the taskboard_handover tool as the master and releases the seat', a
   // The rendered content reflects the released seat.
   const rendered = result.content.map(block => block.type === 'text' ? block.text : '').join('')
   expect(rendered).toContain('released with structured handover notes')
+})
+
+it('executes the taskboard_pause tool as the master and rejects a non-master', async () => {
+  const { ctx, service, devA, devB, workerSignals } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'tool pause card')
+  await scheduleToNotStarted(service, devA, card)
+  await service.assign(devA, card.id)
+
+  const result = await ctx.tools.execute({
+    callId: CallId('tool-pause'),
+    name: 'taskboard_pause',
+    arguments: { ticketId: card.id, reason: 'tool-level pause' },
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(result.isError).toBe(false)
+  const value = (result as { value: { id: string; status: string } }).value
+  expect(value.id).toBe(card.id)
+  expect(value.status).toBe('paused')
+  expect(workerSignals[0]!.aborted).toBe(true)
+  const rendered = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+  expect(rendered).toContain('paused')
+
+  // A non-master is rejected through the same tool.
+  const denied = await ctx.tools.execute({
+    callId: CallId('tool-pause-denied'),
+    name: 'taskboard_pause',
+    arguments: { ticketId: card.id, reason: 'not the master' },
+    agent: devB,
+    signal: new AbortController().signal,
+  })
+  expect(denied.isError).toBe(true)
+  expect((denied as { error: { message: string } }).error.message).toContain('master')
+})
+
+it('executes the taskboard_claim tool as the master and rejects a non-master (V3-7)', async () => {
+  const { ctx, service, devA, devB } = await harness()
+  await service.claimMaster('default', devA)
+  const card = await createTicket(service, 'tool claim card')
+  await toNotStarted(service, devA, card)
+
+  // A non-master is rejected through the tool.
+  const denied = await ctx.tools.execute({
+    callId: CallId('tool-claim-denied'),
+    name: 'taskboard_claim',
+    arguments: { ticketId: card.id },
+    agent: devB,
+    signal: new AbortController().signal,
+  })
+  expect(denied.isError).toBe(true)
+  expect((denied as { error: { message: string } }).error.message).toContain('master')
+
+  // The master claims through the same tool.
+  const result = await ctx.tools.execute({
+    callId: CallId('tool-claim'),
+    name: 'taskboard_claim',
+    arguments: { ticketId: card.id },
+    agent: devA,
+    signal: new AbortController().signal,
+  })
+  expect(result.isError).toBe(false)
+  const value = (result as { value: { id: string; column: string } }).value
+  expect(value.id).toBe(card.id)
+  expect(value.column).toBe('in_progress')
+  const rendered = result.content.map(block => block.type === 'text' ? block.text : '').join('')
+  expect(rendered).toContain('claimed')
 })
 
 it('rejects the taskboard_assign tool for a subagent-origin caller', async () => {
@@ -2034,7 +2919,7 @@ it('keeps report and fail alive when the master notice delivery throws', async (
   // A throwing notification must not rob the card of its reviewer: the
   // reviewer is spawned before the notice and the notice fault is swallowed.
   const card = await createTicket(service, 'notice storm card')
-  await toNotStarted(service, devA, card)
+  await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
   const reported = await service.report(workerChild, card.id, 'implemented')
   expect(reported.review).toBe('spawned')
@@ -2042,7 +2927,7 @@ it('keeps report and fail alive when the master notice delivery throws', async (
   expect(followup).toHaveBeenCalledTimes(1)
   // fail() must land the blocked mutation even when its notice throws.
   const doomed = await createTicket(service, 'notice storm doomed')
-  await toNotStarted(service, devA, doomed)
+  await scheduleToNotStarted(service, devA, doomed)
   await service.assign(devA, doomed.id)
   const blocked = await service.fail(workerChild, doomed.id, 'dependency is down')
   expect(blocked.status).toBe('blocked')
@@ -2103,7 +2988,7 @@ it('returns the current state for repeated fail and repeated report by the same 
 it('downgrades unsupported reviewer capabilities instead of failing the spawn', async () => {
   const { service, devA, workerChild, subagentsStart } = await harness({
     reviewMode: 'report',
-    providerCapabilities: { outputSchema: false, depthLimit: true, toolFilter: false, persona: false },
+    providerCapabilities: { outputSchema: false, depthLimit: true, toolFilter: false, persona: false, effort: false },
   })
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'capability downgrade card')
@@ -2130,7 +3015,7 @@ it('builds handover notes covering every card state and the empty history', () =
   const at = 1000
   const base: TicketView = {
     id: 'ticket-x', title: 'x', description: 'x', column: 'backlog', priority: 'normal',
-    boardId: 'default', type: 'feature', status: 'ready', failure: null,
+    boardId: 'default', type: 'feature', status: 'ready', failure: null, autoRetries: 0,
     createdAt: at, updatedAt: at, position: 0, assignee: null, reviewer: null,
     reviewAttempts: 0, lastReview: null, reviewOutcome: null, devNotes: '',
     targetBranch: '', filesScope: '', dependsOn: [], history: [],

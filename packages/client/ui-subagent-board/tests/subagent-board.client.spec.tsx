@@ -31,6 +31,7 @@ function ticket(overrides: Partial<TicketView> = {}): TicketView {
     status: 'claimed',
     failure: null,
     reviewOutcome: null,
+    autoRetries: 0,
     createdAt: 1,
     updatedAt: 1,
     position: 0,

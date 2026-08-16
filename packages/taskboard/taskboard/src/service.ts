@@ -14,11 +14,11 @@ import { basename } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   defineDomain, DomainError, domainTable,
@@ -32,15 +32,16 @@ import {
   TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
 import type {
-  ArchiveBoardRequest, BoardNotice, BoardSnapshot, BoardView, ColumnId, CreateBoardRequest,
-  CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MoveTicketRequest, Priority,
-  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, TaskboardChanged,
-  TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView, TicketWorkerStatus,
+  ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardSnapshot, BoardView, ColumnId,
+  CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry,
+  MoveTicketRequest, Priority, RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest,
+  TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView,
+  TicketWorkerStatus,
 } from './types.ts'
 import {
   agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildReviewPrompt,
-  buildReviewReportPrompt, buildWorkerPrompt, MASTER_SECTION, reviewerLabel, TaskboardError,
-  WORKFLOW_SECTION,
+  buildReviewReportPrompt, buildWorkerPrompt, MASTER_SECTION, masterModelNote, reviewerLabel,
+  TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 
 /** The single stored ticket shape; validated at the durable boundary. */
@@ -56,6 +57,7 @@ const ticketSchema = zod.object({
   workerAgentId: zod.string().optional(),
   workerSessionId: zod.string().optional(),
   failure: zod.object({ reason: zod.string(), at: zod.number() }).nullable().default(null),
+  autoRetries: zod.number().int().min(0).default(0),
   createdAt: zod.number(),
   updatedAt: zod.number(),
   position: zod.number(),
@@ -117,6 +119,15 @@ const boardSchema = zod.object({
     at: zod.number(),
     ticketId: zod.string(),
   })).default([]),
+  // V3-5: per-board worker/reviewer model+effort overrides. Defaults to an
+  // empty object so legacy records without the field keep host-config
+  // governance over every spawn.
+  modelConfig: zod.object({
+    workerModel: zod.string().optional(),
+    workerEffort: zod.string().optional(),
+    reviewerModel: zod.string().optional(),
+    reviewerEffort: zod.string().optional(),
+  }).default({}),
   archivedAt: zod.number().nullable().default(null),
 })
 
@@ -153,6 +164,10 @@ const NOTICE_KIND = {
   workerFailed: 'worker-failed',
   workerTerminated: 'worker-terminated',
   workerLost: 'worker-lost',
+  workerRedispatched: 'worker-redispatched',
+  reviewerReleased: 'reviewer-released',
+  userScheduled: 'user-scheduled',
+  workerPaused: 'worker-paused',
 } as const
 
 /**
@@ -237,8 +252,26 @@ export interface Config {
   reviewProvider?: string
   /** Model id for the master session (informational knob; the session's own model is authoritative). */
   masterModel?: string
-  /** Model id used for every spawned worker and reviewer child. */
+  /**
+   * Reasoning effort suggested for a NEW master session (informational knob;
+   * the session's own model and effort are authoritative). Omitted effort
+   * leaves the session's adapter default. Written into the master prompt as
+   * a suggestion; a value outside the deepseek vocabulary (off/high/max)
+   * falls back to unset.
+   */
+  masterEffort?: string
+  /** Model id used for every spawned worker child (default deepseek-v4-flash). */
   workerModel?: string
+  /**
+   * Reasoning effort for every spawned worker child (default unset: the
+   * child model's adapter default applies, e.g. deepseek "high"). A value
+   * outside the deepseek vocabulary (off/high/max) falls back to unset.
+   */
+  workerEffort?: string
+  /** Model id used for every spawned reviewer child; defaults to the workerModel. */
+  reviewerModel?: string
+  /** Reasoning effort for every spawned reviewer child; defaults to the workerEffort. */
+  reviewerEffort?: string
   /** Subagent provider name used to spawn worker agents. */
   workerProvider?: string
   /** Master seat lease in milliseconds; a stale seat can be preempted. */
@@ -258,6 +291,30 @@ export interface Config {
    * delivers nothing (0 disables dedupe). Defaults to 10000.
    */
   noticeDedupeWindowMs?: number
+  /**
+   * How long a worker session that is still registered may sit idle (no
+   * running tool, no session activity) before the liveness reconciliation
+   * judges it lost and auto-redispatches a replacement (0 disables the
+   * idle-staleness arm; a session absent from the registry is always lost
+   * immediately). Defaults to 600000 (10 minutes).
+   */
+  lostWorkerTimeoutMs?: number
+  /**
+   * Per-card automatic worker redispatch cap: how many times the liveness
+   * reconciliation may auto-redispatch one card's lost worker before giving
+   * up and marking the card blocked with a master notice (0 disables
+   * auto-redispatch entirely — the card is blocked on the first loss, the
+   * V3-13 behavior). Defaults to 2.
+   */
+  workerAutoRetryLimit?: number
+  /**
+   * How long an In testing card may sit with a reviewer seat and no
+   * reviewOutcome before the reviewer-staleness reconciliation releases the
+   * seat and auto-redispatches a fresh reviewer (0 disables reviewer
+   * staleness; a reviewer session absent from the registry is always
+   * released immediately). Defaults to 900000 (15 minutes).
+   */
+  reviewerStaleTimeoutMs?: number
 }
 
 /** Schemastery configuration for the taskboard consumer. */
@@ -265,23 +322,31 @@ export const Config: z<Config> = z.object({
   maxInProgress: z.number().default(4),
   reviewProvider: z.string().default('spawn'),
   masterModel: z.string().default('deepseek-v4-pro-max'),
+  masterEffort: z.string(),
   workerModel: z.string().default('deepseek-v4-flash'),
+  workerEffort: z.string(),
+  reviewerModel: z.string(),
+  reviewerEffort: z.string(),
   workerProvider: z.string().default('spawn'),
   masterSeatTimeoutMs: z.number().default(900000),
   reviewMode: z.union(['report', 'direct'] as const).default('report'),
   reconcileIntervalMs: z.number().default(60000),
   noticeDedupeWindowMs: z.number().default(10000),
+  lostWorkerTimeoutMs: z.number().default(600000),
+  workerAutoRetryLimit: z.number().default(2),
+  reviewerStaleTimeoutMs: z.number().default(900000),
 })
 
-/** One worker-spawn outcome. */
+/** One worker-spawn outcome. The controller owns the request signal; the
+ * caller keeps it so a later taskboard_pause can abort the in-flight run. */
 export type WorkerSpawnResult =
-  | { ok: true; sessionId: string; run: SubagentRun }
+  | { ok: true; sessionId: string; run: SubagentRun; controller: AbortController }
   | { ok: false; reason: 'unavailable' }
   | { ok: false; reason: 'failed'; errorMessage: string }
 
-/** One reviewer-spawn outcome. */
+/** One reviewer-spawn outcome. The controller owns the request signal. */
 export type ReviewSpawnResult =
-  | { spawned: true; reviewer: TicketAssignee; run: SubagentRun }
+  | { spawned: true; reviewer: TicketAssignee; run: SubagentRun; controller: AbortController }
   | { spawned: false; reason: 'unavailable' }
   | { spawned: false; reason: 'failed'; errorMessage: string }
 
@@ -362,6 +427,22 @@ function resolveMasterSeatTimeout(value: number): number {
   return value
 }
 
+/** The reasoning-effort vocabulary the deepseek family of models accepts (see llm-deepseek). */
+const EFFORT_LEVELS = ['off', 'high', 'max'] as const
+
+/**
+ * Resolve one reasoning-effort knob. Absent means unset (the child model's
+ * adapter default applies, e.g. deepseek "high"); a value outside the
+ * deepseek vocabulary is an invalid config and falls back to unset (V3-5
+ * "非法值回退默认") rather than failing the whole plugin load.
+ * @param value - the configured effort value, if any.
+ * @returns the accepted level, or undefined for absent/invalid values.
+ */
+function resolveEffort(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  return (EFFORT_LEVELS as readonly string[]).includes(value) ? value : undefined
+}
+
 /** Validate one explicit worker-liveness reconciliation interval (0 disables the periodic scan). */
 function resolveReconcileInterval(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
@@ -374,6 +455,30 @@ function resolveReconcileInterval(value: number): number {
 function resolveNoticeDedupeWindow(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error('taskboard: noticeDedupeWindowMs must be a non-negative safe integer')
+  }
+  return value
+}
+
+/** Validate one explicit idle-staleness timeout (0 disables the idle arm). */
+function resolveLostWorkerTimeout(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: lostWorkerTimeoutMs must be a non-negative safe integer')
+  }
+  return value
+}
+
+/** Validate one explicit per-card auto-redispatch cap (0 disables auto-redispatch). */
+function resolveWorkerAutoRetryLimit(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: workerAutoRetryLimit must be a non-negative safe integer')
+  }
+  return value
+}
+
+/** Validate one explicit reviewer-staleness timeout (0 disables reviewer staleness). */
+function resolveReviewerStaleTimeout(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: reviewerStaleTimeoutMs must be a non-negative safe integer')
   }
   return value
 }
@@ -433,27 +538,62 @@ export class TaskboardService extends TypertRemoteService {
     maxInProgress: number
     reviewProvider: string
     masterModel: string
+    masterEffort: string | undefined
     workerModel: string
+    workerEffort: string | undefined
+    reviewerModel: string
+    reviewerEffort: string | undefined
     workerProvider: string
     masterSeatTimeoutMs: number
     reviewMode: 'report' | 'direct'
     reconcileIntervalMs: number
     noticeDedupeWindowMs: number
+    lostWorkerTimeoutMs: number
+    workerAutoRetryLimit: number
+    reviewerStaleTimeoutMs: number
   }
   private readonly domain: Promise<Domain<typeof TASKBOARD_DOMAIN>>
 
+  /**
+   * One in-flight spawned run plus the abort controller owning its request
+   * signal, keyed by ticket id (V3-16): the board-level pause verb aborts the
+   * current worker's run through this handle, and every settle/close path
+   * clears the entry so a settled or removed card never leaks a handle.
+   */
+  private readonly runHandles = new Map<string, { run: SubagentRun; controller: AbortController }>()
+
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'taskboard')
+    // Reviewer knobs default along the worker knobs: an unset reviewerModel
+    // inherits the workerModel, an unset reviewerEffort the workerEffort.
+    const workerEffort = resolveEffort(config.workerEffort)
+    const workerModel = config.workerModel ?? 'deepseek-v4-flash'
     this.resolved = {
       maxInProgress: resolveMaxInProgress(config.maxInProgress ?? 4),
       reviewProvider: config.reviewProvider ?? 'spawn',
       masterModel: config.masterModel ?? 'deepseek-v4-pro-max',
-      workerModel: config.workerModel ?? 'deepseek-v4-flash',
+      masterEffort: resolveEffort(config.masterEffort),
+      workerModel,
+      workerEffort,
+      reviewerModel: config.reviewerModel ?? workerModel,
+      reviewerEffort: resolveEffort(config.reviewerEffort) ?? workerEffort,
       workerProvider: config.workerProvider ?? 'spawn',
       masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
       reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
       reconcileIntervalMs: resolveReconcileInterval(config.reconcileIntervalMs ?? 60000),
       noticeDedupeWindowMs: resolveNoticeDedupeWindow(config.noticeDedupeWindowMs ?? 10000),
+      lostWorkerTimeoutMs: resolveLostWorkerTimeout(config.lostWorkerTimeoutMs ?? 600000),
+      workerAutoRetryLimit: resolveWorkerAutoRetryLimit(config.workerAutoRetryLimit ?? 2),
+      reviewerStaleTimeoutMs: resolveReviewerStaleTimeout(config.reviewerStaleTimeoutMs ?? 900000),
+    }
+    if (config.workerEffort !== undefined && this.resolved.workerEffort === undefined) {
+      ctx.logger.warn('taskboard: workerEffort "' + config.workerEffort + '" is not a supported effort level (off|high|max); falling back to the adapter default')
+    }
+    if (config.reviewerEffort !== undefined && this.resolved.reviewerEffort === undefined) {
+      ctx.logger.warn('taskboard: reviewerEffort "' + config.reviewerEffort + '" is not a supported effort level (off|high|max); falling back to the worker effort / adapter default')
+    }
+    if (config.masterEffort !== undefined && this.resolved.masterEffort === undefined) {
+      ctx.logger.warn('taskboard: masterEffort "' + config.masterEffort + '" is not a supported effort level (off|high|max); leaving the suggestion unset')
     }
     this.domain = ctx.storageDomain.open(TASKBOARD_DOMAIN)
     // The open races shutdown when the host unmounts before it resolves;
@@ -470,14 +610,32 @@ export class TaskboardService extends TypertRemoteService {
       }
     }, 'taskboard: domain lifetime')
     ctx.effect(() => {
-      // Worker-liveness reconciliation. The startup scan runs once, as soon
-      // as the domain is open (a host restart drops the in-memory run
-      // settlement callbacks, so cards whose worker died with the previous
-      // process would otherwise hang In progress forever); the periodic scan
-      // then repeats at the configured interval (0 disables it). Each pass is
-      // deferred one macrotask so boot-time session registration (the root /
-      // master sessions) settles before liveness is judged.
-      const run = () => { void this.reconcileLostWorkers().catch(() => {}) }
+      // Seat self-healing reconciliation (worker + reviewer staleness). The
+      // startup scan runs once, as soon as the domain is open (a host restart
+      // drops the in-memory run settlement callbacks, so cards whose worker
+      // died with the previous process would otherwise hang In progress
+      // forever); the periodic scan then repeats at the configured interval
+      // (0 disables it). Each pass is deferred one macrotask so boot-time
+      // session registration (the root / master sessions) settles before
+      // liveness is judged. The in-flight guard prevents reentry: a slow pass
+      // (spawning replacement workers) never overlaps a second pass, so one
+      // card is never recovered twice concurrently.
+      let inFlight = false
+      const run = () => {
+        if (inFlight) return
+        inFlight = true
+        void (async () => {
+          try {
+            await this.reconcileLostWorkers()
+            await this.reconcileStaleReviewers()
+          } catch {
+            // A recovery fault must never take the scanner down; the next
+            // tick retries.
+          } finally {
+            inFlight = false
+          }
+        })()
+      }
       void this.domain.then(() => { setTimeout(run, 0) }).catch(() => {})
       const timer = this.resolved.reconcileIntervalMs > 0
         ? setInterval(run, this.resolved.reconcileIntervalMs)
@@ -485,8 +643,11 @@ export class TaskboardService extends TypertRemoteService {
       return () => {
         if (timer !== undefined) clearInterval(timer)
       }
-    }, 'taskboard: worker liveness reconciliation')
-    ctx.systemPrompt.section({ name: 'taskboard:master', order: 149, text: MASTER_SECTION })
+    }, 'taskboard: seat self-healing reconciliation')
+    // The master section carries the informational model-preset suggestion
+    // (V3-5): the session's own model/effort stay authoritative; the note only
+    // recommends a preset for new sessions and points at taskboard_board_config.
+    ctx.systemPrompt.section({ name: 'taskboard:master', order: 149, text: MASTER_SECTION + masterModelNote(this.resolved.masterModel, this.resolved.masterEffort) })
     ctx.systemPrompt.section({ name: 'taskboard:workflow', order: 150, text: WORKFLOW_SECTION })
     this.registerTools()
   }
@@ -496,9 +657,79 @@ export class TaskboardService extends TypertRemoteService {
     return (await this.domain).table('tickets')
   }
 
+  /**
+   * Drop one card's run handle when its recorded run settles or the card
+   * leaves the in-flight state. Identity-checked: a handle replaced by a
+   * newer run for the same card (e.g. an auto-redispatched worker) survives
+   * the older run's settlement.
+   */
+  private clearRunHandle(ticketId: string, sessionId: string): void {
+    const handle = this.runHandles.get(ticketId)
+    if (handle !== undefined && handle.run.id === sessionId) this.runHandles.delete(ticketId)
+  }
+
   /** Resolve the opened boards table. */
   private async boards(): Promise<KvTable<string, BoardView>> {
     return (await this.domain).table('boards')
+  }
+
+  /**
+   * The effective worker/reviewer model+effort for one board: the board's
+   * modelConfig overrides the host config field by field, and a stored
+   * effort outside the deepseek vocabulary falls back to the host config
+   * (then to the adapter default). Board-level effort values are validated
+   * here so a corrupted/out-of-band record degrades instead of failing.
+   * @param boardId - the board whose spawns are being resolved.
+   */
+  private async effectiveModelConfig(boardId: string): Promise<{
+    workerModel: string
+    workerEffort: string | undefined
+    reviewerModel: string
+    reviewerEffort: string | undefined
+  }> {
+    const table = await this.boards()
+    const board = table.get(boardId)
+    const override: BoardModelConfig | undefined = board?.modelConfig
+    return {
+      workerModel: override?.workerModel ?? this.resolved.workerModel,
+      workerEffort: resolveEffort(override?.workerEffort) ?? this.resolved.workerEffort,
+      reviewerModel: override?.reviewerModel ?? this.resolved.reviewerModel,
+      reviewerEffort: resolveEffort(override?.reviewerEffort) ?? this.resolved.reviewerEffort,
+    }
+  }
+
+  /**
+   * Build the agentOptions for one spawned child: the model plus the
+   * reasoning effort when one is configured AND the provider advertises the
+   * effort capability (V3-5). An unsupporting provider gets the model only;
+   * the caller records the downgrade.
+   * @param model - the effective model id.
+   * @param effort - the effective effort level, or undefined for adapter default.
+   * @param supportsEffort - whether the spawn provider advertises the effort capability.
+   */
+  private static agentOptionsFor(model: string, effort: string | undefined, supportsEffort: boolean): AgentOptions {
+    return {
+      model,
+      ...(effort !== undefined && supportsEffort ? { reasoningEffort: ReasoningEffortId(effort) } : {}),
+    }
+  }
+
+  /**
+   * Record one effort capability downgrade on the card's history: a
+   * configured reasoning effort was omitted because the spawn provider does
+   * not advertise the effort capability, so the child keeps its adapter
+   * default (the V3-12 "downgrade, never fail" pattern).
+   * @param ticketId - the card whose spawn downgraded.
+   * @param role - "worker" or "reviewer".
+   * @param effort - the configured effort that was dropped.
+   * @param providerName - the provider that cannot honor it.
+   */
+  private async recordEffortDowngrade(ticketId: string, role: string, effort: string, providerName: string): Promise<void> {
+    await this.mutate(ticketId, 'edit', current => appendHistory(
+      current,
+      'model-effort-downgrade',
+      role + ' reasoning effort "' + effort + '" omitted: provider "' + providerName + '" does not advertise the effort capability; the child keeps its adapter default',
+    ))
   }
 
   /** Translate storage-layer failures into domain errors. */
@@ -907,6 +1138,7 @@ export class TaskboardService extends TypertRemoteService {
       const capabilities = provider?.capabilities
       const supportsOutputSchema = capabilities === undefined || capabilities.outputSchema
       const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
+      const supportsEffort = capabilities === undefined || capabilities.effort
       const basePrompt = reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket)
       // Degraded report mode: without structured output the reviewer returns
       // its verdict as plain text; the prompt says so instead of silently
@@ -915,12 +1147,22 @@ export class TaskboardService extends TypertRemoteService {
         ? basePrompt + '\n\n[Note: the configured provider does not support structured output; return your verdict (approve or reject) with a summary and problems as plain text in your final message.]'
         : basePrompt
       const prompt: ContentBlock[] = [{ type: 'text', text: promptText }]
+      // The controller outlives start() so the board can abort the in-flight
+      // reviewer run later (V3-16 pause keeps reviewer handles too).
+      const controller = new AbortController()
+      // V3-5: the effective reviewer model+effort for this board (board
+      // modelConfig overrides the host config; reviewer defaults along the
+      // worker knobs). An effort the provider cannot honor is omitted and
+      // recorded instead of failing the spawn (capability downgrade).
+      const modelCfg = await this.effectiveModelConfig(ticket.boardId)
+      const droppedReviewerEffort = modelCfg.reviewerEffort
+      const effortDowngraded = droppedReviewerEffort !== undefined && !supportsEffort
       const request: SubagentStartRequest = {
         label: 'review ' + ticket.id,
         prompt,
         parent,
-        signal: new AbortController().signal,
-        agentOptions: { model: this.resolved.workerModel },
+        signal: controller.signal,
+        agentOptions: TaskboardService.agentOptionsFor(modelCfg.reviewerModel, modelCfg.reviewerEffort, supportsEffort),
         // Report mode: the reviewer returns a structured conclusion only and
         // never decides on the card; direct mode keeps the v1 reviewer tools.
         // Unsupported capabilities are omitted (downgrade) instead of rejected.
@@ -928,7 +1170,11 @@ export class TaskboardService extends TypertRemoteService {
         ...(reportMode && supportsToolFilter ? { toolFilter: { deny: REVIEWER_DENIED_TOOLS } } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
-      return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run }
+      if (effortDowngraded) {
+        await this.recordEffortDowngrade(ticket.id, 'reviewer', droppedReviewerEffort, this.resolved.reviewProvider).catch(() => {})
+        this.ctx.logger.info('taskboard: reviewer effort "' + droppedReviewerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.reviewProvider + '" does not advertise the effort capability')
+      }
+      return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run, controller }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       return { spawned: false, reason: 'failed', errorMessage }
@@ -942,7 +1188,8 @@ export class TaskboardService extends TypertRemoteService {
    * model error resolves with stopReason "error"), so the rejection arm is a
    * defensive no-op.
    */
-  private trackReviewerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
+  private trackReviewerRun(ticketId: string, sessionId: string, run: SubagentRun, controller: AbortController): void {
+    this.runHandles.set(ticketId, { run, controller })
     const result: Promise<SubagentResult> | undefined = run.result
     if (result === undefined) return
     void result.then(
@@ -953,6 +1200,8 @@ export class TaskboardService extends TypertRemoteService {
 
   /** Persist the structured reviewer report when the settled run produced one. */
   private async recordReviewOutcome(ticketId: string, sessionId: string, outcome: SubagentResult): Promise<void> {
+    // The reviewer run settled: its handle is done, whatever the outcome.
+    this.clearRunHandle(ticketId, sessionId)
     const structured = outcome.structured
     if (structured === undefined || !isReviewOutcome(structured)) return
     let landed = false
@@ -1055,6 +1304,16 @@ export class TaskboardService extends TypertRemoteService {
         : undefined
       const capabilities = provider?.capabilities
       const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
+      const supportsEffort = capabilities === undefined || capabilities.effort
+      // The controller outlives start() so taskboard_pause can abort the
+      // in-flight worker run through the card's recorded handle.
+      const controller = new AbortController()
+      // V3-5: the effective worker model+effort for this board (board
+      // modelConfig overrides the host config). An effort the provider
+      // cannot honor is omitted and recorded instead of failing the spawn.
+      const modelCfg = await this.effectiveModelConfig(ticket.boardId)
+      const droppedWorkerEffort = modelCfg.workerEffort
+      const effortDowngraded = droppedWorkerEffort !== undefined && !supportsEffort
       const request: SubagentStartRequest = {
         label: workerLabel ?? ticket.title,
         // The master session id names the worker's independent branch
@@ -1062,12 +1321,16 @@ export class TaskboardService extends TypertRemoteService {
         // workers in a shared workspace from colliding.
         prompt: [{ type: 'text', text: buildWorkerPrompt(ticket, cwd, parent.id) }],
         parent,
-        signal: new AbortController().signal,
-        agentOptions: { model: this.resolved.workerModel },
+        signal: controller.signal,
+        agentOptions: TaskboardService.agentOptionsFor(modelCfg.workerModel, modelCfg.workerEffort, supportsEffort),
         ...(supportsToolFilter ? { toolFilter: { deny: WORKER_DENIED_TOOLS } } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.workerProvider, request)
-      return { ok: true, sessionId: run.id, run }
+      if (effortDowngraded) {
+        await this.recordEffortDowngrade(ticket.id, 'worker', droppedWorkerEffort, this.resolved.workerProvider).catch(() => {})
+        this.ctx.logger.info('taskboard: worker effort "' + droppedWorkerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.workerProvider + '" does not advertise the effort capability')
+      }
+      return { ok: true, sessionId: run.id, run, controller }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       return { ok: false, reason: 'failed', errorMessage }
@@ -1079,7 +1342,8 @@ export class TaskboardService extends TypertRemoteService {
    * is still In progress and still owned by that session, so the worker was
    * terminated mid-flight.
    */
-  private trackWorkerRun(ticketId: string, sessionId: string, run: SubagentRun): void {
+  private trackWorkerRun(ticketId: string, sessionId: string, run: SubagentRun, controller: AbortController): void {
+    this.runHandles.set(ticketId, { run, controller })
     const result: Promise<SubagentResult> | undefined = run.result
     if (result === undefined) return
     void result.then(
@@ -1090,109 +1354,321 @@ export class TaskboardService extends TypertRemoteService {
 
   /** Mark a card blocked when its worker session ended without reporting. */
   private async reclaimTerminatedWorker(ticketId: string, sessionId: string, stopReason: string): Promise<void> {
-    let reclaimed = false
-    const next = await this.mutate(ticketId, 'fail', (current) => {
-      if (current.workerSessionId !== sessionId) return current
-      if (current.column !== 'in_progress' || current.status !== 'running') return current
-      const detail = 'worker terminated (' + stopReason + ')'
-      reclaimed = true
-      return appendHistory(
-        {
-          ...current,
-          status: 'blocked',
-          failure: { reason: detail, at: Date.now() },
-          updatedAt: Date.now(),
-        },
-        'fail',
-        detail,
-      )
-    })
-    if (reclaimed) {
-      await this.notifyMaster(next.boardId,
-        'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") terminated without reporting; the card is blocked. Re-dispatch with taskboard_reassign.',
-        NOTICE_KIND.workerTerminated, next.id)
-    }
+    // The worker run settled: its handle is done, whatever the outcome. A
+    // paused card is skipped below but still releases its handle here.
+    this.clearRunHandle(ticketId, sessionId)
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) return
+    if (current.workerSessionId !== sessionId) return
+    if (current.column !== 'in_progress' || current.status !== 'running') return
+    // Mid-flight death: the same recovery path the liveness reconciliation
+    // uses — auto-redispatch a fresh worker while the per-card budget lasts,
+    // block once it is exhausted or no live master exists to spawn from.
+    await this.recoverLostWorker(current, 'worker terminated (' + stopReason + ')')
   }
 
   /**
-   * The durable failure reason the worker-liveness reconciliation records,
-   * distinct from the settlement-callback reason ('worker terminated
-   * (<stopReason>)') so the two reclaim paths never double-report one
-   * termination with two different reasons.
+   * The durable failure reason the worker-liveness reconciliation records
+   * when a lost worker cannot be auto-redispatched, distinct from the
+   * settlement-callback reason ('worker terminated (<stopReason>)') so the
+   * two reclaim paths never double-report one termination with two different
+   * reasons.
    */
   private static readonly RECONCILE_REASON = 'worker terminated (restart reconciliation)'
 
   /**
-   * One worker-liveness reconciliation pass: every In progress card whose
-   * worker is still marked running and whose worker session id is absent from
-   * the live agent registry is marked blocked — durable failure with reason
-   * RECONCILE_REASON, one 'fail' history row, and a master notice. Shared by
-   * the startup scan and the periodic scanner.
+   * The last observed activity of one live agent: the timestamp of its last
+   * session event, falling back to the session creation time when the log is
+   * empty. The session event log is the durable activity authority — a worker
+   * appends a row on every turn/tool activity, so a session whose tail is
+   * older than the idle threshold has genuinely been silent, not merely idle
+   * between turns.
+   */
+  private static lastActivityOf(agent: Agent): number {
+    const events = agent.session.events
+    const last = events.length > 0 ? events[events.length - 1]?.time : undefined
+    return last ?? agent.session.header.createdAt
+  }
+
+  /**
+   * Judge one running card's worker liveness: 'lost' when the session is
+   * absent from the registry (restart / hard death) or when it is still
+   * registered but idle — no running tool — and has had no session activity
+   * for longer than lostWorkerTimeoutMs (stuck). 'alive' otherwise. The idle
+   * arm is disabled when the timeout is 0; the registry-absence arm is not
+   * configurable (a missing session is always lost, per the restart rule).
+   */
+  private workerLost(registry: { get(id: string): Agent | undefined }, sessionId: string): boolean {
+    const agent = registry.get(sessionId)
+    if (agent === undefined) return true
+    if (this.resolved.lostWorkerTimeoutMs === 0) return false
+    if (agent.status === 'running') return false
+    return Date.now() - TaskboardService.lastActivityOf(agent) > this.resolved.lostWorkerTimeoutMs
+  }
+
+  /**
+   * One lost-worker recovery: auto-redispatch a fresh worker while the
+   * per-card budget lasts and a live master session exists to spawn from,
+   * otherwise mark the card blocked. Shared by the settlement callback
+   * (mid-flight death) and the liveness reconciliation (registry-absent or
+   * idle-stale) so both paths converge on one deduped recovery.
+   *
+   * Auto-redispatch keeps the card running with a new worker session, clears
+   * the failure record, appends the "续做勿回滚" annotation to the card
+   * description (the next worker's prompt inlines it, so it continues the
+   * existing working tree instead of rolling back), writes one 'reassign'
+   * history row and notifies the master. Blocking writes one 'fail' row and
+   * notifies the master that manual taskboard_reassign is needed.
+   *
+   * Reentry-safe: the guarded mutate re-checks column/status/worker identity
+   * atomically, so a card another path already recovered is returned
+   * untouched and exactly one recovery ever lands per loss.
+   * @returns 'redispatched' | 'blocked' | 'skipped'
+   */
+  private async recoverLostWorker(ticket: TicketView, reason: string): Promise<'redispatched' | 'blocked' | 'skipped'> {
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    if (registry === undefined || typeof registry.get !== 'function') return 'skipped'
+    const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
+    if (sessionId === undefined) return 'skipped'
+
+    // Budget exhausted (or auto-redispatch disabled): terminal block.
+    if (ticket.autoRetries >= this.resolved.workerAutoRetryLimit) {
+      return this.blockLostWorker(ticket, reason, 'worker lost after ' + ticket.autoRetries
+        + ' automatic redispatch attempts (cap ' + this.resolved.workerAutoRetryLimit + ')')
+    }
+    // A fresh worker needs a live master session as its parent; without one
+    // (e.g. a full restart where the master has not resumed yet) the card is
+    // blocked and the master re-dispatches when it comes back.
+    const board = (await this.boards()).get(ticket.boardId)
+    const masterId = board?.masterAgentId
+    const master = masterId === undefined || masterId === null ? undefined : registry.get(masterId)
+    if (master === undefined) {
+      return this.blockLostWorker(ticket, reason, TaskboardService.RECONCILE_REASON
+        + ' (no live master session to auto-redispatch)')
+    }
+    const attempt = ticket.autoRetries + 1
+    const spawn = await this.spawnWorker(master, ticket, 'auto-redispatch ' + attempt + ' ' + ticket.title)
+    if (!spawn.ok) {
+      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
+        ? 'auto-redispatch spawn failed: ' + spawn.errorMessage
+        : 'auto-redispatch spawn ' + spawn.reason
+      return this.blockLostWorker(ticket, reason, failureReason)
+    }
+    // Guarded attach: only the card that still names THIS worker session and
+    // is still running accepts the replacement; a card another path already
+    // recovered (settlement won first, or the reconcile beat us) is skipped.
+    let applied = false
+    let next: TicketView
+    try {
+      next = await this.mutate(ticket.id, 'reassign', (current) => {
+        if (current.column !== 'in_progress' || current.status !== 'running') return current
+        const currentSession = current.workerSessionId ?? current.workerAgentId
+        if (currentSession !== sessionId) return current
+        applied = true
+        return appendHistory(
+          {
+            ...current,
+            status: 'running',
+            failure: null,
+            autoRetries: attempt,
+            workerAgentId: spawn.sessionId,
+            workerSessionId: spawn.sessionId,
+            description: current.description.trim() === ''
+              ? '[auto-redispatch #' + attempt + '] 续做勿回滚：previous worker lost; continue from the preserved working tree.'
+              : current.description + '\n\n[auto-redispatch #' + attempt + '] 续做勿回滚：previous worker lost; continue from the preserved working tree.',
+            updatedAt: Date.now(),
+          },
+          'reassign',
+          'auto-redispatched after ' + reason,
+        )
+      })
+    } catch {
+      // The card vanished mid-recovery; the fresh worker is orphaned but the
+      // card is gone, so nothing to recover.
+      return 'skipped'
+    }
+    if (!applied) return 'skipped'
+    // Attach termination reclamation only after the new identity is durable.
+    this.trackWorkerRun(ticket.id, spawn.sessionId, spawn.run, spawn.controller)
+    await this.notifyMaster(next.boardId,
+      'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") was lost (' + reason + '); auto-redispatched (attempt ' + attempt + ' of ' + this.resolved.workerAutoRetryLimit + '). The working tree is preserved — the new worker continues without rolling back.',
+      NOTICE_KIND.workerRedispatched, next.id)
+    return 'redispatched'
+  }
+
+  /**
+   * Terminal lost-worker recovery: mark the card blocked with one durable
+   * failure row and a master notice (the V3-13 fallback when auto-redispatch
+   * is impossible or the per-card budget is exhausted). Reentry-safe like
+   * {@link recoverLostWorker}: the guarded mutate only applies to a card that
+   * still names the same worker session and is still running.
+   */
+  private async blockLostWorker(ticket: TicketView, reason: string, detail: string): Promise<'blocked' | 'skipped'> {
+    let marked = false
+    let next: TicketView
+    try {
+      next = await this.mutate(ticket.id, 'fail', (current) => {
+        if (current.column !== 'in_progress' || current.status !== 'running') return current
+        const currentSession = current.workerSessionId ?? current.workerAgentId
+        if (currentSession !== (ticket.workerSessionId ?? ticket.workerAgentId)) return current
+        marked = true
+        return appendHistory(
+          {
+            ...current,
+            status: 'blocked',
+            failure: { reason: detail, at: Date.now() },
+            updatedAt: Date.now(),
+          },
+          'fail',
+          detail,
+        )
+      })
+    } catch {
+      return 'skipped'
+    }
+    if (!marked) return 'skipped'
+    await this.notifyMaster(next.boardId,
+      'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is lost (' + reason + '); the card is blocked (' + detail + '). Re-dispatch with taskboard_reassign.',
+      NOTICE_KIND.workerLost, next.id)
+    return 'blocked'
+  }
+
+  /**
+   * One worker-liveness reconciliation pass: every In progress/running card
+   * whose worker is lost — absent from the live agent registry (restart /
+   * hard death) or registered but idle with no activity past the configured
+   * timeout — is recovered through {@link recoverLostWorker}: auto-redispatch
+   * while the per-card budget lasts, block with a master notice once
+   * exhausted. Shared by the startup scan and the periodic scanner.
    *
    * Liveness authority research (service dependency surface): the agent
    * registry is the exact "is this session's agent alive right now" authority
    * — agents.get(id) returns the live Agent or undefined; presence means
    * live (an idle agent is still alive, only an unregistered session is
    * lost), which is precisely the restart scenario where the in-memory run
-   * settlement callbacks are gone. The subagent seam's listChildren /
-   * listDescendants are parent-rooted tree listings that throw without a
-   * mounted projection registry + session store, and the session store tracks
-   * persisted sessions rather than live agent loops — neither is a general
-   * flat liveness probe, so the registry is used directly, and a missing
-   * registry (never in the host, where 'agents' is an injected dependency)
-   * degrades to a silent skip without blocking anything.
+   * settlement callbacks are gone. The session event log supplies the
+   * activity tail for the idle-staleness arm. The subagent seam's
+   * listChildren / listDescendants are parent-rooted tree listings that
+   * throw without a mounted projection registry + session store, and the
+   * session store tracks persisted sessions rather than live agent loops —
+   * neither is a general flat liveness probe, so the registry is used
+   * directly, and a missing registry (never in the host, where 'agents' is
+   * an injected dependency) degrades to a silent skip without blocking
+   * anything.
    *
    * Idempotent by construction and coexistent with the settlement callback:
-   * only running cards are considered, and the guarded mutate re-checks
+   * only running cards are considered, and the guarded recovery re-checks
    * column/status/worker identity atomically on the committed record, so a
-   * card the settlement callback already blocked (or whose worker came back)
-   * is returned untouched — exactly one 'fail' row ever lands per card.
-   * @returns how many cards this pass marked blocked.
+   * card the settlement callback already recovered (or whose worker came
+   * back) is returned untouched — exactly one recovery ever lands per card.
+   * @returns how many cards this pass recovered (redispatched or blocked).
    */
   async reconcileLostWorkers(): Promise<number> {
     // The registry is the liveness authority; without it the pass cannot
-    // judge and must not block anything (mirrors notifyMaster's guard).
+    // judge and must not recover anything (mirrors notifyMaster's guard).
     const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
     if (registry === undefined || typeof registry.get !== 'function') return 0
     const table = await this.tickets()
-    let blockedCount = 0
+    let recovered = 0
     for (const [, ticket] of table.entries()) {
       if (ticket.column !== 'in_progress' || ticket.status !== 'running') continue
       const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
       if (sessionId === undefined) continue
-      if (registry.get(sessionId) !== undefined) continue
+      if (!this.workerLost(registry, sessionId)) continue
+      const agent = registry.get(sessionId)
+      const reason = agent === undefined
+        ? 'no longer a live session (absent from the agent registry, e.g. after a restart)'
+        : 'idle with no activity for ' + Math.round((Date.now() - TaskboardService.lastActivityOf(agent)) / 1000) + 's'
+      const outcome = await this.recoverLostWorker(ticket, reason).catch(() => 'skipped' as const)
+      if (outcome !== 'skipped') recovered += 1
+    }
+    return recovered
+  }
+
+  /**
+   * One reviewer-staleness reconciliation pass: every In testing card that
+   * still has a review seat but no reviewOutcome is checked against the live
+   * agent registry and the review-start clock:
+   * - a reviewer session absent from the registry is a ghost seat and is
+   *   released immediately (no ghost seats, per the spec);
+   * - a reviewer that is registered but idle — no running tool — with the
+   *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
+   *   the seat is released.
+   * On release the card history gets one 'review-release' row, the master is
+   * notified, and a fresh reviewer is auto-redispatched when a live master
+   * session exists to spawn from; otherwise the seat is left vacant so
+   * taskboard_claim_review can take it.
+   *
+   * Reentry-safe: the guarded mutate only releases a seat that still names
+   * the same reviewer and is still In testing without an outcome, so a card
+   * another path already released (or resolved) is returned untouched.
+   * @returns how many seats this pass released.
+   */
+  async reconcileStaleReviewers(): Promise<number> {
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    if (registry === undefined || typeof registry.get !== 'function') return 0
+    const table = await this.tickets()
+    let released = 0
+    for (const [, ticket] of table.entries()) {
+      if (ticket.column !== 'in_testing' || ticket.reviewer === null) continue
+      if (ticket.reviewOutcome !== null) continue
+      const seatedReviewer = ticket.reviewer
+      const reviewerAgent = registry.get(seatedReviewer.agentId)
+      const ghost = reviewerAgent === undefined
+      const stale = !ghost && this.resolved.reviewerStaleTimeoutMs > 0
+        && reviewerAgent.status !== 'running'
+        && Date.now() - TaskboardService.lastActivityOf(reviewerAgent) > this.resolved.reviewerStaleTimeoutMs
+      if (!ghost && !stale) continue
       let marked = false
       let next: TicketView
       try {
-        next = await this.mutate(ticket.id, 'fail', (current) => {
-          if (current.column !== 'in_progress' || current.status !== 'running') return current
-          const currentSession = current.workerSessionId ?? current.workerAgentId
-          if (currentSession === undefined || registry.get(currentSession) !== undefined) return current
-          const detail = TaskboardService.RECONCILE_REASON
+        next = await this.mutate(ticket.id, 'review-release', (current) => {
+          if (current.column !== 'in_testing' || current.reviewer === null) return current
+          if (current.reviewer.agentId !== seatedReviewer.agentId) return current
+          if (current.reviewOutcome !== null) return current
           marked = true
           return appendHistory(
             {
               ...current,
-              status: 'blocked',
-              failure: { reason: detail, at: Date.now() },
+              reviewer: null,
               updatedAt: Date.now(),
             },
-            'fail',
-            detail,
+            'review-release',
+            ghost ? 'review seat released: reviewer session lost' : 'review seat released: reviewer stale',
           )
         })
       } catch {
         // The card vanished mid-scan (removed by another caller); skip it.
         continue
       }
-      if (marked) {
-        blockedCount += 1
-        await this.notifyMaster(next.boardId,
-          'Taskboard notice: the worker for ticket ' + next.id + ' ("' + next.title + '") is no longer a live session (absent from the agent registry, e.g. after a restart); the card is blocked. Re-dispatch with taskboard_reassign.',
-          NOTICE_KIND.workerLost, next.id)
+      if (!marked) continue
+      released += 1
+      // Auto-redispatch a fresh reviewer through a live master session, so
+      // the review continues without waiting for claim_review; when no master
+      // is live the seat stays vacant for taskboard_claim_review.
+      const releasedTicket = next
+      const board = (await this.boards()).get(releasedTicket.boardId)
+      const masterId = board?.masterAgentId
+      const master = masterId === undefined || masterId === null ? undefined : registry.get(masterId)
+      let reseated = false
+      if (master !== undefined) {
+        const spawn = await this.spawnReviewer(master, releasedTicket).catch(
+          () => ({ spawned: false, reason: 'failed' as const, errorMessage: 'reconcile reviewer spawn threw' }) as ReviewSpawnResult,
+        )
+        if (spawn.spawned) {
+          const withReviewer = await this.attachReviewer(releasedTicket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started (auto after release)')
+          reseated = withReviewer.reviewer !== null
+          this.trackReviewerRun(releasedTicket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
+        }
       }
+      await this.notifyMaster(next.boardId,
+        'Taskboard notice: the review seat for ticket ' + next.id + ' ("' + next.title + '") was released because the reviewer '
+        + (ghost ? 'session is gone' : 'was idle without a verdict for too long') + '. '
+        + (reseated ? 'A fresh reviewer has been auto-redispatched.' : 'The seat is vacant — use taskboard_claim_review.'),
+        NOTICE_KIND.reviewerReleased, next.id)
     }
-    return blockedCount
+    return released
   }
 
   /** Attach the designated reviewer to an In testing ticket. */
@@ -1226,8 +1702,14 @@ export class TaskboardService extends TypertRemoteService {
     ))
   }
 
-  /** One user move with reviewer automation when the target is In testing. */
-  private async moveWithReviewer(agent: Agent, request: MoveTicketRequest): Promise<TicketView> {
+  /**
+   * One move with reviewer automation when the target is In testing. The
+   * origin distinguishes the user-facing move (Remote 'move', the web UI
+   * drag) from the master's own taskboard_move tool: only a user-origin move
+   * into Not started wakes the master with the user-scheduled notice, so the
+   * master never notifies itself about its own scheduling.
+   */
+  private async moveWithReviewer(agent: Agent, request: MoveTicketRequest, origin: 'user' | 'master' = 'user'): Promise<TicketView> {
     if (!isColumn(request.column)) {
       throw new TaskboardError('unknown column "' + String(request.column) + '"', 'TASKBOARD_INVALID_COLUMN')
     }
@@ -1238,6 +1720,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
+    const sourceColumn = current.column
     const position = this.positionBetween(table, request.column, request.beforeTicketId, request.afterTicketId)
     const ticket = await this.mutate(request.ticketId, 'move', moved => appendHistory(
       {
@@ -1250,11 +1733,21 @@ export class TaskboardService extends TypertRemoteService {
       'move',
       'moved to ' + request.column,
     ))
+    // The user scheduling a card into Not started is the board's "start this"
+    // signal: wake the master so it adjudicates whether to dispatch (every
+    // dependency Done and capacity allowing → taskboard_assign) or explains
+    // the refusal to the user. Re-entry guarded: the master's own moves never
+    // notify, and a card already in Not started or returning from In progress
+    // (reassign backlog) is not a fresh user schedule.
+    if (request.column === 'not_started' && origin === 'user'
+      && sourceColumn !== 'not_started' && sourceColumn !== 'in_progress') {
+      await this.notifyUserScheduled(ticket)
+    }
     if (request.column === 'in_testing' && ticket.reviewer === null) {
       const spawn = await this.spawnReviewer(agent, ticket)
       if (spawn.spawned) {
         const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-        this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
+        this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
         return withReviewer
       }
       if (spawn.reason === 'failed') {
@@ -1262,6 +1755,37 @@ export class TaskboardService extends TypertRemoteService {
       }
     }
     return ticket
+  }
+
+  /**
+   * Notify the board's master that the user scheduled one card into Not
+   * started (a user-origin move), so it adjudicates whether to dispatch:
+   * every dependency Done and capacity allowing → taskboard_assign; otherwise
+   * the master tells the user the refusal reason and records it on the card.
+   * Reuses the durable master-notice channel (board notice + live inbox /
+   * persisted inbox delivery); best-effort like every master notice, so a
+   * notification fault never fails the move itself.
+   */
+  private async notifyUserScheduled(ticket: TicketView): Promise<void> {
+    try {
+      const table = await this.tickets()
+      const pending = ticket.dependsOn.filter((id) => {
+        const dependency = table.get(id)
+        return dependency === undefined || dependency.column !== 'done'
+      })
+      const dependsOn = ticket.dependsOn.length === 0
+        ? 'none'
+        : ticket.dependsOn.join(', ') + (pending.length === 0 ? ' (all Done)' : ' (NOT all Done: ' + pending.join(', ') + ')')
+      const filesScope = ticket.filesScope === '' ? '(none)' : ticket.filesScope
+      const text = 'Taskboard notice: the user scheduled ticket ' + ticket.id + ' ("' + ticket.title
+        + '", priority ' + ticket.priority + ', type ' + ticket.type + ') into Not started — adjudicate whether to start it. '
+        + 'dependsOn [' + dependsOn + ']; filesScope "' + filesScope + '". '
+        + 'When every dependency is Done and capacity allows, dispatch with taskboard_assign (the card moves to In progress and the workflow starts); '
+        + 'otherwise tell the user why the card cannot start and record the reason in the card history or devNotes.'
+      await this.notifyMaster(ticket.boardId, text, NOTICE_KIND.userScheduled, ticket.id)
+    } catch {
+      // A notification must never fail the move that triggered it.
+    }
   }
 
   /**
@@ -1405,6 +1929,49 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Write the board-level worker/reviewer model+effort overrides (V3-5,
+   * master only). Omitted patch fields keep the current board overrides; an
+   * empty string clears one override so the host config governs again.
+   * Effort values must be a deepseek level (off/high/max) or empty; anything
+   * else is rejected loudly so the master sees the mistake instead of a
+   * silent fallback.
+   * @param agent - the board's current master.
+   * @param boardId - the board to configure.
+   * @param patch - the overrides to apply field by field.
+   * @returns the updated board.
+   */
+  private async setBoardModelConfig(
+    agent: Agent,
+    boardId: string,
+    patch: { workerModel?: string; workerEffort?: string; reviewerModel?: string; reviewerEffort?: string },
+  ): Promise<BoardView> {
+    await this.assertMasterOfBoard(boardId, agent)
+    const table = await this.boards()
+    const board = table.get(boardId)
+    if (board === undefined) throw new TaskboardError('board "' + boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+    const current = board.modelConfig ?? {}
+    const pick = (key: keyof BoardModelConfig, value: string | undefined): string | undefined => {
+      if (value === undefined) return current[key]
+      if (value === '') return undefined
+      if ((key === 'workerEffort' || key === 'reviewerEffort') && !(EFFORT_LEVELS as readonly string[]).includes(value)) {
+        throw new TaskboardError('reasoning effort "' + value + '" is not supported (off|high|max)', 'TASKBOARD_INVALID_INPUT')
+      }
+      return value
+    }
+    const workerModel = pick('workerModel', patch.workerModel)
+    const workerEffort = pick('workerEffort', patch.workerEffort)
+    const reviewerModel = pick('reviewerModel', patch.reviewerModel)
+    const reviewerEffort = pick('reviewerEffort', patch.reviewerEffort)
+    const modelConfig: BoardModelConfig = {
+      ...(workerModel === undefined ? {} : { workerModel }),
+      ...(workerEffort === undefined ? {} : { workerEffort }),
+      ...(reviewerModel === undefined ? {} : { reviewerModel }),
+      ...(reviewerEffort === undefined ? {} : { reviewerEffort }),
+    }
+    return this.mutateBoard(boardId, currentBoard => ({ ...currentBoard, modelConfig }))
+  }
+
+  /**
    * Create one ticket in Backlog through the Remote boundary. The target
    * board must be visible to the caller; an invisible board is denied as not
    * found (no existence leak).
@@ -1441,6 +2008,7 @@ export class TaskboardService extends TypertRemoteService {
       type,
       status: 'ready' as TicketWorkerStatus,
       failure: null,
+      autoRetries: 0,
       createdAt: now,
       updatedAt: now,
       assignee: null,
@@ -1538,6 +2106,9 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     const boardId = TaskboardService.boardContextOf(request.boardId, current)
+    // The card is gone: its in-flight run handle is released with it (the
+    // worker session itself keeps running, as removal always behaved).
+    this.runHandles.delete(request.ticketId)
     const removed = await table.delete(request.ticketId)
     if (!removed) {
       throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
@@ -1578,7 +2149,7 @@ export class TaskboardService extends TypertRemoteService {
       throw new TaskboardError('no reviewer backend is available to assign', 'TASKBOARD_INVALID_TRANSITION')
     }
     const withReviewer = await this.attachReviewer(current.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(current.id, spawn.reviewer.agentId, spawn.run)
+    this.trackReviewerRun(current.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
     return withReviewer
   }
 
@@ -1842,11 +2413,14 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Master assigns a Not started ticket to a freshly spawned worker: the
-   * card moves to In progress, status running, and a worker subagent is
-   * spawned immediately; on success its id is recorded on the card.
+   * Master assigns a Backlog or Not started ticket to a freshly spawned
+   * worker: the card moves to In progress, status running, and a worker
+   * subagent is spawned immediately; on success its id is recorded on the
+   * card. Not started remains the scheduling display for the next queue,
+   * but a card needs no move before dispatch — assign accepts it straight
+   * from Backlog (V3-6 relaxation).
    * @param agent - the master session agent.
-   * @param ticketId - the Not started ticket to dispatch.
+   * @param ticketId - the Backlog or Not started ticket to dispatch.
    * @param workerLabel - optional display label for the worker child.
    * @returns the card plus the worker-spawn outcome.
    */
@@ -1861,9 +2435,9 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertMasterOfTicket(current, agent)
     const running = await this.mutate(ticketId, 'assign', (ticket) => {
-      if (ticket.column !== 'not_started') {
+      if (ticket.column !== 'not_started' && ticket.column !== 'backlog') {
         throw new TaskboardError(
-          'ticket "' + ticket.id + '" is in "' + ticket.column + '" (assign requires Not started)',
+          'ticket "' + ticket.id + '" is in "' + ticket.column + '" (assign requires Not started or Backlog)',
           'TASKBOARD_INVALID_TRANSITION',
         )
       }
@@ -1874,6 +2448,7 @@ export class TaskboardService extends TypertRemoteService {
           status: 'running',
           assignee: { agentId: agent.id, label: agentLabel(agent) },
           failure: null,
+          autoRetries: 0,
           updatedAt: Date.now(),
         },
         'assign',
@@ -1903,7 +2478,7 @@ export class TaskboardService extends TypertRemoteService {
     // an already-settled run (e.g. an infrastructure rejection) fires its
     // settlement callback immediately, and the reclaim must see the card's
     // workerSessionId to avoid a spurious no-op.
-    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run)
+    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run, spawn.controller)
     return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
   }
 
@@ -1938,7 +2513,7 @@ export class TaskboardService extends TypertRemoteService {
         )
       }
       return appendHistory(
-        { ...current, column: 'in_testing', status: 'claimed', devNotes: notes, updatedAt: Date.now() },
+        { ...current, column: 'in_testing', status: 'claimed', devNotes: notes, autoRetries: 0, updatedAt: Date.now() },
         'report',
         'worker reported development done, waiting for review',
       )
@@ -1956,7 +2531,7 @@ export class TaskboardService extends TypertRemoteService {
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
+    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
     await this.notifyMaster(withReviewer.boardId,
       'Taskboard notice: the worker for ticket ' + withReviewer.id + ' ("' + withReviewer.title + '") reported development done; the card is In testing. Adjudicate the review with taskboard_resolve_review.',
       NOTICE_KIND.workerDone, withReviewer.id)
@@ -2032,6 +2607,7 @@ export class TaskboardService extends TypertRemoteService {
           assignee: null,
           failure: null,
           reviewer: null,
+          autoRetries: 0,
           updatedAt: Date.now(),
         }
         delete reset.workerAgentId
@@ -2042,6 +2618,9 @@ export class TaskboardService extends TypertRemoteService {
           'returned to Not started by master',
         )
       })
+      // The card left the in-flight state: release its run handle so a later
+      // pause cannot target a worker that no longer owns the card.
+      this.runHandles.delete(ticketId)
       return { ticket, worker: null, workerAgentId: null }
     }
     const running = await this.mutate(ticketId, 'reassign', (retried) => {
@@ -2052,9 +2631,11 @@ export class TaskboardService extends TypertRemoteService {
         )
       }
       return appendHistory(
-        { ...retried, status: 'running', failure: null, updatedAt: Date.now() },
+        { ...retried, status: 'running', failure: null, autoRetries: 0, updatedAt: Date.now() },
         'reassign',
-        're-dispatched by master',
+        retried.status === 'paused'
+          ? 're-dispatched by master (resumed from pause)'
+          : 're-dispatched by master',
       )
     })
     const spawn = await this.spawnWorker(agent, running, workerLabel)
@@ -2076,8 +2657,58 @@ export class TaskboardService extends TypertRemoteService {
       workerSessionId: spawn.sessionId,
       updatedAt: Date.now(),
     }))
-    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run)
+    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run, spawn.controller)
     return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
+  }
+
+  /**
+   * Master pauses one In progress/running card (taskboard_pause): the
+   * in-flight worker run is aborted through the card's recorded handle, the
+   * card status flips to 'paused' (column unchanged, one 'pause' history row
+   * naming the pauser and the reason), and the master is notified. A paused
+   * card is never marked blocked: the settlement callback and the
+   * worker-liveness reconciliation only ever act on status 'running', so the
+   * paused status alone keeps the card out of V3-13/V3-9 reclamation. Resume
+   * with taskboard_reassign action "retry", which clears the paused status
+   * and spawns a fresh worker.
+   * @param agent - the master session agent.
+   * @param ticketId - the In progress card whose worker to pause.
+   * @param reason - why the master pauses the card (recorded in history).
+   * @returns the paused card.
+   */
+  async pause(agent: Agent, ticketId: string, reason: string): Promise<TicketView> {
+    const notes = resolveRequiredText(reason, 'pause reason')
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
+    const paused = await this.mutate(ticketId, 'pause', (ticket) => {
+      if (ticket.column !== 'in_progress' || ticket.status !== 'running') {
+        throw new TaskboardError(
+          'ticket "' + ticket.id + '" is in "' + ticket.column + '" with status "' + ticket.status
+            + '" (pause requires an In progress running card)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      return appendHistory(
+        { ...ticket, status: 'paused', updatedAt: Date.now() },
+        'pause',
+        'paused by ' + agentLabel(agent) + ': ' + notes,
+      )
+    })
+    // Abort the in-flight run only after the paused status is durable, so the
+    // run's settlement callback sees status 'paused' and skips reclamation.
+    const handle = this.runHandles.get(ticketId)
+    if (handle !== undefined) {
+      handle.controller.abort()
+      this.runHandles.delete(ticketId)
+    }
+    await this.notifyMaster(paused.boardId,
+      'Taskboard notice: the master paused ticket ' + paused.id + ' ("' + paused.title + '") — the worker run was aborted and the card is paused (column unchanged). Resume it with taskboard_reassign action "retry", which spawns a fresh worker.',
+      NOTICE_KIND.workerPaused, paused.id)
+    return paused
   }
 
   /**
@@ -2115,9 +2746,10 @@ export class TaskboardService extends TypertRemoteService {
     await this.assertMasterOfTicket(current, agent)
     // The master tool carries no boardId: resolve it from the ticket itself
     // so any board the caller masters can be scheduled. An explicit
-    // boardId in the request is still honored and validated.
+    // boardId in the request is still honored and validated. Master-origin
+    // moves never notify the master about its own scheduling.
     const boardId = request.boardId ?? current.boardId
-    return this.moveWithReviewer(agent, { ...request, boardId })
+    return this.moveWithReviewer(agent, { ...request, boardId }, 'master')
   }
 
   /**
@@ -2171,14 +2803,22 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Agent claims a Not started ticket and becomes its owner (v1 path, kept
-   * for boards without a master seat).
-   * @param agent - the claiming agent.
+   * Master claims a Not started ticket and schedules it to In progress.
+   * V3-7 closes the free claim: under the dispatch system only the master
+   * of the ticket's board may claim — workers and reviewers receive cards
+   * through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch),
+   * never by claiming. The caller must hold the master seat.
+   * @param agent - the master session agent.
    * @param ticketId - the Not started ticket to claim.
    * @returns the claimed ticket, now In progress.
    */
   async claim(agent: Agent, ticketId: string): Promise<TicketView> {
     const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertMasterOfTicket(current, agent)
     const label = agentLabel(agent)
     return this.mutate(ticketId, 'claim', (current) => {
       if (current.assignee !== null) {
@@ -2268,7 +2908,7 @@ export class TaskboardService extends TypertRemoteService {
         throw new TaskboardError('only the assignee may complete the ticket', 'TASKBOARD_NOT_OWNER')
       }
       return appendHistory(
-        { ...current, column: 'in_testing', devNotes: notes, updatedAt: Date.now() },
+        { ...current, column: 'in_testing', devNotes: notes, autoRetries: 0, updatedAt: Date.now() },
         'complete',
         'development done, waiting for review',
       )
@@ -2281,7 +2921,7 @@ export class TaskboardService extends TypertRemoteService {
       return { ticket, review: spawn.reason, reviewerAgentId: null }
     }
     const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run)
+    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
     return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
   }
 
@@ -2354,6 +2994,7 @@ export class TaskboardService extends TypertRemoteService {
             at: Date.now(),
           },
           reviewer: null,
+          autoRetries: 0,
           updatedAt: Date.now(),
         },
         'reject',
@@ -2469,6 +3110,7 @@ export class TaskboardService extends TypertRemoteService {
             at: Date.now(),
           },
           reviewer: null,
+          autoRetries: 0,
           updatedAt: Date.now(),
         },
         'reject',
@@ -2807,9 +3449,9 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_claim',
-      description: 'Claim a Not started taskboard ticket for the calling agent: the card moves to In progress and this agent becomes its owner. Rejected when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Claim the oldest (lowest position) ready ticket first; use parallel subagents to claim several independent tickets at once.',
+      description: 'Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master\'s dispatch. Rejected when the caller is not the master of the ticket\'s board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
       parameters: {
-        ticketId: { type: 'string' as const, required: true, description: 'The Not started ticket to claim.' },
+        ticketId: { type: 'string' as const, required: true, description: 'The Not started ticket to claim (master only).' },
       },
       output: {
         schema: {
@@ -3111,9 +3753,9 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_assign',
-      description: 'Dispatch a Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
+      description: 'Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
       parameters: {
-        ticketId: { type: 'string' as const, required: true, description: 'The Not started ticket to dispatch.' },
+        ticketId: { type: 'string' as const, required: true, description: 'The Backlog or Not started ticket to dispatch.' },
         workerLabel: {
           type: 'string' as const,
           description: 'Optional display label for the worker subagent; defaults to the ticket title.',
@@ -3253,6 +3895,35 @@ export class TaskboardService extends TypertRemoteService {
         }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Reassign taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_pause',
+      description: 'Pause one In progress/running taskboard ticket (master only): the in-flight worker run is aborted and the card is marked paused (column unchanged) with one history row naming the pauser and the reason. A paused card is never auto-blocked by settlement or liveness reconciliation. Resume it with taskboard_reassign action "retry", which clears paused and spawns a fresh worker.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The In progress card whose worker to pause.' },
+        reason: { type: 'string' as const, required: true, description: 'Why the master pauses the card (recorded in the card history).' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
+          },
+        },
+        render: (_args, value: { id: string; title: string; status: string }) => [{
+          type: 'text' as const,
+          text: 'ticket ' + value.id + ' ("' + value.title + '") paused (status ' + value.status + ')',
+        }],
+      },
+      execute: async (args: { ticketId: string; reason: string }, exec) => {
+        const value = await this.pause(TaskboardService.agentOf(exec), args.ticketId, args.reason)
+        return { id: value.id, title: value.title, column: value.column, status: value.status }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Pause taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
     }))
 
     this.ctx.tools.register(defineTool({
@@ -3470,6 +4141,81 @@ export class TaskboardService extends TypertRemoteService {
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Plan taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
     }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_board_config',
+      description: 'Read or set the per-board worker/reviewer model and reasoning-effort overrides (V3-5, master only). Every configured field overrides the host config for the board\'s spawned workers/reviewers; omit a field to keep the current board override, pass "" to clear it back to the host default (and the reviewer knobs fall back to the worker ones). Effort levels are the deepseek vocabulary: off | high | max. Spawns after the change use the new overrides; the board record keeps them durably.',
+      parameters: {
+        boardId: {
+          type: 'string' as const,
+          description: 'The board to configure. Omit for the default board.',
+        },
+        workerModel: {
+          type: 'string' as const,
+          description: 'Board-level worker model override; "" clears it. Omit to keep the current override.',
+        },
+        workerEffort: {
+          type: 'string' as const,
+          description: 'Board-level worker reasoning effort (off|high|max); "" clears it. Omit to keep the current override.',
+        },
+        reviewerModel: {
+          type: 'string' as const,
+          description: 'Board-level reviewer model override; "" clears it. Omit to keep the current override.',
+        },
+        reviewerEffort: {
+          type: 'string' as const,
+          description: 'Board-level reviewer reasoning effort (off|high|max); "" clears it. Omit to keep the current override.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            name: { type: 'string', required: true },
+            modelConfig: {
+              type: 'object', required: true, additionalProperties: false,
+              properties: {
+                workerModel: { type: 'string' },
+                workerEffort: { type: 'string' },
+                reviewerModel: { type: 'string' },
+                reviewerEffort: { type: 'string' },
+              },
+            },
+          },
+        },
+        render: (_args, value: { boardId: string; name: string; modelConfig: BoardModelConfig }) => [{ type: 'text' as const, text: 'board ' + value.boardId + ' ("' + value.name + '") model config: ' + JSON.stringify(value.modelConfig) }],
+      },
+      execute: async (args: {
+        boardId?: string
+        workerModel?: string
+        workerEffort?: string
+        reviewerModel?: string
+        reviewerEffort?: string
+      }, exec) => {
+        const board = await this.setBoardModelConfig(
+          TaskboardService.agentOf(exec),
+          args.boardId ?? 'default',
+          {
+            ...(args.workerModel === undefined ? {} : { workerModel: args.workerModel }),
+            ...(args.workerEffort === undefined ? {} : { workerEffort: args.workerEffort }),
+            ...(args.reviewerModel === undefined ? {} : { reviewerModel: args.reviewerModel }),
+            ...(args.reviewerEffort === undefined ? {} : { reviewerEffort: args.reviewerEffort }),
+          },
+        )
+        // Present only the override keys that are actually set: the output
+        // schema's optional properties do not admit explicit undefined.
+        const stored = board.modelConfig ?? {}
+        const modelConfig: { workerModel?: string; workerEffort?: string; reviewerModel?: string; reviewerEffort?: string } = {
+          ...(stored.workerModel === undefined ? {} : { workerModel: stored.workerModel }),
+          ...(stored.workerEffort === undefined ? {} : { workerEffort: stored.workerEffort }),
+          ...(stored.reviewerModel === undefined ? {} : { reviewerModel: stored.reviewerModel }),
+          ...(stored.reviewerEffort === undefined ? {} : { reviewerEffort: stored.reviewerEffort }),
+        }
+        return { boardId: board.boardId, name: board.name, modelConfig }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Set taskboard board model config', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
   }
 }
 
@@ -3485,7 +4231,8 @@ export class TaskboardService extends TypertRemoteService {
 const WORKER_DENIED_TOOLS = [
   'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
-  'taskboard_assign', 'taskboard_reassign', 'taskboard_claim_master', 'taskboard_release_master',
+  'taskboard_assign', 'taskboard_reassign', 'taskboard_pause', 'taskboard_claim_master',
+  'taskboard_release_master',
   'taskboard_handover', 'taskboard_create', 'taskboard_move', 'taskboard_plan',
   'taskboard_notices',
 ] as const

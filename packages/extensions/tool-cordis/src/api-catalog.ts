@@ -1743,9 +1743,15 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     methods: [
       {
         signature: 'async reconcileLostWorkers(): Promise<number>',
-        description: 'One worker-liveness reconciliation pass: every In progress card whose worker is still marked running and whose worker session id is absent from the live agent registry is marked blocked — durable failure with reason RECONCILE_REASON, one \'fail\' history row, and a master notice. Shared by the startup scan and the periodic scanner.\n\nLiveness authority research (service dependency surface): the agent registry is the exact "is this session\'s agent alive right now" authority — agents.get(id) returns the live Agent or undefined; presence means live (an idle agent is still alive, only an unregistered session is lost), which is precisely the restart scenario where the in-memory run settlement callbacks are gone. The subagent seam\'s listChildren / listDescendants are parent-rooted tree listings that throw without a mounted projection registry + session store, and the session store tracks persisted sessions rather than live agent loops — neither is a general flat liveness probe, so the registry is used directly, and a missing registry (never in the host, where \'agents\' is an injected dependency) degrades to a silent skip without blocking anything.\n\nIdempotent by construction and coexistent with the settlement callback: only running cards are considered, and the guarded mutate re-checks column/status/worker identity atomically on the committed record, so a card the settlement callback already blocked (or whose worker came back) is returned untouched — exactly one \'fail\' row ever lands per card.',
+        description: 'One worker-liveness reconciliation pass: every In progress/running card whose worker is lost — absent from the live agent registry (restart / hard death) or registered but idle with no activity past the configured timeout — is recovered through recoverLostWorker: auto-redispatch while the per-card budget lasts, block with a master notice once exhausted. Shared by the startup scan and the periodic scanner.\n\nLiveness authority research (service dependency surface): the agent registry is the exact "is this session\'s agent alive right now" authority — agents.get(id) returns the live Agent or undefined; presence means live (an idle agent is still alive, only an unregistered session is lost), which is precisely the restart scenario where the in-memory run settlement callbacks are gone. The session event log supplies the activity tail for the idle-staleness arm. The subagent seam\'s listChildren / listDescendants are parent-rooted tree listings that throw without a mounted projection registry + session store, and the session store tracks persisted sessions rather than live agent loops — neither is a general flat liveness probe, so the registry is used directly, and a missing registry (never in the host, where \'agents\' is an injected dependency) degrades to a silent skip without blocking anything.\n\nIdempotent by construction and coexistent with the settlement callback: only running cards are considered, and the guarded recovery re-checks column/status/worker identity atomically on the committed record, so a card the settlement callback already recovered (or whose worker came back) is returned untouched — exactly one recovery ever lands per card.',
         parameters: [],
-        returns: 'how many cards this pass marked blocked.',
+        returns: 'how many cards this pass recovered (redispatched or blocked).',
+      },
+      {
+        signature: 'async reconcileStaleReviewers(): Promise<number>',
+        description: 'One reviewer-staleness reconciliation pass: every In testing card that still has a review seat but no reviewOutcome is checked against the live agent registry and the review-start clock:\n\n- a reviewer session absent from the registry is a ghost seat and is released immediately (no ghost seats, per the spec);\n- a reviewer that is registered but idle — no running tool — with the review pending longer than reviewerStaleTimeoutMs is judged stuck and the seat is released. On release the card history gets one \'review-release\' row, the master is notified, and a fresh reviewer is auto-redispatched when a live master session exists to spawn from; otherwise the seat is left vacant so taskboard_claim_review can take it.\n\nReentry-safe: the guarded mutate only releases a seat that still names the same reviewer and is still In testing without an outcome, so a card another path already released (or resolved) is returned untouched.',
+        parameters: [],
+        returns: 'how many seats this pass released.',
       },
       {
         signature: '@Remote(\'snapshot\') async snapshot(agent: Agent, boardId?: string): Promise<BoardSnapshot>',
@@ -1827,8 +1833,8 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'async assign(agent: Agent, ticketId: string, workerLabel?: string): Promise<AssignTicketResult>',
-        description: 'Master assigns a Not started ticket to a freshly spawned worker: the card moves to In progress, status running, and a worker subagent is spawned immediately; on success its id is recorded on the card.',
-        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the Not started ticket to dispatch.' }, { name: 'workerLabel', description: 'optional display label for the worker child.' }],
+        description: 'Master assigns a Backlog or Not started ticket to a freshly spawned worker: the card moves to In progress, status running, and a worker subagent is spawned immediately; on success its id is recorded on the card. Not started remains the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog (V3-6 relaxation).',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the Backlog or Not started ticket to dispatch.' }, { name: 'workerLabel', description: 'optional display label for the worker child.' }],
         returns: 'the card plus the worker-spawn outcome.',
       },
       {
@@ -1850,6 +1856,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the re-dispatched card plus the worker-spawn outcome.',
       },
       {
+        signature: 'async pause(agent: Agent, ticketId: string, reason: string): Promise<TicketView>',
+        description: 'Master pauses one In progress/running card (taskboard_pause): the in-flight worker run is aborted through the card\'s recorded handle, the card status flips to \'paused\' (column unchanged, one \'pause\' history row naming the pauser and the reason), and the master is notified. A paused card is never marked blocked: the settlement callback and the worker-liveness reconciliation only ever act on status \'running\', so the paused status alone keeps the card out of V3-13/V3-9 reclamation. Resume with taskboard_reassign action "retry", which clears the paused status and spawns a fresh worker.',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the In progress card whose worker to pause.' }, { name: 'reason', description: 'why the master pauses the card (recorded in history).' }],
+        returns: 'the paused card.',
+      },
+      {
         signature: 'async createAsMaster( agent: Agent, request: CreateTicketRequest & { type?: TicketType; targetBranch?: string }, ): Promise<TicketView>',
         description: 'Master records a new ticket on a board\'s Backlog (the discussion whiteboard: the plan the master agreed with the user is written down). Unlike the Remote create surface, the master tool also sets the ticket type and may target any board the caller masters.',
         parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'request', description: 'title, description, type, priority, dependencies, boardId and optional targetBranch.' }],
@@ -1869,8 +1881,8 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'async claim(agent: Agent, ticketId: string): Promise<TicketView>',
-        description: 'Agent claims a Not started ticket and becomes its owner (v1 path, kept for boards without a master seat).',
-        parameters: [{ name: 'agent', description: 'the claiming agent.' }, { name: 'ticketId', description: 'the Not started ticket to claim.' }],
+        description: 'Master claims a Not started ticket and schedules it to In progress. V3-7 closes the free claim: under the dispatch system only the master of the ticket\'s board may claim — workers and reviewers receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch), never by claiming. The caller must hold the master seat.',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the Not started ticket to claim.' }],
         returns: 'the claimed ticket, now In progress.',
       },
       {
@@ -2832,7 +2844,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'AgentOptions',
-    declaration: 'export interface AgentOptions {\n    provider?: string;\n    model?: string;\n    maxTokens?: number;\n}',
+    declaration: 'export interface AgentOptions {\n    provider?: string;\n    model?: string;\n    reasoningEffort?: ReasoningEffortId;\n    maxTokens?: number;\n}',
   },
   {
     name: 'AgentPreset',
@@ -4360,7 +4372,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SubagentCapabilities',
-    declaration: 'export interface SubagentCapabilities {\n    readonly outputSchema: boolean;\n    readonly depthLimit: boolean;\n    readonly toolFilter: boolean;\n    readonly persona: boolean;\n}',
+    declaration: 'export interface SubagentCapabilities {\n    readonly outputSchema: boolean;\n    readonly depthLimit: boolean;\n    readonly toolFilter: boolean;\n    readonly persona: boolean;\n    readonly effort: boolean;\n}',
   },
   {
     name: 'SubagentDescendantListEntry',
@@ -4512,7 +4524,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TaskboardOperation',
-    declaration: 'export type TaskboardOperation = \'create\' | \'move\' | \'edit\' | \'remove\' | \'claim\' | \'complete\' | \'approve\' | \'reject\' | \'review-claim\' | \'assign\' | \'report\' | \'fail\' | \'reassign\' | \'resolve-review\';',
+    declaration: 'export type TaskboardOperation = \'create\' | \'move\' | \'edit\' | \'remove\' | \'claim\' | \'complete\' | \'approve\' | \'reject\' | \'review-claim\' | \'review-release\' | \'assign\' | \'report\' | \'fail\' | \'reassign\' | \'resolve-review\' | \'pause\';',
   },
   {
     name: 'TerminalBackend',
@@ -4624,7 +4636,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketView',
-    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    autoRetries: number;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TicketWorkerStatus',
