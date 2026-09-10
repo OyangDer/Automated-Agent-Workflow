@@ -4,7 +4,7 @@
  * store identity across plugin reloads); register() receives the factory and
  * the component derives its PropsStore share from the return type.
  */
-import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-runtime/client'
+import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-store'
 
 /** Tab-local viewing state. */
 type TaskboardViewState = {

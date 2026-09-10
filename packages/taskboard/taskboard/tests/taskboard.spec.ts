@@ -18,11 +18,11 @@ import * as storageJson from '@deepseek-ai/dsh-storage-json'
 import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import type { SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
-import { CallId } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
@@ -38,7 +38,32 @@ import type { PreflightReport } from '../src/types.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
 function stubAgentForSession(session: Session): Agent {
-  const inbox = new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} })
+  const nextTurn: Parameters<Inbox['append']>[1][] = []
+  const nextStep: Parameters<Inbox['append']>[1][] = []
+  const inbox: Inbox = {
+    nextTurn,
+    nextStep,
+    clear() { nextTurn.splice(0); nextStep.splice(0) },
+    append(target, message) { (target === 'next-turn' ? nextTurn : nextStep).push(message) },
+    prepend(target, message) { (target === 'next-turn' ? nextTurn : nextStep).unshift(message) },
+    replace(messageId, message) {
+      for (const pending of [nextTurn, nextStep]) {
+        const index = pending.findIndex(candidate => candidate.id === messageId)
+        if (index >= 0) { pending.splice(index, 1, message); return true }
+      }
+      return false
+    },
+    remove(messageId) {
+      for (const pending of [nextTurn, nextStep]) {
+        const index = pending.findIndex(candidate => candidate.id === messageId)
+        if (index >= 0) { pending.splice(index, 1); return true }
+      }
+      return false
+    },
+    splice(target, start, deleteCount, inserted) {
+      return (target === 'next-turn' ? nextTurn : nextStep).splice(start, deleteCount, ...inserted)
+    },
+  }
   return {
     id: session.id,
     options: {},
@@ -65,9 +90,10 @@ function stubAgent(rawId: string): Agent {
 function stubAgentWithCwd(rawId: string, cwd: string): Agent {
   const id = SessionId(rawId)
   const session = Session.create(id, undefined, {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id,
     createdAt: Date.now(),
+    isSeeded: false,
     cwd,
   })
   return stubAgentForSession(session)
@@ -160,8 +186,6 @@ interface HarnessOptions {
   reviewerRunResult?: Promise<RunResultStub>
   /** The review protocol; defaults to "report". */
   reviewMode?: 'report' | 'direct'
-  /** When set, the stubbed subagent seam also exposes followup. */
-  followup?: ReturnType<typeof vi.fn>
   /** When set, a stubbed workspace registry archives session ids through this fn. */
   archive?: ReturnType<typeof vi.fn>
   /** When set, the stubbed workspace registry resolves cwds through this fn. */
@@ -172,7 +196,7 @@ interface HarnessOptions {
     depthLimit: boolean
     toolFilter: boolean
     persona: boolean
-    effort: boolean
+    agentOptions: boolean
   }
   /** Host workerModel passed to the service (default deepseek-v4-flash). */
   workerModel?: string
@@ -244,7 +268,6 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     })
     ctx.provide('subagents', {
       start: subagentsStart,
-      ...(options.followup === undefined ? {} : { followup: options.followup }),
       ...(options.providerCapabilities === undefined ? {} : {
         getProvider: () => ({
           name: 'spawn',
@@ -258,7 +281,6 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     })
     ctx.provide('subagents', {
       start: subagentsStart,
-      ...(options.followup === undefined ? {} : { followup: options.followup }),
     } as never)
   } else {
     subagentsStart = vi.fn()
@@ -967,9 +989,10 @@ describe('TaskboardService workflow', () => {
     // the pass judges it lost on the idle-staleness arm and auto-redispatches.
     unregisterWorker()
     const oldSession = Session.create(SessionId('worker-child-agent'), undefined, {
-      version: 0,
+      version: SESSION_FORMAT_VERSION,
       id: SessionId('worker-child-agent'),
       createdAt: Date.now() - 60_000,
+      isSeeded: false,
     })
     const staleWorker = stubAgentForSession(oldSession)
     ctx.agents.register(staleWorker)
@@ -1058,9 +1081,10 @@ describe('TaskboardService workflow', () => {
     // reviewer is auto-redispatched through the live master).
     unregisterReviewer()
     const oldSession = Session.create(SessionId('reviewer-child-agent'), undefined, {
-      version: 0,
+      version: SESSION_FORMAT_VERSION,
       id: SessionId('reviewer-child-agent'),
       createdAt: Date.now() - 60_000,
+      isSeeded: false,
     })
     const staleReviewer = stubAgentForSession(oldSession)
     ctx.agents.register(staleReviewer)
@@ -1460,18 +1484,19 @@ describe('TaskboardService workflow', () => {
   })
 
   it('resolveReview reject returns the card for rework with the reviewer problems', async () => {
-    const { service, devA, workerChild } = await harness()
+    const { service, devA, workerChild, unregisterWorker } = await harness()
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'rework me')
     await toNotStarted(service, devA, ticket)
     await service.assign(devA, ticket.id)
     const reported = await service.report(workerChild, ticket.id, 'implemented')
+    unregisterWorker()
     const result = await service.resolveReview(devA, reported.ticket.id, 'reject', 'reviewed the change', [
       'missing error handling in parse()',
       'tests do not cover the edge case',
     ])
     expect(result.action).toBe('rejected')
-    // A one-shot worker session cannot receive a continuation followup.
+    // A vanished worker session cannot receive a live-agent followup.
     expect(result.followup).toBe('unavailable')
     expect(result.blockedAfterReject).toBe(false)
     expect(result.ticket.column).toBe('in_progress')
@@ -1484,9 +1509,9 @@ describe('TaskboardService workflow', () => {
     expect(result.ticket.failure).toBeNull()
   })
 
-  it('follows up the original worker when the subagent seam supports it', async () => {
-    const followup = vi.fn(async () => 'msg-1')
-    const { service, devA, workerChild } = await harness({ followup })
+  it('follows up the original worker through its live Agent handle', async () => {
+    const { service, devA, workerChild } = await harness()
+    const followup = vi.spyOn(workerChild, 'followup')
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'rework window')
     await toNotStarted(service, devA, ticket)
@@ -1495,10 +1520,9 @@ describe('TaskboardService workflow', () => {
     const result = await service.resolveReview(devA, reported.ticket.id, 'reject', 'reviewed', ['fix the parse() path'])
     expect(result.followup).toBe('sent')
     expect(followup).toHaveBeenCalledTimes(1)
-    const call = followup.mock.calls[0] as unknown[]
-    expect((call[0] as { id: string }).id).toBe(devA.id)
-    expect(call[1]).toBe('worker-child-agent')
-    const text = (call[2] as { type: string; text: string }[])[0]!.text
+    const message = followup.mock.calls[0]![0]
+    expect(message.source).toMatchObject({ kind: 'taskboard', form: 'relay', senderSessionId: devA.id })
+    const text = message.content[0]!.type === 'text' ? message.content[0]!.text : ''
     expect(text).toContain(ticket.id)
     expect(text).toContain('fix the parse() path')
   })
@@ -2167,7 +2191,7 @@ describe('TaskboardService workflow', () => {
     const { ctx, service, devA } = await harness()
     await service.claimMaster('default', devA)
     const result = await ctx.tools.execute({
-      callId: CallId('tool-create-scope'),
+      callId: ToolCallId('tool-create-scope'),
       name: 'taskboard_create',
       arguments: { title: 'tool scoped', description: '', priority: 'normal', filesScope: 'packages/client/ui-taskboard/src' },
       agent: devA,
@@ -2179,7 +2203,7 @@ describe('TaskboardService workflow', () => {
     // The dispatch surface (taskboard_list rows) carries the scope for the
     // master's parallel-safety judgment.
     const list = await ctx.tools.execute({
-      callId: CallId('tool-list-scope'),
+      callId: ToolCallId('tool-list-scope'),
       name: 'taskboard_list',
       arguments: {},
       agent: devA,
@@ -2191,7 +2215,7 @@ describe('TaskboardService workflow', () => {
     expect(row.filesScope).toBe('packages/client/ui-taskboard/src')
     // The view tool also carries the scope.
     const view = await ctx.tools.execute({
-      callId: CallId('tool-view-scope'),
+      callId: ToolCallId('tool-view-scope'),
       name: 'taskboard_view',
       arguments: { ticketId: value.id },
       agent: devA,
@@ -2556,7 +2580,7 @@ describe('TaskboardService workflow', () => {
     })
     await service.claimMaster('default', devA)
     const result = await ctx.tools.execute({
-      callId: CallId('tool-board-config'),
+      callId: ToolCallId('tool-board-config'),
       name: 'taskboard_board_config',
       arguments: { workerModel: 'board-model', workerEffort: 'off', reviewerModel: 'board-reviewer', reviewerEffort: 'max' },
       agent: devA,
@@ -2580,7 +2604,7 @@ describe('TaskboardService workflow', () => {
     await service.claimMaster('default', devA)
     // Set only the worker model: the effort and the reviewer knobs inherit the host config.
     await ctx.tools.execute({
-      callId: CallId('bc-partial'), name: 'taskboard_board_config',
+      callId: ToolCallId('bc-partial'), name: 'taskboard_board_config',
       arguments: { workerModel: 'board-model' }, agent: devA, signal: new AbortController().signal,
     })
     const ticket = await createTicket(service, 'partial override')
@@ -2590,7 +2614,7 @@ describe('TaskboardService workflow', () => {
       .toEqual({ model: 'board-model', reasoningEffort: 'max' })
     // Clearing the worker model restores the host model.
     await ctx.tools.execute({
-      callId: CallId('bc-clear'), name: 'taskboard_board_config',
+      callId: ToolCallId('bc-clear'), name: 'taskboard_board_config',
       arguments: { workerModel: '' }, agent: devA, signal: new AbortController().signal,
     })
     const card2 = await createTicket(service, 'cleared override')
@@ -2599,32 +2623,32 @@ describe('TaskboardService workflow', () => {
     expect((subagentsStart.mock.calls[1] as [string, SubagentStartRequest])[1].agentOptions?.model).toBe('host-flash')
     // An invalid effort is rejected loudly by the master tool.
     const denied = await ctx.tools.execute({
-      callId: CallId('bc-bad'), name: 'taskboard_board_config',
+      callId: ToolCallId('bc-bad'), name: 'taskboard_board_config',
       arguments: { workerEffort: 'ludicrous' }, agent: devA, signal: new AbortController().signal,
     })
     expect(denied.isError).toBe(true)
     expect((denied as { error: { message: string } }).error.message).toContain('off|high|max')
     // A non-master cannot configure the board.
     const nonMaster = await ctx.tools.execute({
-      callId: CallId('bc-non-master'), name: 'taskboard_board_config',
+      callId: ToolCallId('bc-non-master'), name: 'taskboard_board_config',
       arguments: { workerModel: 'nope' }, agent: devB, signal: new AbortController().signal,
     })
     expect(nonMaster.isError).toBe(true)
     expect((nonMaster as { error: { message: string } }).error.message).toContain('master')
   })
 
-  it('omits the reasoning effort and records a downgrade when the provider lacks the effort capability (V3-5)', async () => {
+  it('omits agent options and records an effort downgrade when the provider lacks that capability (V3-5)', async () => {
     const { service, devA, subagentsStart } = await harness({
       workerEffort: 'max',
-      providerCapabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true, effort: false },
+      providerCapabilities: { agentOptions: false, outputSchema: true, depthLimit: true, toolFilter: true, persona: true },
     })
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'downgrade card')
     await toNotStarted(service, devA, ticket)
     await service.assign(devA, ticket.id)
     const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
-    // The model still flows; the unsupported effort is dropped (downgrade).
-    expect(workerCall[1].agentOptions).toEqual({ model: 'deepseek-v4-flash' })
+    // The provider cannot accept either model or effort overrides.
+    expect(workerCall[1].agentOptions).toBeUndefined()
     // The downgrade is recorded on the card history.
     const updated = await service.viewTicket(ticket.id)
     expect(updated.history.some(row => row.kind === 'model-effort-downgrade' && row.detail.includes('max'))).toBe(true)
@@ -2722,7 +2746,7 @@ it('returns the structured handover snapshot from the claim tool, even without a
   // structured snapshot computed fresh from the live board state.
   await service.releaseMaster('default', devA)
   const claim = await ctx.tools.execute({
-    callId: CallId('tool-claim-snapshot'),
+    callId: ToolCallId('tool-claim-snapshot'),
     name: 'taskboard_claim_master',
     arguments: {},
     agent: devB,
@@ -2777,7 +2801,7 @@ it('returns the structured handover snapshot from the claim tool, even without a
 
   // taskboard_list's model-visible result carries the concrete rows too.
   const list = await ctx.tools.execute({
-    callId: CallId('tool-list-snapshot'),
+    callId: ToolCallId('tool-list-snapshot'),
     name: 'taskboard_list',
     arguments: {},
     agent: devB,
@@ -2805,7 +2829,7 @@ it('lists cards compact by default and full when detail "full" is requested (V3-
 
   // Default detail: compact one-line rows (no description/devNotes/reviewOutcome).
   const compact = await ctx.tools.execute({
-    callId: CallId('tool-list-compact'),
+    callId: ToolCallId('tool-list-compact'),
     name: 'taskboard_list',
     arguments: {},
     agent: devA,
@@ -2822,7 +2846,7 @@ it('lists cards compact by default and full when detail "full" is requested (V3-
   // detail "full": the rows carry description/devNotes/reviewOutcome and the
   // model-visible render shows them.
   const full = await ctx.tools.execute({
-    callId: CallId('tool-list-full'),
+    callId: ToolCallId('tool-list-full'),
     name: 'taskboard_list',
     arguments: { detail: 'full' },
     agent: devA,
@@ -2844,9 +2868,10 @@ it('rejects handover on an unknown board', async () => {
 it('rejects assign from a subagent session; the top-level master still dispatches', async () => {
   const { service, devA } = await harness()
   const subagent = stubAgentForSession(Session.create(SessionId('spawned-child'), undefined, {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id: SessionId('spawned-child'),
     createdAt: Date.now(),
+    isSeeded: false,
     origin: 'subagent',
     delegationDepth: 1,
   }))
@@ -3113,13 +3138,12 @@ it('queues a master notice into the persisted session inbox when the master is a
   expect(data.target).toBe('next-turn')
   expect(data.start).toBe(0)
   expect(JSON.stringify(data.inserted)).toContain(card.id)
-  // The master's next run replays the persisted log: the Inbox projection
-  // (exactly what agent-loop resume builds from stored events) sees the
-  // notice as pending input for the next turn.
+  // The persisted splice carries the complete identified message that the
+  // standard Inbox projection will expose on resume.
   const persisted = persistence.stored.get(devA.id)!
   const resumed = Session.create(SessionId(devA.id), persisted)
-  const inbox = new Inbox(resumed, { inserted: () => {}, discarded: () => {}, claimed: () => {} })
-  expect(JSON.stringify(inbox.nextTurn)).toContain(card.id)
+  const replayed = resumed.snapshotEvents().find(event => event.type === 'agent/inbox/spliced')
+  expect(JSON.stringify(replayed?.data)).toContain(card.id)
   // The in-board fallback record landed too.
   const read = await service.boardNotices('default', devA)
   expect(read.notices).toHaveLength(1)
@@ -3145,7 +3169,7 @@ it('records durable board notices readable via the claim result and the taskboar
   expect(claimed.notices?.[0]!.text).toContain(card.id)
   // The taskboard_notices tool reads them back.
   const toolResult = await ctx.tools.execute({
-    callId: CallId('tool-notices'),
+    callId: ToolCallId('tool-notices'),
     name: 'taskboard_notices',
     arguments: {},
     agent: devA,
@@ -3250,7 +3274,7 @@ it('executes the taskboard_handover tool as the master and releases the seat', a
   await service.assign(devA, card.id)
 
   const result = await ctx.tools.execute({
-    callId: CallId('tool-handover'),
+    callId: ToolCallId('tool-handover'),
     name: 'taskboard_handover',
     arguments: {},
     agent: devA,
@@ -3274,7 +3298,7 @@ it('executes the taskboard_pause tool as the master and rejects a non-master', a
   await service.assign(devA, card.id)
 
   const result = await ctx.tools.execute({
-    callId: CallId('tool-pause'),
+    callId: ToolCallId('tool-pause'),
     name: 'taskboard_pause',
     arguments: { ticketId: card.id, reason: 'tool-level pause' },
     agent: devA,
@@ -3290,7 +3314,7 @@ it('executes the taskboard_pause tool as the master and rejects a non-master', a
 
   // A non-master is rejected through the same tool.
   const denied = await ctx.tools.execute({
-    callId: CallId('tool-pause-denied'),
+    callId: ToolCallId('tool-pause-denied'),
     name: 'taskboard_pause',
     arguments: { ticketId: card.id, reason: 'not the master' },
     agent: devB,
@@ -3308,7 +3332,7 @@ it('executes the taskboard_claim tool as the master and rejects a non-master (V3
 
   // A non-master is rejected through the tool.
   const denied = await ctx.tools.execute({
-    callId: CallId('tool-claim-denied'),
+    callId: ToolCallId('tool-claim-denied'),
     name: 'taskboard_claim',
     arguments: { ticketId: card.id },
     agent: devB,
@@ -3319,7 +3343,7 @@ it('executes the taskboard_claim tool as the master and rejects a non-master (V3
 
   // The master claims through the same tool.
   const result = await ctx.tools.execute({
-    callId: CallId('tool-claim'),
+    callId: ToolCallId('tool-claim'),
     name: 'taskboard_claim',
     arguments: { ticketId: card.id },
     agent: devA,
@@ -3336,9 +3360,10 @@ it('executes the taskboard_claim tool as the master and rejects a non-master (V3
 it('rejects the taskboard_assign tool for a subagent-origin caller', async () => {
   const { ctx, service, devA } = await harness()
   const subagent = stubAgentForSession(Session.create(SessionId('spawned-tool-child'), undefined, {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id: SessionId('spawned-tool-child'),
     createdAt: Date.now(),
+    isSeeded: false,
     origin: 'subagent',
     delegationDepth: 1,
   }))
@@ -3347,7 +3372,7 @@ it('rejects the taskboard_assign tool for a subagent-origin caller', async () =>
   await toNotStarted(service, devA, ticket)
 
   const result = await ctx.tools.execute({
-    callId: CallId('tool-assign'),
+    callId: ToolCallId('tool-assign'),
     name: 'taskboard_assign',
     arguments: { ticketId: ticket.id },
     agent: subagent,
@@ -3357,7 +3382,7 @@ it('rejects the taskboard_assign tool for a subagent-origin caller', async () =>
   expect((result as { error: { message: string } }).error.message).toContain('top-level session agent')
   // The top-level master still dispatches through the same tool.
   const ok = await ctx.tools.execute({
-    callId: CallId('tool-assign-ok'),
+    callId: ToolCallId('tool-assign-ok'),
     name: 'taskboard_assign',
     arguments: { ticketId: ticket.id },
     agent: devA,
@@ -3458,7 +3483,7 @@ it('returns the current state for repeated fail and repeated report by the same 
 it('downgrades unsupported reviewer capabilities instead of failing the spawn', async () => {
   const { service, devA, workerChild, subagentsStart } = await harness({
     reviewMode: 'report',
-    providerCapabilities: { outputSchema: false, depthLimit: true, toolFilter: false, persona: false, effort: false },
+    providerCapabilities: { agentOptions: false, outputSchema: false, depthLimit: true, toolFilter: false, persona: false },
   })
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'capability downgrade card')
@@ -3467,8 +3492,10 @@ it('downgrades unsupported reviewer capabilities instead of failing the spawn', 
   const reported = await service.report(workerChild, card.id, 'implemented')
   expect(reported.review).toBe('spawned')
   const workerCall = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+  expect(workerCall[1].agentOptions).toBeUndefined()
   expect(workerCall[1].toolFilter).toBeUndefined()
   const reviewCall = subagentsStart.mock.calls[1] as [string, SubagentStartRequest]
+  expect(reviewCall[1].agentOptions).toBeUndefined()
   expect(reviewCall[1].outputSchema).toBeUndefined()
   expect(reviewCall[1].toolFilter).toBeUndefined()
   // The degraded prompt explains the no-schema report fallback.

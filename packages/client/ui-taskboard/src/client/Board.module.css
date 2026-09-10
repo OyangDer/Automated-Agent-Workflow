@@ -5,6 +5,8 @@
   flex-direction: column;
   background: var(--dsw-alias-bg-base);
   overflow: hidden;
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
 }
 
 .header {
@@ -12,7 +14,7 @@
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .title {
@@ -45,7 +47,7 @@
 
 .boardSelect {
   background: var(--dsw-alias-bg-layer-1);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
@@ -59,7 +61,7 @@
   line-height: 16px;
   color: var(--dsw-alias-label-tertiary);
   background: var(--dsw-alias-bg-layer-2);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 10px;
   padding: 1px 6px;
   white-space: nowrap;
@@ -71,7 +73,7 @@
 .cancelButton,
 .secondaryButton {
   background: transparent;
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   font-size: 12px;
   line-height: 18px;
@@ -119,14 +121,14 @@
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .boardNameInput {
   flex: 1;
   min-width: 160px;
   background: var(--dsw-alias-bg-layer-1);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
@@ -136,7 +138,7 @@
 
 .boardScopeSelect {
   background: var(--dsw-alias-bg-layer-1);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
@@ -165,7 +167,7 @@
   gap: 6px;
   margin-left: 12px;
   background: var(--dsw-alias-bg-layer-2);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 10px;
   padding: 2px 8px;
   white-space: nowrap;
@@ -249,7 +251,7 @@
   flex-direction: column;
   gap: 8px;
   background: var(--dsw-alias-bg-layer-1);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 10px;
   padding: 8px;
   min-height: 120px;

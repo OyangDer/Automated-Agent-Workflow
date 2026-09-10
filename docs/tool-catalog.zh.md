@@ -5,11 +5,13 @@
 
 [English](tool-catalog.md) | 中文
 
-已发布插件向 `ctx.tools` 提供的所有面向模型的工具：模型通过系统提示词组装获得的 `name`、`description` 和 JSON Schema `parameters`。本目录是[子系统页面](subsystems/core.md)（类型及每页生成的 `cordis-surface` 接线区域）的补充；本页列出的是向 agent（智能体）提供的*工具*。
+已发布插件向 `ctx.tools` 提供的所有面向模型的工具：模型通过系统提示词组装获得的 `name`、`description` 和 JSON Schema `parameters`。本目录是[子系统页面](subsystems/core.zh.md)（类型及每页生成的 `cordis-surface` 接线区域）的补充；本页列出的是向 agent（智能体）提供的*工具*。
 
-英文源文件由系统**生成**，并通过 `pnpm run verify-tool-catalog`（`doc-sync`（文档同步门禁）的一部分）验证新鲜度；本中文文件作为经评审对侧通过双语配对维护。与 Cordis 目录（纯源码 AST 处理）不同，英文生成器会在真实上下文中**启动**每个工具插件并读取 `ctx.tools.schemas()`，因为工具 schema 无法通过静态分析完全确定，例如运行时展开的枚举、拼接的描述、由配置决定的名称以及使用原始 JSON Schema 的 MCP 工具。完整性守卫会 glob 匹配 `packages/*/tool-*`；如果生成器的启动 manifest（元数据清单）遗漏任何包，检查就会失败，因此新工具不会在无人察觉的情况下缺少文档。参见[工具 schema 目录 Agent Note](../.agents/notes/implemented/process/2026-07-02-tool-schema-catalog.md)。
+英文源文件由系统**生成**，并通过 `pnpm run verify-tool-catalog`（`doc-sync`（文档同步门禁）的一部分）验证新鲜度；本中文文件作为经评审对侧通过双语配对维护。与 Cordis 目录（纯源码 AST 处理）不同，英文生成器会在真实上下文中**启动**每个工具插件并读取 `ctx.tools.schemas()`，因为工具 schema 无法通过静态分析完全确定，例如运行时展开的枚举、拼接的描述、由配置决定的名称以及使用原始 JSON Schema 的 MCP 工具。完整性守卫会 glob 匹配 `packages/*/tool-*`；如果生成器的启动 manifest（元数据清单）遗漏任何包，检查就会失败，因此新工具不会在无人察觉的情况下缺少文档。
 
 范围：`packages/*/tool-*` 下已发布的产品工具，每个工具均使用其**默认**配置启动；但如果某个 Config 字段是**必填项**且没有默认值，生成器就必须作出选择，对应包的说明会记录本页展示的是哪个分支。注册的工具**名称**可以是加载时配置，例如 `tool-subagent` 的 `toolName`，因此部署可能以不同名称或额外名称提供某个包；如果存在随产品发布的别名，对应包的说明会予以记录。`examples/` 中的演示工具（例如 `echo`）不在范围内，这与 Cordis 目录仅涵盖包的范围一致。
+
+<a id="tool-package-map"></a>
 
 ## 工具包映射
 
@@ -18,26 +20,28 @@
 | 工具包 | 模型可见名称 | 依赖 | 写入／影响 | 随产品发布的别名 | 部署说明 |
 | --- | --- | --- | --- | --- | --- |
 | `@deepseek-ai/dsh-tool-ask-user` | `ask_user_question` | `ctx.tools`、`ctx.userQuestions` | `tool/call`、`tool/result after a UI/provider answers the question` | - | ask_user_question 会暂停工具调用，直到当前 UI 提供方返回人类答案。 |
-| `@deepseek-ai/dsh-tools` | `run_code` | `ctx.tools`、`ctx.codeRuntime (execution time)`、`ctx.systemPrompt` | `tool/call`、`one tool/code-dispatch-start + tool/code-dispatch pair per bridged sub-call`、`tool/result` | - | 在 `mode: code`／`mode: both` 下，它由工具注册表所有，作为可过滤能力层之外的保留传输机制（参见 Code Mode Agent Note）。在 `code` 下，它是注册表对协议格式（wire format）的唯一贡献；其他可见能力在使用已加载运行时语言生成的 SDK 章节中声明。程序通过 binding 调用这些能力，调用按照原生并发约定调度：启动顺序和策略遵循提交顺序，并发安全的函数体最多重叠执行 `maxParallelSubCalls` 个。调用会重新进入完整且受守卫保护的工具流水线，并将每个嵌套执行关联到此外层结果。 |
+| `@deepseek-ai/dsh-tools` | `run_code` | `ctx.tools`、`ctx.codeRuntime (execution time)`、`ctx.systemPrompt` | `tool/call`、`one tool/ptc-dispatch-start + tool/ptc-dispatch pair per bridged sub-call`、`tool/result` | - | 在 `mode: ptc`／`mode: both` 下，它由工具注册表所有，作为可过滤能力层之外的保留传输机制（参见 PTC mode Agent Note）。在 `ptc` 下，它是注册表对协议格式（wire format）的唯一贡献；其他可见能力在使用已加载运行时语言生成的 SDK 章节中声明。程序通过 binding 调用这些能力，调用按照原生并发约定调度：启动顺序和策略遵循提交顺序，并发安全的函数体最多重叠执行 `maxParallelSubCalls` 个。调用会重新进入完整且受守卫保护的工具流水线，并将每个嵌套执行关联到此外层结果。 |
 | `@deepseek-ai/dsh-plan-mode` | `exit_plan_mode` | `ctx.tools`、`ctx.systemPrompt`、`ctx.userQuestions (execution time, opportunistic)` | `tool/call`、`plan/mode inactive on an approved review`、`tool/result` | - | 规划未激活时，exit_plan_mode 仍保留在面向模型的 schema 中，这样状态转换不会在规划策略变更之外额外造成工具目录变动。其执行路径会拒绝规划模式之外的调用；在规划模式下，它通过用户交互 seam 提交计划（批准／根据反馈继续规划），批准后会在步骤边界记录规划模式已停用。 |
 | `@deepseek-ai/dsh-tool-bash` | `bash` | `ctx.tools`、`ctx.shell`、`ctx.systemPrompt`、`ctx.shellEnv`、`ctx.jobs at call time for run_in_background` | `tool/call`、`tool/result` | - | bash 工具是 bash 执行器 seam 面向模型的消费方。使用 `run_in_background` 的运行会注册到通用 `ctx.jobs` 运行时，并通过 `job_*` 工具（来自 `@deepseek-ai/dsh-tool-jobs`）收集／停止；禁用 `enableRunInBackground` 配置（默认为 true）后，该参数会被完全移除。 |
 | `@deepseek-ai/dsh-tool-pwsh` | `pwsh` | `ctx.tools`、`ctx.shell`、`ctx.systemPrompt`、`ctx.shellEnv`、`ctx.jobs at call time for run_in_background` | `tool/call`、`tool/result` | - | pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费方（由 `@deepseek-ai/dsh-pwsh-local` 等 PowerShell 执行器为 `ctx.shell` 提供后端）；除沙箱接口外，它逐项对应 bash 工具调用。使用 `run_in_background` 的运行会注册到通用 `ctx.jobs` 运行时，并通过 `job_*` 工具收集／停止；托管的 `DSH_*` 环境来自 `@deepseek-ai/dsh-shell-env`。每次调用都在新进程中运行，不使用持久 PTY 会话。路径采用原生 `C:\...` 形式，变量采用 `$env:NAME`。 |
 | `@deepseek-ai/dsh-tool-cordis` | `cordis_define`、`cordis_inspect_list`、`cordis_inspect_query`、`cordis_inspect_self`、`cordis_run`、`cordis_stop`、`cordis_undefine` | `ctx.tools`、`ctx.dynamicCordisRunner` | `tool/call`、`tool/result`、`process-local dynamic package lifecycle` | - | 不在任何随产品发布的树中，需要显式选择启用；动态 Package 代码可以访问真实运行时，见 .agents/notes/implemented/feature/2026-07-08-self-referential-cordis-toolset.md。该工具集注入 `@deepseek-ai/dsh-cordis-host-runner` 提供的 `ctx.dynamicCordisRunner`，后者拥有定义注册表和 vm 沙箱；组合缺少它时这些工具不会激活。运行中的 Package 在停止、undefine 或 DSH 重启前可以注册**额外的**模型可见工具；发生这类工具集变化时，系统会记录完整且有变动的请求头。 |
 | `@deepseek-ai/dsh-tool-bash-persistent` | `bash` | `ctx.tools`、`ctx.terminals`、`an owning Agent at execution time` | `tool/call`、`PTY shell state`、`tool/result` | - | 一个按所有者隔离的持久 bash 工具；部署组合提供 PTY 后端，并可覆盖面向模型的环境描述。 |
+| `@deepseek-ai/dsh-tool-pwsh-persistent` | `pwsh` | `ctx.tools`、`ctx.terminals`、`an owning Agent at execution time` | `tool/call`、`PTY shell state`、`tool/result` | - | 一个按所有者隔离的持久 pwsh 工具，持久 bash 工具的 Windows 对应物；部署组合提供 pwsh 方言的 PTY 后端，并可覆盖面向模型的环境描述。 |
 | `@deepseek-ai/dsh-tool-str-replace-editor` | `str_replace_editor` | `ctx.tools`、`ctx.fs` | `tool/call`、`fs/observed after view presence/absence, edit absence, or successful mutation`、`tool/result` | - | 基于文件系统 seam 的独立查看／创建／唯一字面量替换／按行插入工具；可与任何 shell 或终端接口组合。 |
-| `@deepseek-ai/dsh-tool-fs` | `edit`、`read`、`read_image`、`write` | `ctx.tools`、`ctx.fs`、`ctx.systemPrompt`、`ctx.attachments (read_image registration)`、`ctx.llm + an image-capable route (read_image execution)` | `tool/call`、`fs/write-intent or fs/edit-intent for mutations`、`fs/observed after read presence/absence or successful file operation`、`durable attachment (read_image)`、`tool/result` | - | 先读后写／编辑策略由 `@deepseek-ai/dsh-fs-observation-policy` 添加；它是一个 `fs/*` 事件门禁插件，不会改变 schema。加载这些工具的部署按预期也应加载该插件。没有 `ctx.attachments` 时 `read_image` 不会注册；其 schema 与路由无关，执行时除非确切路由的模型声明图像输入，否则拒绝。 |
+| `@deepseek-ai/dsh-tool-fs` | `edit`、`read`、`read_image`、`write` | `ctx.tools`、`ctx.fs`、`ctx.systemPrompt`、`ctx.attachments (image-tool registration)`、`ctx.llm + an image-capable route (image-tool execution)` | `tool/call`、`fs/write-intent or fs/edit-intent for mutations`、`fs/observed after read presence/absence or successful file operation`、`durable attachment (read_image)`、`tool/result` | - | 先读后写／编辑策略由 `@deepseek-ai/dsh-fs-observation-policy` 添加；它是一个 `fs/*` 事件门禁插件，不会改变 schema。加载这些工具的部署按预期也应加载该插件。没有 `ctx.attachments` 时图片工具不会注册；其 schema 与路由无关，执行时除非确切路由的模型声明图片输入，否则拒绝。 |
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`、`grep` | `ctx.tools`、`ctx.subprocess`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | glob 和 grep 是无条件可用的发现工具，通过 ctx.subprocess spawn 随包提供的 ripgrep 二进制文件（`@vscode/ripgrep`），并作为普通前台调用运行，绝不作为后台任务；无需在宿主机安装 `rg`，也不经过 shell 层。本目录使用 `sampleOverCapGlobResults: true`；部署必须显式选择该行为。结果超过上限时，会通过可选的 ctx.spillStore 后端保存完整的格式化列表；在共置部署中，如果后端公开本地路径，返回的定位信息可供后续读取／搜索。 |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`、`terminal_list`、`terminal_open`、`terminal_read`、`terminal_send`、`terminal_signal` | `ctx.tools`、`ctx.terminals`、`ctx.systemPrompt`、`ctx.jobs at call time for run_in_background` | `tool/call`、`tool/result` | - | 这 6 个终端工具需要选择启用，用于补充一次性 bash／文件系统工具。`terminal_send(run_in_background: true)` 会注册到 `ctx.jobs`；schema 不包含 TUI、具名按键序列、BEL、调整尺寸、自动启动和跨 agent 共享。 |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`、`get_goal`、`update_goal` | `ctx.tools`、`ctx.agents`、`ctx.goals`、`ctx.systemPrompt`、`a calling Agent in an authorized open turn` | `tool/call`、`goal/change for mutations`、`tool/result` | - | create、edit、pause 和 resume 要求直接来自人类的根权限；complete 和 blocked 也接受确切的当前 Goal Round。blocked 的默认下限是 3 个获准的 Round。 |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-two taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`、`schedule_delete`、`schedule_list` | `ctx.tools`、`ctx.sessions`、Session 持久化、未来创建的 live 根 Agent | `tool/call`、`schedule/change create or delete`、`tool/result` | - | 仅在选择启用的 Schedule 插件加载后创建的 live 根 Agent scope 内注册。版本 1 接受 after_seconds、显式绝对 at 和有界固定速率 every_seconds，并披露 session-local 交付；管理读取与变更必须通过共享的 Session 持久化 barrier。 |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`、`ctx.lsp`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，因此其模型可见 schema 在更换提供方时保持稳定。运行时要求已注册提供方，例如 `@deepseek-ai/dsh-lsp-stdio`；如果没有提供方，查询会返回结构化 `LSP_UNAVAILABLE` 错误，而不会改变 schema。 |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`、`ctx.workflowEngine`、`ctx.subagents`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents every fresh round)` | `tool/call`、`tool/result`、`workflow and child session events during execution` | - | 固定的前台工作流会在每个 Round 启动一个全新的结构化子级；模型只能选择不可变目标和可选的 Round 上限。 |
 | `@deepseek-ai/dsh-tool-skill` | `skill` | `ctx.tools`、`ctx.agents`、`ctx.skills` | `tool/call`、`tool/result`、`user/message replacement catalogs via agent.inject()` | - | - |
 | `@deepseek-ai/dsh-tool-session-query` | `session_event_read`、`session_event_search`、`session_event_trace`、`session_search`、`session_trace` | `ctx.tools`、`ctx.systemPrompt`、`ctx.sessionQuery`、`a calling Agent for workspace authority` | `tool/call`、`tool/result` | - | 这 5 个只读工具会隐藏提供方游标，并根据不可变的调用 agent 会话为每个结果授权。该包需要选择启用；需要强制截止时间或限制行内输出的组合还会挂载通用超时或 spill 策略。 |
-| `@deepseek-ai/dsh-tool-subagent` | `subagent` | `ctx.tools`、`ctx.subagents`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`child session events through the chosen provider` | `subagent`、`subagent_fork` | 注册的工具名称取决于加载时 `toolName` 配置（默认为 `subagent`）；上述 schema 对应默认值。随产品发布的组合会为每个 subagent 后端加载一次该包，因此模型还会看到绑定到 fork 后端的 `subagent_fork`。每个实例的描述、`run_in_background` 参数与 system prompt 策略取决于它自己的 `backgroundMode` 和 `enableRunInBackground`，因此两个随附 schema 并不相同：`subagent` 为 `continuable`，省略参数时默认后台运行，并由 runtime 自动投递结束结果；`subagent_fork` 保持 `one-shot`，省略参数时默认前台运行。详见 `packages/bundle/base/cordis.patch.yml` 和 `examples/acp-agent/cordis.yml`。 |
+| `@deepseek-ai/dsh-tool-subagent` | `list_subagent_models`、`subagent` | `ctx.tools`、`ctx.subagents`、`ctx.systemPrompt`、`用于模型发现和所选路由校验的 ctx.llm` | `tool/call`、`tool/result`、`child session events through the chosen provider` | `subagent`、`subagent_fork` | 注册的委派工具名称取决于加载时 `toolName` 配置（默认为 `subagent`）；上述默认 schema 关闭模型选择，而发现 schema 则展示为已启用 Session 中可用的固定配套工具。Web preset 会在每个新顶层 Session 创建时读取插件页偏好，并为其子 Session 保留该决定；`subagent_fork` 始终使用固定路由。每个实例通过 `modelSelectionSettings`、`backgroundMode` 与 `enableRunInBackground` 独立控制是否读取模型选择设置及其后台行为。 |
 | `@deepseek-ai/dsh-tool-subagent-control` | `interrupt_agent`、`list_agents`、`send_message` | `ctx.tools`、`ctx.subagents`、`ctx.agents and ctx.sessionProjections (list_agents only)` | `tool/call`、`tool/result`、`child session events through ctx.subagents` | - | 这些是控制可继续后台 subagent 的全局命名工具：绑定提供方的 `tool-subagent` 实例注册不同的委派工具；本包注册一次 `send_message` 和 `interrupt_agent`，另由 `list_agents` 通过单独加载的 `/list-agents` 插件提供，其目录行使用 sessionProjections 和实时 Agent 注册表。 |
-| `@deepseek-ai/dsh-tool-subagent-report` | `report` | `ctx.subagents`、`ctx.systemPrompt`、`a live continuable in-process child Agent` | `tool/call`、`tool/result`、`a user-role message in the direct parent session` | - | 按可继续的进程内子级注册，而非全局注册，因此该 schema 仅在这种子级内部可见，并且不受其全局 `toolFilter` 影响。同一份贡献还会安装子级作用域的 `tool:report` 系统提示词 section，本目录不渲染该 section。面向父级的 `send_message` 工具单独安装。 |
 | `@deepseek-ai/dsh-tool-jobs` | `job_kill`、`job_list`、`job_output` | `ctx.tools`、`ctx.jobs`、`ctx.systemPrompt` | `tool/call`、`tool/result`、`user/message via agent.inject() for background completion notices` | - | 与任务种类无关的后台任务控制器：后台 bash 命令、PTY 发送和 subagent 都通过相同的 3 个工具读取、列出和终止。加载该插件会挂接控制器，从而启用生产方的 `ctx.jobs.start()`。 |
+| `@deepseek-ai/dsh-experimental-tool-agent-team` | `interrupt_agent`、`list_agents`、`send_message`、`spawn_teammate`、`team_task_create`、`team_task_get`、`team_task_list`、`team_task_update`、`wait_agent` | `ctx.tools`、`ctx.systemPrompt`、`ctx.agentTeams`、`an exact live Team member Agent` | `tool/call`、`team/member`、`team/message/queued`、`team/message/delivered`、`team/task`、`tool/result` | - | 这 9 个工具限定于隐式 Team Lead 与持久 teammate 作用域。随产品发布的 dsh-base bundle 默认禁用该包；文档中的 Agent Teams profile patch 会启用它，并禁用旧 continuable child 的同名控制工具。 |
 | `@deepseek-ai/dsh-tool-todo` | `todo_write` | `ctx.tools`、`owning Agent session` | `tool/call`、`todo/write`、`tool/result` | - | todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为检查清单。`allowParallelInProgress` 是没有默认值的必填项，因此本目录明确选择 `true`，对应描述允许同时存在多个 `in_progress` 项。选择 `false` 的部署会获得同一工具，但描述会要求只能有 1 个活动任务。 |
 | `@deepseek-ai/dsh-tool-workflow` | `workflow` | `ctx.tools`、`ctx.workflowEngine`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents the script children)` | `tool/call`、`tool/result` | - | - |
 | `@deepseek-ai/dsh-tool-web` | `web_fetch`、`web_search` | `ctx.tools`、`ctx.web`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | web_search 和 web_fetch 将提供方选择置于 ctx.web 之后，使模型可见 schema 在更换后端时保持稳定。 |
@@ -122,7 +126,7 @@ ask_user_question 会暂停工具调用，直到当前 UI 提供方返回人类�
 
 ### `run_code`
 
-针对可用工具执行 TypeScript 程序。接受两个必填参数：`code`，即异步函数的**函数体**（仅使用可擦除语法；支持顶层 `await` 和 `return`）；以及 `description`，简要说明该程序做什么。请根据系统提示词中的声明，以 `await tools.name(args)` 形式调用工具。只有打印或返回的内容会传回，请谨慎筛选。
+针对可用工具执行 TypeScript 程序。接受两个必填参数：`code`，即异步函数的**函数体**（仅使用可擦除语法；支持顶层 `await` 和 `return`）；以及 `description`，简要说明该程序做什么。请根据系统提示词中的声明，以 `await tools.name(args)` 形式调用工具。只有打印或返回的内容属于程序输出，请谨慎筛选。含图片的子工具结果会在运行结束后附加。
 
 ```json
 {
@@ -144,9 +148,9 @@ ask_user_question 会暂停工具调用，直到当前 UI 提供方返回人类�
 }
 ```
 
-来源：[`packages/core/tools/src/code-mode.ts`](../packages/core/tools/src/code-mode.ts)
+来源：[`packages/core/tools/src/ptc.ts`](../packages/core/tools/src/ptc.ts)
 
-在 `mode: code`／`mode: both` 下，它由工具注册表所有，作为可过滤能力层之外的保留传输机制（参见 Code Mode Agent Note）。在 `code` 下，它是注册表对协议格式的唯一贡献；其他可见能力在使用已加载运行时语言生成的 SDK 章节中声明。程序通过 binding 调用这些能力，调用按照原生并发约定调度：启动顺序和策略遵循提交顺序，并发安全的函数体最多重叠执行 `maxParallelSubCalls` 个。调用会重新进入完整且受守卫保护的工具流水线，并将每个嵌套执行关联到此外层结果。
+在 `mode: ptc`／`mode: both` 下，它由工具注册表所有，作为可过滤能力层之外的保留传输机制（参见 PTC mode Agent Note）。在 `ptc` 下，它是注册表对协议格式的唯一贡献；其他可见能力在使用已加载运行时语言生成的 SDK 章节中声明。程序通过 binding 调用这些能力，调用按照原生并发约定调度：启动顺序和策略遵循提交顺序，并发安全的函数体最多重叠执行 `maxParallelSubCalls` 个。调用会重新进入完整且受守卫保护的工具流水线，并将每个嵌套执行关联到此外层结果。
 
 <a id="deepseek-aidsh-plan-mode"></a>
 
@@ -528,6 +532,33 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
 
 一个按所有者隔离的持久 bash 工具；部署组合提供 PTY 后端，并可覆盖面向模型的环境描述。
 
+<a id="deepseek-aidsh-tool-pwsh-persistent"></a>
+
+## `@deepseek-ai/dsh-tool-pwsh-persistent`
+
+### `pwsh`
+
+在持久 PowerShell shell 中运行命令。包括当前目录和已导出环境变量在内的状态会在此 agent 的多次调用之间保留。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The PowerShell command to run. Relative path is preferred in the command."
+    }
+  },
+  "required": [
+    "command"
+  ]
+}
+```
+
+来源：[`packages/shell/tool-pwsh-persistent/src/index.ts`](../packages/shell/tool-pwsh-persistent/src/index.ts)
+
+一个按所有者隔离的持久 pwsh 工具，持久 bash 工具的 Windows 对应物；部署组合提供 pwsh 方言的 PTY 后端，并可覆盖面向模型的环境描述。
+
 <a id="deepseek-aidsh-tool-str-replace-editor"></a>
 
 ## `@deepseek-ai/dsh-tool-str-replace-editor`
@@ -540,6 +571,7 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
 * 如果 `path` 是文件，`view` 会显示应用 `cat -n` 后的结果。如果 `path` 是目录，`view` 会列出最多向下 2 层的非隐藏文件和目录
 * 如果指定的 `create` 命令目标 `path` 已作为文件存在，则不能使用该命令
 * 如果 `command` 产生较长输出，输出会被截断并标记为 `<response clipped>`
+* 当前命令不使用某个参数时，值为 `null` 的占位参数视为未提供。必填参数仍须提供值；删除匹配内容时应省略 `str_replace.new_str`，而不是将其设为 `null`
 
 使用 `str_replace` 命令时请注意：
 
@@ -566,27 +598,62 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
       "description": "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`."
     },
     "file_text": {
-      "type": "string",
-      "description": "Required parameter of `create` command, with the content of the file to be created."
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Required string parameter of `create` command, with the content of the file to be created. A null placeholder is treated as omitted by commands that do not use this parameter."
     },
     "insert_line": {
-      "type": "integer",
-      "description": "Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`."
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Required integer parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`. A null placeholder is treated as omitted by commands that do not use this parameter."
     },
     "new_str": {
-      "type": "string",
-      "description": "Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert."
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional string parameter of `str_replace` command containing the new string (if omitted, no string will be added). Required string parameter of `insert` command containing the string to insert. A null placeholder is accepted only by commands that do not use this parameter."
     },
     "old_str": {
-      "type": "string",
-      "description": "Required parameter of `str_replace` command containing the string in `path` to replace."
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Required string parameter of `str_replace` command containing the string in `path` to replace. A null placeholder is treated as omitted by commands that do not use this parameter."
     },
     "view_range": {
-      "type": "array",
-      "description": "Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.",
-      "items": {
-        "type": "integer"
-      }
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional parameter of `view` command when `path` points to a file. If omitted or null, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file."
     }
   },
   "required": [
@@ -670,7 +737,7 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
 
 ### `read_image`
 
-读取 PNG/JPEG/WebP/GIF 文件并返回图像本身。要求当前模型接受图像输入。
+读取 PNG/JPEG/WebP/GIF 文件并返回图像本身。无扩展名的路径同样被接受；格式按文件内容检测，因此规范化附件路径可以直接传入，无需复制或重命名。Harness 会在下一次模型请求前校验并缩小受支持的大图，因此仅为查看图片时应直接使用此工具，无需安装图片库或创建缩略图。可以用小批次并发读取彼此独立的文件。要求当前模型接受图像输入。
 
 ```json
 {
@@ -715,7 +782,7 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
 
 来源：[`packages/fs/tool-fs/src/index.ts`](../packages/fs/tool-fs/src/index.ts)
 
-先读后写／编辑策略由 `@deepseek-ai/dsh-fs-observation-policy` 添加；它是一个 `fs/*` 事件门禁插件，不会改变 schema。加载这些工具的部署按预期也应加载该插件。没有 `ctx.attachments` 时 `read_image` 不会注册；其 schema 与路由无关，执行时除非确切路由的模型声明图像输入，否则拒绝。
+先读后写／编辑策略由 `@deepseek-ai/dsh-fs-observation-policy` 添加；它是一个 `fs/*` 事件门禁插件，不会改变 schema。加载这些工具的部署按预期也应加载该插件。没有 `ctx.attachments` 时图片工具不会注册；其 schema 与路由无关，执行时除非确切路由的模型声明图片输入，否则拒绝。
 
 <a id="deepseek-aidsh-tool-fs-search"></a>
 
@@ -1035,6 +1102,656 @@ glob 和 grep 是无条件可用的发现工具，通过 ctx.subprocess spawn �
 来源：[`packages/goal/tool-goal/src/index.ts`](../packages/goal/tool-goal/src/index.ts)
 
 create、edit、pause 和 resume 要求直接来自人类的根权限；complete 和 blocked 也接受确切的当前 Goal Round。blocked 的默认下限是 3 个获准的 Round。
+
++<a id="deepseek-aidsh-taskboard"></a>
+
+## `@deepseek-ai/dsh-taskboard`
+
+### `taskboard_approve`
+
+Approve an In testing taskboard ticket you are the designated reviewer of: the card moves to Done. Summary states what was verified. Use only after actually inspecting the work; otherwise use taskboard_reject.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In testing ticket you review."
+    },
+    "summary": {
+      "type": "string",
+      "description": "What you inspected and why it passes."
+    }
+  },
+  "required": [
+    "ticketId",
+    "summary"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_assign`
+
+Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The Backlog or Not started ticket to dispatch."
+    },
+    "workerLabel": {
+      "type": "string",
+      "description": "Optional display label for the worker subagent; defaults to the ticket title."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_board_config`
+
+Read or set the per-board worker/reviewer model and reasoning-effort overrides (V3-5, master only). Every configured field overrides the host config for the board's spawned workers/reviewers; omit a field to keep the current board override, pass "" to clear it back to the host default (and the reviewer knobs fall back to the worker ones). Effort levels are the deepseek vocabulary: off | high | max. Spawns after the change use the new overrides; the board record keeps them durably.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to configure. Omit for the default board."
+    },
+    "workerModel": {
+      "type": "string",
+      "description": "Board-level worker model override; \"\" clears it. Omit to keep the current override."
+    },
+    "workerEffort": {
+      "type": "string",
+      "description": "Board-level worker reasoning effort (off|high|max); \"\" clears it. Omit to keep the current override."
+    },
+    "reviewerModel": {
+      "type": "string",
+      "description": "Board-level reviewer model override; \"\" clears it. Omit to keep the current override."
+    },
+    "reviewerEffort": {
+      "type": "string",
+      "description": "Board-level reviewer reasoning effort (off|high|max); \"\" clears it. Omit to keep the current override."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_claim`
+
+Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master's dispatch. Rejected when the caller is not the master of the ticket's board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The Not started ticket to claim (master only)."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_claim_master`
+
+Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board's durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to claim. Omit for the default board."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_claim_review`
+
+Take the empty review seat of an In testing taskboard ticket (used when the automatic reviewer could not be spawned). After claiming, you are its reviewer: inspect the work, then call taskboard_approve or taskboard_reject.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In testing ticket with no reviewer."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_complete`
+
+Mark an owned In progress ticket as development-complete: the card moves to In testing and the board automatically assigns a fresh reviewer agent. Summarize what changed and how it was verified in devNotes — the reviewer reads exactly that. The reviewer decides approve/reject; you never review your own ticket.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this agent owns."
+    },
+    "devNotes": {
+      "type": "string",
+      "description": "What was implemented, files/areas touched, and how it was verified (tests run, manual checks). The reviewer reads this."
+    }
+  },
+  "required": [
+    "ticketId",
+    "devNotes"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_create`
+
+Create a taskboard ticket on a board's Backlog (master only): the plan you agreed with the user is written down as a card. The ticket lands in Backlog with the given type, priority and dependencies.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to create the ticket on. Omit for the default board."
+    },
+    "title": {
+      "type": "string",
+      "description": "Ticket title."
+    },
+    "description": {
+      "type": "string",
+      "description": "Ticket description / acceptance criteria."
+    },
+    "type": {
+      "type": "string",
+      "description": "Ticket kind badge. Omit for \"feature\".",
+      "enum": [
+        "feature",
+        "bugfix",
+        "refactor",
+        "docs",
+        "test",
+        "merge",
+        "infra",
+        "chore",
+        "spike"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "description": "Ticket priority. Omit for \"normal\".",
+      "enum": [
+        "low",
+        "normal",
+        "high"
+      ]
+    },
+    "dependsOn": {
+      "type": "array",
+      "description": "Ticket ids this ticket waits for; all must exist and be open to completion.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "filesScope": {
+      "type": "string",
+      "description": "Declared file scope: the paths (files or directories) this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards."
+    }
+  },
+  "required": [
+    "title",
+    "description"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_fail`
+
+Report a taskboard ticket as failed (assigned worker only): the card stays In progress but is marked blocked with your failure reason so the master can re-dispatch it.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this worker was assigned."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Concrete failure reason (blocked, missing access, irrecoverable error)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "reason"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_handover`
+
+Hand over the master seat of a taskboard board (master only): generate structured handover notes (every card status, each in-flight worker identity, the In testing review seats, the backlog summary, and the master history), write them onto the board, and release the seat. The successor claims the seat with taskboard_claim_master — the claim result carries these notes.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to hand over. Omit for the default board."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_list`
+
+List taskboard tickets. Tickets come back sorted by implementation order (position) inside each column; dependsOn names tickets that must be Done before this one may be claimed. Prefer this over taskboard_view when scanning for the next card to pick up. detail "compact" (default) returns one compact line per card; detail "full" also carries description, devNotes and the pending review report — use full only when a compact line leaves an anomaly unresolved.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "column": {
+      "type": "string",
+      "description": "Only tickets in this column. Omit for the whole board.",
+      "enum": [
+        "backlog",
+        "not_started",
+        "in_progress",
+        "in_testing",
+        "done"
+      ]
+    },
+    "mine": {
+      "type": "boolean",
+      "description": "When true, only tickets assigned to the calling agent."
+    },
+    "detail": {
+      "type": "string",
+      "description": "compact (default) returns one line per card; full also includes description, devNotes and the pending review report for anomaly adjudication.",
+      "enum": [
+        "compact",
+        "full"
+      ]
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_move`
+
+Move a taskboard ticket between columns (master only): schedules the card, optionally next to an anchor ticket. Moving into In testing keeps the automatic reviewer assignment.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket to move."
+    },
+    "column": {
+      "type": "string",
+      "description": "The target column.",
+      "enum": [
+        "backlog",
+        "not_started",
+        "in_progress",
+        "in_testing",
+        "done"
+      ]
+    },
+    "beforeTicketId": {
+      "type": "string",
+      "description": "Insert immediately before this ticket in the target column."
+    },
+    "afterTicketId": {
+      "type": "string",
+      "description": "Insert immediately after this ticket in the target column (used when before is omitted)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "column"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_notices`
+
+Read the durable master notices of a taskboard board (default board "default"): every notice (worker reported done/failed, worker lost after a restart, review verdicts) lands on the board synchronously, so this read works even when live or persistent inbox delivery could not reach the master. Notices carry {kind, text, at, ticketId}; the newest is last.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to read. Omit for the default board."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_pause`
+
+Pause one In progress/running taskboard ticket (master only): the in-flight worker run is aborted and the card is marked paused (column unchanged) with one history row naming the pauser and the reason. A paused card is never auto-blocked by settlement or liveness reconciliation. Resume it with taskboard_reassign action "retry", which clears paused and spawns a fresh worker.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In progress card whose worker to pause."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why the master pauses the card (recorded in the card history)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "reason"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_plan`
+
+Plan a taskboard ticket (master only): adjust dependency edges, priority, and the card's ordering position inside its column. Dependency changes take effect immediately on claim gates; position is an index in the column ordering (0 = first).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket to plan."
+    },
+    "dependsOn": {
+      "type": "array",
+      "description": "Replacement dependency edges (tickets that must be Done first). Omit to keep the current edges.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "priority": {
+      "type": "string",
+      "description": "Replacement priority. Omit to keep the current priority.",
+      "enum": [
+        "low",
+        "normal",
+        "high"
+      ]
+    },
+    "position": {
+      "type": "number",
+      "description": "Desired index in the ticket's column ordering (0 = first). Omit to keep the current position."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_reassign`
+
+Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In progress card to re-dispatch."
+    },
+    "action": {
+      "type": "string",
+      "description": "retry spawns a new worker; backlog returns the card to Not started.",
+      "enum": [
+        "retry",
+        "backlog"
+      ]
+    },
+    "workerLabel": {
+      "type": "string",
+      "description": "Optional display label for a retry worker subagent."
+    }
+  },
+  "required": [
+    "ticketId",
+    "action"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_reject`
+
+Reject an In testing taskboard ticket you are the designated reviewer of: the card returns to In progress (打回) with your feedback for the developer to rework. Feedback must list concrete, actionable problems. Do not fix the code yourself.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In testing ticket you review."
+    },
+    "feedback": {
+      "type": "string",
+      "description": "Concrete, actionable rework feedback."
+    }
+  },
+  "required": [
+    "ticketId",
+    "feedback"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_release_master`
+
+Release the master seat of a taskboard board (default board "default"); only the current master may release. After release, another agent may claim the seat.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The board to release. Omit for the default board."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_report`
+
+Report taskboard ticket development as complete (assigned worker only): the card moves to In testing and the board automatically assigns a fresh reviewer agent. devNotes summarizes what changed, which files were touched, and how it was verified — the reviewer reads exactly that.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this worker was assigned."
+    },
+    "devNotes": {
+      "type": "string",
+      "description": "What was implemented, files/areas touched, and how it was verified (tests run, manual checks)."
+    }
+  },
+  "required": [
+    "ticketId",
+    "devNotes"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_resolve_review`
+
+Resolve a report-mode review (master only): apply the reviewer-reported verdict for an In testing taskboard ticket. approve moves the card to Done and archives the worker session; reject returns the card for rework with the reviewer's problems as feedback. The master applies the verdict as reported and may not overturn a rejection. After the third consecutive reject the card is marked blocked, awaiting the user's decision.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The In testing ticket under review."
+    },
+    "verdict": {
+      "type": "string",
+      "description": "The reviewer-reported conclusion to apply.",
+      "enum": [
+        "approve",
+        "reject"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "What the reviewer inspected and concluded."
+    },
+    "problems": {
+      "type": "array",
+      "description": "Concrete rework items reported by the reviewer (empty when approving).",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "ticketId",
+    "verdict",
+    "summary",
+    "problems"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_update`
+
+Update a taskboard ticket this agent owns: title, description, and/or devNotes. Omitted fields stay unchanged.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket this agent owns."
+    },
+    "title": {
+      "type": "string",
+      "description": "Replacement title."
+    },
+    "description": {
+      "type": "string",
+      "description": "Replacement description."
+    },
+    "devNotes": {
+      "type": "string",
+      "description": "Replacement completion notes."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_view`
+
+Read one full taskboard ticket: description, assignee, review state, rejection feedback, devNotes and history. Use this when you need the ticket details before claiming or reworking it.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketId": {
+      "type": "string",
+      "description": "The ticket id."
+    }
+  },
+  "required": [
+    "ticketId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+The twenty-two taskboard tools drive the five-column workflow: list/view, dependency- and capacity-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, resolve-review, and own-ticket updates.
 
 <a id="deepseek-aidsh-schedule"></a>
 
@@ -1476,6 +2193,28 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 
 ## `@deepseek-ai/dsh-tool-subagent`
 
+### `list_subagent_models`
+
+发现 subagent 可用的 LLM 路由，不更改当前 Agent。无参数调用会列出已注册提供方；提供 `provider` 时会列出其公布的模型；同时提供 `provider` 和 `model` 时会检查该精确模型及其推理强度。目录条目只提供建议：adapter 可能接受未列出的模型 id。把返回的 id 用于委派工具的 `provider`、`model` 与 `reasoning_effort` 字段。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "provider": {
+      "type": "string",
+      "description": "Registered LLM provider id. Omit to list providers."
+    },
+    "model": {
+      "type": "string",
+      "description": "Exact model id to inspect. Requires provider; omit to list that provider's advertised models."
+    }
+  }
+}
+```
+
+来源：[`packages/subagent/tool-subagent/src/list-models.ts`](../packages/subagent/tool-subagent/src/list-models.ts)
+
 ### `subagent`
 
 将一项自包含任务委派给 subagent（在自身上下文中工作的独立 agent），用它卸载聚焦且独立的工作，例如研究、限定范围的实现或分析，以免消耗当前对话的上下文。subagent 会返回结果，但不会返回中间步骤。请提供完整、独立的提示词，因为它看不到当前对话。此调用默认等待结果。设置 `run_in_background: true` 可返回 job id；使用 `job_output` 收集结果，使用 `job_kill` 停止任务。
@@ -1506,7 +2245,7 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 
 来源：[`packages/subagent/tool-subagent/src/index.ts`](../packages/subagent/tool-subagent/src/index.ts)
 
-注册的工具名称取决于加载时 `toolName` 配置（默认为 `subagent`）；上述 schema 对应默认值。随产品发布的组合会为每个 subagent 后端加载一次该包，因此模型还会看到绑定到 fork 后端的 `subagent_fork`。每个实例的描述、`run_in_background` 参数与 system prompt 策略取决于它自己的 `backgroundMode` 和 `enableRunInBackground`，因此两个随附 schema 并不相同：`subagent` 为 `continuable`，省略参数时默认后台运行，并由 runtime 自动投递结束结果；`subagent_fork` 保持 `one-shot`，省略参数时默认前台运行。详见 `packages/bundle/base/cordis.patch.yml` 和 `examples/acp-agent/cordis.yml`。
+注册的委派工具名称取决于加载时 `toolName` 配置（默认为 `subagent`）；上述默认 schema 关闭模型选择，而发现 schema 则展示为已启用 Session 中可用的固定配套工具。Web preset 会在每个新顶层 Session 创建时读取插件页偏好，并为其子 Session 保留该决定；`subagent_fork` 始终使用固定路由。每个实例通过 `modelSelectionSettings`、`backgroundMode` 与 `enableRunInBackground` 独立控制是否读取模型选择设置及其后台行为。
 
 <a id="deepseek-aidsh-tool-subagent-control"></a>
 
@@ -1535,7 +2274,7 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 
 ### `list_agents`
 
-按持久 id 和标签列出你的可继续后台 subagent。用它回忆你启动过哪些 subagent，而不是轮询完成情况——subagent 完成时你会被告知。状态来自实时注册表：running 表示 agent 此刻正在工作；idle 表示已加载但处于轮次之间，可能正在等待它启动的 agent；ready 表示它只存在于存储中——可恢复而非终态，也不表示有结果等待收集；`send_message` 会在同一对话上开启新的轮次，且无论处于哪种状态，直接子级都仍可作为 `send_message` 的目标。该快照并非投递承诺；`send_message` 会执行权威检查，仍可能失败。无法读取的子级会作为诊断信息报告，而不会被静默丢弃。`descendants` 作用域会按稳定的前序顺序遍历你下方的整棵树，并为每个条目标注其持久的直接父会话 id 和深度。只有深度为 1 的条目可以使用 `send_message`；更深的条目只能作为 `interrupt_agent` 的候选目标。
+按持久 id 和标签列出你的可继续后台 subagent。用它回忆你启动过哪些 subagent，而不是轮询完成情况——subagent 完成时你会被告知。状态来自实时注册表：running 表示 agent 此刻正在工作；idle 表示已加载但处于轮次之间，可能正在等待它启动的 agent；ready 表示它只存在于存储中——可恢复而非终态，也不表示有结果等待收集；`send_message` 会在运行中 child 的最近 step 边界 steer 消息，或为 idle、ready child 启动轮次，且无论处于哪种状态，直接子级都仍可作为 `send_message` 的目标。该快照并非投递承诺；`send_message` 会执行权威检查，仍可能失败。无法读取的子级会作为诊断信息报告，而不会被静默丢弃。`descendants` 作用域会按稳定的前序顺序遍历你下方的整棵树，并为每个条目标注其持久的直接父会话 id 和深度。只有深度为 1 的条目可以使用 `send_message`；更深的条目只能作为 `interrupt_agent` 的候选目标。
 
 ```json
 {
@@ -1557,23 +2296,23 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 
 ### `send_message`
 
-根据 subagent id 向后台 subagent 发送消息，继续同一段对话。该消息会成为 subagent 的下一轮次：如果它仍在工作，消息会等待当前轮次结束，因此无法改变已经开始的工作方向。此调用不会返回 subagent 的答案，只会确认消息已投递，因此请用它分派更多工作。调用失败表示消息**未**投递。
+根据 agent id 向直接可继续 child 发送消息。如果你是驻留的可继续 child，也可以把自己的直接 parent 作为目标。如果目标仍在工作，消息会 steer 其最近的 step；如果目标处于 idle，消息会启动一个轮次。此调用不会返回该 agent 的答案，只会确认消息已投递。调用失败表示消息**未**投递。
 
 ```json
 {
   "type": "object",
   "properties": {
-    "subagent_id": {
+    "agent_id": {
       "type": "string",
-      "description": "The subagent id returned when the background subagent was started."
+      "description": "The agent id of your direct continuable child, or your direct parent when you are a resident continuable child."
     },
     "message": {
       "type": "string",
-      "description": "The message to deliver to the subagent."
+      "description": "The message to deliver to the agent."
     }
   },
   "required": [
-    "subagent_id",
+    "agent_id",
     "message"
   ]
 }
@@ -1582,33 +2321,6 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 来源：[`packages/subagent/tool-subagent-control/src/index.ts`](../packages/subagent/tool-subagent-control/src/index.ts)
 
 这些是控制可继续后台 subagent 的全局命名工具：绑定提供方的 `tool-subagent` 实例注册不同的委派工具；本包注册一次 `send_message` 和 `interrupt_agent`，另由 `list_agents` 通过单独加载的 `/list-agents` 插件提供，其目录行使用 sessionProjections 和实时 Agent 注册表。
-
-<a id="deepseek-aidsh-tool-subagent-report"></a>
-
-## `@deepseek-ai/dsh-tool-subagent-report`
-
-### `report`
-
-向启动你的 agent 报告选定内容。在你结束前调用一次，给出自包含的最终结果；当进度或发现会改变该 agent 接下来的行动时，也可以更早调用。该 agent 与你共享工作区，但不会自动收到你的 transcript（文本记录）、工具输出或推理，因此完成你的工作本身并不等于交出结果。报告不会结束你的轮次或完成你的工作，且只有直接父级会收到。失败的调用仍可能已经送达，因此不要盲目重复。
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "output": {
-      "type": "string",
-      "description": "Actionable content for your parent; summarize conclusions and reference relevant shared paths."
-    }
-  },
-  "required": [
-    "output"
-  ]
-}
-```
-
-来源：[`packages/subagent/tool-subagent-report/src/index.ts`](../packages/subagent/tool-subagent-report/src/index.ts)
-
-按可继续的进程内子级注册，而非全局注册，因此该 schema 仅在这种子级内部可见，并且不受其全局 `toolFilter` 影响。同一份贡献还会安装子级作用域的 `tool:report` 系统提示词 section，本目录不渲染该 section。面向父级的 `send_message` 工具单独安装。
 
 <a id="deepseek-aidsh-tool-jobs"></a>
 
@@ -1682,6 +2394,297 @@ lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，�
 来源：[`packages/jobs/tool-jobs/src/index.ts`](../packages/jobs/tool-jobs/src/index.ts)
 
 与任务种类无关的后台任务控制器：后台 bash 命令、PTY 发送和 subagent 都通过相同的 3 个工具读取、列出和终止。加载该插件会挂接控制器，从而启用生产方的 `ctx.jobs.start()`。
+
+<a id="deepseek-aidsh-experimental-tool-agent-team"></a>
+
+## `@deepseek-ai/dsh-experimental-tool-agent-team`
+
+### `interrupt_agent`
+
+中断一名 teammate 的当前 turn，同时保留其待处理 inbox。仅 Team Lead 可用。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string",
+      "description": "Teammate name."
+    }
+  },
+  "required": [
+    "target"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `list_agents`
+
+列出 Lead 与所有持久 teammate，以及各自当前的运行时状态。
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `send_message`
+
+向另一名 Team member 发送一条持久消息。running target 会在最近的步骤边界收到消息；idle target 会启动一个 turn；inactive teammate 会冷恢复。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string",
+      "description": "Team member name, or lead."
+    },
+    "message": {
+      "type": "string",
+      "description": "Self-contained message for the target."
+    }
+  },
+  "required": [
+    "target",
+    "message"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `spawn_teammate`
+
+创建一名具名、持久的 teammate。只有 Team Lead 可以调用此工具。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Unique lower-kebab-case teammate name."
+    },
+    "description": {
+      "type": "string",
+      "description": "Short description of the delegated responsibility."
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Complete initial task for the teammate."
+    },
+    "context": {
+      "type": "string",
+      "description": "fresh starts without Lead history; fork inherits completed Lead turns. Defaults to fresh.",
+      "enum": [
+        "fresh",
+        "fork"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "prompt"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `team_task_create`
+
+在共享 Team 任务板上创建一个无 owner 的 pending task。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "subject": {
+      "type": "string",
+      "description": "Concise task title."
+    },
+    "description": {
+      "type": "string",
+      "description": "Complete task details and acceptance criteria."
+    },
+    "blocked_by": {
+      "type": "array",
+      "description": "Task ids that must complete first.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "write_scopes": {
+      "type": "array",
+      "description": "Advisory workspace-relative file or directory prefixes this task expects to modify.",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "subject",
+    "description"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `team_task_get`
+
+在修改或执行共享任务前，读取其完整的最新值。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Shared task id."
+    }
+  },
+  "required": [
+    "task_id"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `team_task_list`
+
+列出共享任务，包括 readiness、owner、revision、blocker 与 write-scope warning。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "description": "Optional exact status filter.",
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    },
+    "owner": {
+      "type": "string",
+      "description": "Optional member-name filter; use unowned for tasks without an owner."
+    },
+    "ready": {
+      "type": "boolean",
+      "description": "Optional readiness filter."
+    },
+    "cursor": {
+      "type": "integer",
+      "description": "Zero-based result offset. Defaults to 0."
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Number of rows, 1 through 100. Defaults to 50."
+    }
+  }
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `team_task_update`
+
+使用 team_task_get 或 team_task_list 返回的最新 revision，对共享任务操作执行 compare-and-set。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Shared task id."
+    },
+    "expected_revision": {
+      "type": "integer",
+      "description": "Current task revision used as the CAS precondition."
+    },
+    "action": {
+      "type": "string",
+      "description": "Task transition to apply.",
+      "enum": [
+        "claim",
+        "release",
+        "edit",
+        "set_dependencies",
+        "complete",
+        "reopen",
+        "reassign",
+        "delete"
+      ]
+    },
+    "subject": {
+      "type": "string",
+      "description": "Replacement title for edit."
+    },
+    "description": {
+      "type": "string",
+      "description": "Replacement details for edit."
+    },
+    "blocked_by": {
+      "type": "array",
+      "description": "Complete blocker list for set_dependencies.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "write_scopes": {
+      "type": "array",
+      "description": "Replacement advisory write scopes for edit.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "owner": {
+      "type": "string",
+      "description": "Member name for Lead-only reassign; omit to unassign."
+    }
+  },
+  "required": [
+    "task_id",
+    "expected_revision",
+    "action"
+  ]
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+### `wait_agent`
+
+等待本次调用开始后下一次 teammate 状态、mailbox 或共享任务变更。它绝不会唤醒 inactive member；若没有其他 member 正在 running 或 provisioning，则立即返回 noProgress。唤醒或超时后应重新列出状态，而不是轮询。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "timeout_ms": {
+      "type": "integer",
+      "description": "Wait duration in milliseconds, from 10000 through 3600000. Defaults to 30000."
+    }
+  }
+}
+```
+
+来源：[`packages/experimental/tool-agent-team/src/index.ts`](../packages/experimental/tool-agent-team/src/index.ts)
+
+这 10 个工具限定于隐式 Team Lead 与持久 teammate 作用域。随产品发布的 dsh-base bundle 默认禁用该包；文档中的 Agent Teams profile patch 会启用它，并禁用旧 continuable child 的同名控制工具。
+
 
 <a id="deepseek-aidsh-tool-todo"></a>
 
@@ -1856,19 +2859,22 @@ todo_write 是会话所有的状态；UI 将最新的 todo/write 事件渲染为
 
 ### `web_search`
 
-在 Web 上搜索最新信息。返回可选的摘要答案和源 URL 列表。
+在 Web 上搜索最新信息。在必填的 `queries` 数组中提供 1–4 个查询。返回可选的摘要答案和来源 URL 列表。
 
 ```json
 {
   "type": "object",
   "properties": {
-    "query": {
-      "type": "string",
-      "description": "The search query."
+    "queries": {
+      "type": "array",
+      "description": "Required search queries; accepts 1–4 items and merges their results.",
+      "items": {
+        "type": "string"
+      }
     }
   },
   "required": [
-    "query"
+    "queries"
   ]
 }
 ```

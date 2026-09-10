@@ -9,7 +9,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
-import type { SubagentCatalogSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SubagentCatalogSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { BoardSnapshot, TicketView } from '@deepseek-ai/dsh-taskboard/client'
 import { SubagentBoardView, type SubagentBoardViewProps } from '../src/client/SubagentBoardView.tsx'
 import { zh } from '../src/client/locales.ts'

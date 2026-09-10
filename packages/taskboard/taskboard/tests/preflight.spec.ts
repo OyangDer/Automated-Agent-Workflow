@@ -19,10 +19,10 @@ import * as storageJson from '@deepseek-ai/dsh-storage-json'
 import * as storageDomain from '@deepseek-ai/dsh-storage-domain'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import type { SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import TaskboardService from '@deepseek-ai/dsh-taskboard'
 import type { TicketView } from '@deepseek-ai/dsh-taskboard'
 import {
@@ -81,7 +81,32 @@ async function addWorktree(repo: string, relativePath: string, branch: string): 
 
 /** A registry-compatible agent around one concrete session (cwd optional). */
 function stubAgentForSession(session: Session): Agent {
-  const inbox = new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} })
+  const nextTurn: Parameters<Inbox['append']>[1][] = []
+  const nextStep: Parameters<Inbox['append']>[1][] = []
+  const inbox: Inbox = {
+    nextTurn,
+    nextStep,
+    clear() { nextTurn.splice(0); nextStep.splice(0) },
+    append(target, message) { (target === 'next-turn' ? nextTurn : nextStep).push(message) },
+    prepend(target, message) { (target === 'next-turn' ? nextTurn : nextStep).unshift(message) },
+    replace(messageId, message) {
+      for (const pending of [nextTurn, nextStep]) {
+        const index = pending.findIndex(candidate => candidate.id === messageId)
+        if (index >= 0) { pending.splice(index, 1, message); return true }
+      }
+      return false
+    },
+    remove(messageId) {
+      for (const pending of [nextTurn, nextStep]) {
+        const index = pending.findIndex(candidate => candidate.id === messageId)
+        if (index >= 0) { pending.splice(index, 1); return true }
+      }
+      return false
+    },
+    splice(target, start, deleteCount, inserted) {
+      return (target === 'next-turn' ? nextTurn : nextStep).splice(start, deleteCount, ...inserted)
+    },
+  }
   return {
     id: session.id,
     options: {},
@@ -104,7 +129,13 @@ function masterAgent(rawId: string, cwd?: string): Agent {
   const id = SessionId(rawId)
   const session = cwd === undefined
     ? Session.create(id)
-    : Session.create(id, undefined, { version: 0, id, createdAt: Date.now(), cwd })
+    : Session.create(id, undefined, {
+      version: SESSION_FORMAT_VERSION,
+      id,
+      createdAt: Date.now(),
+      isSeeded: false,
+      cwd,
+    })
   return stubAgentForSession(session)
 }
 

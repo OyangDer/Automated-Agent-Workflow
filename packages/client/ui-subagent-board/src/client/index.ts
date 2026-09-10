@@ -6,11 +6,16 @@
  * taskboard/changed event, republished through one stable observable source.
  * The plugin owns no store beyond that live source.
  */
-import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 // Type-only: pulls the generated Remote API and ctx.remote merge through the Client assembly boundary.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
+// Type-only: pulls the Session Controller service merge.
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 // Type-only: pulls the ui-conversation SlotMap merge (the conversation.view ring).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+// Type-only: pulls the renderer-owned slots service.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'

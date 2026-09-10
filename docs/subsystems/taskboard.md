@@ -92,7 +92,7 @@ When a worker reports (`taskboard_report`), fails (`taskboard_fail`), or termina
 
 ## Cordis API
 
-Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — this section is byte-identical in both language sides of the page. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
+Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
 
 <a id="ctxtaskboard--taskboardservice"></a>
 
@@ -472,9 +472,12 @@ async updateOwn( agent: Agent, ticketId: string, title: string | undefined, desc
  * @param column - column filter, or null for every column.
  * @param mine - when true, only rows assigned to agentId.
  * @param agentId - the calling agent's id.
+ * @param detail - "compact" (default) returns the compact row; "full" also
+ * carries description, devNotes and the pending review report (V3-21 card
+ * read layering: compact by default, full when an anomaly needs it).
  * @returns the matching rows in position order.
  */
-async listRows(column: ColumnId | null, mine: boolean, agentId: string): Promise<TicketRow[]>
+async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: 'compact' | 'full' = 'compact', ): Promise<TicketRow[]>
 
 /**
  * One full ticket for the model.
@@ -498,7 +501,7 @@ async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; no
 
 Types: [Agent](core.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:532`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -521,5 +524,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:338`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

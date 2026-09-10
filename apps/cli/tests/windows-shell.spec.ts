@@ -13,11 +13,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import yaml from 'js-yaml'
 import { entryListSchema } from '@deepseek-ai/cordis-plugin-include'
 import { evaluate } from '@deepseek-ai/cordis-plugin-loader'
+import { SHIPPED_PRESET_ROOT } from '@deepseek-ai/dsh-agent-presets'
 import { composeEntries, initProfile, loadProfile, PROFILES_DIR } from '@deepseek-ai/dsh-app-boot'
 
 /**
@@ -52,7 +53,7 @@ describe('the shipped shell composition (real bundle layers)', () => {
     const byId = new Map(rows.map(row => [row.id, row]))
     // One shared patch set, two rosters: the shell stacks gate themselves.
     for (const id of ['bash-sandbox', 'pwsh-sandbox', 'tool-bash', 'tool-pwsh']) {
-      expect(byId.has(id), 'row ' + id).toBe(true)
+      expect(byId.has(id), `row ${id}`).toBe(true)
     }
     expect(disabledOn(byId.get('bash-sandbox')!, 'win32'), 'bash-sandbox on win32').toBe(true)
     expect(disabledOn(byId.get('bash-sandbox')!, 'linux'), 'bash-sandbox on linux').toBe(false)
@@ -66,14 +67,14 @@ describe('the shipped shell composition (real bundle layers)', () => {
     // permission switcher, fs-sandbox, and the approval service stay enabled
     // exactly as on POSIX — the confined pwsh executor is what changes.
     for (const id of ['permission', 'ui-permission', 'sandbox', 'sandbox-policy', 'fs-sandbox', 'approval']) {
-      expect(byId.get(id)?.disabled, 'row ' + id).not.toBe(true)
+      expect(byId.get(id)?.disabled, `row ${id}`).not.toBe(true)
     }
     // The launcher's cold-start module fallback BFS-links the apps/cli
     // dependency closure into the profile's node_modules, so every bare
     // plugin name in the base patch must resolve from there.
     const cliManifest = JSON.parse(readFileSync(anchor, 'utf8')) as { dependencies?: Record<string, string> }
     for (const name of ['@deepseek-ai/dsh-pwsh-sandbox', '@deepseek-ai/dsh-tool-pwsh']) {
-      expect(cliManifest.dependencies?.[name], 'cold-start closure must reach ' + name).toBeDefined()
+      expect(cliManifest.dependencies?.[name], `cold-start closure must reach ${name}`).toBeDefined()
     }
     expect(warnings).toEqual([])
   })
@@ -89,7 +90,7 @@ describe('the shipped shell composition (real bundle layers)', () => {
     )
     const byId = new Map(rows.map(row => [row.id, row]))
     for (const id of ['bash-sandbox', 'tool-bash', 'pwsh-sandbox', 'tool-pwsh']) {
-      expect(byId.has(id), 'row ' + id).toBe(true)
+      expect(byId.has(id), `row ${id}`).toBe(true)
     }
     // No web overlay: the tool rows keep their own gating too.
     expect(disabledOn(byId.get('tool-bash')!, 'win32'), 'tool-bash on win32').toBe(true)
@@ -101,54 +102,58 @@ describe('the shipped shell composition (real bundle layers)', () => {
 })
 
 describe('shipped agent presets gate both shell tools by platform', () => {
-  const presetRoot = resolve(fileURLToPath(new URL('../package.json', import.meta.url)), '..', 'config', 'agent-presets')
+  const presetRoot = SHIPPED_PRESET_ROOT
 
-  it.each(['standard', 'code', 'cordis'])('preset %s gates its shell tool rows by platform', (preset) => {
+  it.each(['standard', 'ptc', 'cordis'])('preset %s gates its shell tool rows by platform', (preset) => {
     const entries: unknown = yaml.load(
       readFileSync(join(presetRoot, preset, 'agent.cordis.yml'), 'utf8'),
       { schema: entryListSchema },
     )
-    if (!Array.isArray(entries)) throw new TypeError('preset ' + preset + ' must parse to an entry array')
+    if (!Array.isArray(entries)) throw new TypeError(`preset ${preset} must parse to an entry array`)
     for (const [id, win32] of [['tool-bash', true], ['tool-pwsh', false]] as const) {
       const row = entries.find((entry): entry is Record<string, unknown> => (
         typeof entry === 'object' && entry !== null && (entry as Record<string, unknown>).id === id
       ))
-      if (row === undefined) throw new TypeError('preset ' + preset + ' must mount ' + id)
+      if (row === undefined) throw new TypeError(`preset ${preset} must mount ${id}`)
       expect(row.disabled).toMatchObject({ __jsExpr: expect.any(String) as string })
       // A platform-scoped context pins both outcomes on every host.
       const expression = (row.disabled as { __jsExpr: string }).__jsExpr
-      expect(Boolean(evaluate({ process: { platform: 'win32' } }, expression)), id + ' on win32').toBe(win32)
-      expect(Boolean(evaluate({ process: { platform: 'linux' } }, expression)), id + ' on linux').toBe(!win32)
+      expect(Boolean(evaluate({ process: { platform: 'win32' } }, expression)), `${id} on win32`).toBe(win32)
+      expect(Boolean(evaluate({ process: { platform: 'linux' } }, expression)), `${id} on linux`).toBe(!win32)
     }
   })
 
-  it('minimal routes the shell slot by platform: PTY trio off and tool-pwsh on for win32', () => {
+  it('minimal mounts no shell tool row and gates its persistent shell stack by platform', () => {
     const entries: unknown = yaml.load(
       readFileSync(join(presetRoot, 'minimal', 'agent.cordis.yml'), 'utf8'),
       { schema: entryListSchema },
     )
     if (!Array.isArray(entries)) throw new TypeError('minimal preset must parse to an entry array')
-    const topLevel = new Map<string, Record<string, unknown>>(
-      (entries as Record<string, unknown>[]).map(entry => [String(entry.id), entry]),
-    )
-    // The win32 shell slot: tool-pwsh mounts only on win32 (PTY inspection is
-    // unsupported there); on POSIX the PTY-backed trio keeps the shell slot.
-    const pwsh = topLevel.get('tool-pwsh')
-    expect(pwsh, 'tool-pwsh must be present for the win32 shell slot').toBeDefined()
-    const pwshExpr = (pwsh!.disabled as { __jsExpr: string }).__jsExpr
-    expect(Boolean(evaluate({ process: { platform: 'win32' } }, pwshExpr)), 'tool-pwsh on win32').toBe(false)
-    expect(Boolean(evaluate({ process: { platform: 'linux' } }, pwshExpr)), 'tool-pwsh on linux').toBe(true)
-    // The PTY-backed trio lives inside the persistent-shell group and must be
-    // disabled on win32 (terminal inspection unsupported) and mounted elsewhere.
-    const shellGroup = topLevel.get('persistent-shell')
-    expect(shellGroup, 'missing persistent-shell group').toBeDefined()
-    const groupRows = shellGroup!.config as Record<string, unknown>[]
-    for (const id of ['pty', 'terminal-bash', 'persistent-bash']) {
-      const row = groupRows.find(entry => entry.id === id)
-      expect(row, 'missing PTY-backed entry ' + id).toBeDefined()
-      const expression = (row!.disabled as { __jsExpr: string }).__jsExpr
-      expect(Boolean(evaluate({ process: { platform: 'win32' } }, expression)), id + ' on win32').toBe(true)
-      expect(Boolean(evaluate({ process: { platform: 'linux' } }, expression)), id + ' on linux').toBe(false)
+    for (const id of ['tool-bash', 'tool-pwsh']) {
+      expect(entries.some(entry => (
+        typeof entry === 'object' && entry !== null && (entry as Record<string, unknown>).id === id
+      )), `${id} must be absent from minimal`).toBe(false)
     }
+    const group = entries.find((entry): entry is Record<string, unknown> => (
+      typeof entry === 'object' && entry !== null && (entry as Record<string, unknown>).id === 'persistent-shell'
+    ))
+    if (group === undefined) throw new TypeError('minimal preset must mount persistent-shell')
+    const rows = group.config as unknown[]
+    if (!Array.isArray(rows)) throw new TypeError('persistent-shell must carry a row list')
+    const byId = new Map(rows
+      .filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null)
+      .map(entry => [entry.id, entry]))
+    // The bash stack (terminal-bash + persistent-bash) mounts on POSIX only; the
+    // pwsh twin (terminal-bash with shellDialect pwsh + persistent-pwsh) mounts on
+    // win32 only — exactly one persistent shell per host.
+    for (const id of ['terminal-bash', 'persistent-bash']) {
+      expect(disabledOn(byId.get(id)!, 'win32'), `${id} on win32`).toBe(true)
+      expect(disabledOn(byId.get(id)!, 'linux'), `${id} on linux`).toBe(false)
+    }
+    for (const id of ['terminal-pwsh', 'persistent-pwsh']) {
+      expect(disabledOn(byId.get(id)!, 'win32'), `${id} on win32`).toBe(false)
+      expect(disabledOn(byId.get(id)!, 'linux'), `${id} on linux`).toBe(true)
+    }
+    expect(byId.get('terminal-pwsh')?.config).toMatchObject({ shellDialect: 'pwsh' })
   })
 })

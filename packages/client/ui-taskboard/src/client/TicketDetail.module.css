@@ -6,7 +6,10 @@
   display: flex;
   flex-direction: column;
   background: var(--dsw-alias-bg-module-platform);
-  border-left: 1px solid var(--dsw-alias-border-l2);
+  border-left: 0;
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
   box-shadow: var(--dsw-shadow-lv3);
 }
 
@@ -16,7 +19,7 @@
   justify-content: space-between;
   gap: 8px;
   padding: 10px 12px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .title {
@@ -121,7 +124,7 @@
 }
 
 .reviewBox {
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 8px;
   padding: 8px 10px;
   display: flex;
@@ -193,7 +196,7 @@
 
 .input, .textarea {
   background: var(--dsw-alias-bg-base);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
@@ -228,12 +231,12 @@
   flex-wrap: wrap;
   gap: 6px;
   padding: 10px 12px;
-  border-top: 1px solid var(--dsw-alias-border-l2);
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .button {
   background: var(--dsw-alias-button-tool-bar-fill);
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   color: var(--dsw-alias-label-primary);
   font-size: 12px;

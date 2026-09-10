@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-taskboard",
   "description": "Five-column kanban ticket board: durable workflow domain, agent claim/complete/review tools, reviewer automation, and the browser Remote API",
-  "version": "0.1.0-rc.5",
+  "version": "0.1.5-alpha.1",
   "publishConfig": {
     "access": "public"
   },

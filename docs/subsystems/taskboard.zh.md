@@ -2,7 +2,7 @@
 
 [English](taskboard.md) | 中文
 
-五列看板工单域的类型与工作流。工单通过 [storage-domain 接口](storage.md) 持久化；Agent 使用 `taskboard_*` 工具驱动工作流，浏览器页签通过 Remote API 渲染同一份状态。包的 [README](../../packages/taskboard/taskboard/README.md) 定义了可调用 API 与模型可见契约。
+五列看板工单域的类型与工作流。工单通过 [storage-domain 接口](storage.zh.md) 持久化；Agent 使用 `taskboard_*` 工具驱动工作流，浏览器页签通过 Remote API 渲染同一份状态。包的 [README](../../packages/taskboard/taskboard/README.zh.md) 定义了可调用 API 与模型可见契约。
 
 ## 列与工作流
 
@@ -92,7 +92,7 @@ interface TaskboardChanged {
 
 ## Cordis API
 
-Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — this section is byte-identical in both language sides of the page. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
+Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.zh.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
 
 <a id="ctxtaskboard--taskboardservice"></a>
 
@@ -472,9 +472,12 @@ async updateOwn( agent: Agent, ticketId: string, title: string | undefined, desc
  * @param column - column filter, or null for every column.
  * @param mine - when true, only rows assigned to agentId.
  * @param agentId - the calling agent's id.
+ * @param detail - "compact" (default) returns the compact row; "full" also
+ * carries description, devNotes and the pending review report (V3-21 card
+ * read layering: compact by default, full when an anomaly needs it).
  * @returns the matching rows in position order.
  */
-async listRows(column: ColumnId | null, mine: boolean, agentId: string): Promise<TicketRow[]>
+async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: 'compact' | 'full' = 'compact', ): Promise<TicketRow[]>
 
 /**
  * One full ticket for the model.
@@ -496,9 +499,9 @@ async viewTicket(ticketId: string): Promise<TicketView>
 async boardNotices(boardId: string, agent: Agent): Promise<{ boardId: string; notices: BoardNotice[] }>
 ```
 
-Types: [Agent](core.md)
+Types: [Agent](core.zh.md)
 
-Source: [`packages/taskboard/taskboard/src/service.ts:532`](../../packages/taskboard/taskboard/src/service.ts)
+Source: [`packages/taskboard/taskboard/src/service.ts`](../../packages/taskboard/taskboard/src/service.ts)
 
 <a id="taskboard-events"></a>
 
@@ -521,5 +524,5 @@ One durable taskboard mutation has committed. Forwarded to the browser verbatim;
 'taskboard/changed'(change: TaskboardChanged): void
 ```
 
-Source: [`packages/taskboard/taskboard/src/types.ts:338`](../../packages/taskboard/taskboard/src/types.ts)
+Source: [`packages/taskboard/taskboard/src/types.ts`](../../packages/taskboard/taskboard/src/types.ts)
 <!-- END GENERATED cordis-surface -->

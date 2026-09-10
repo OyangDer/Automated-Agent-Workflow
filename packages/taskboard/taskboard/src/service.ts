@@ -760,17 +760,15 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Build the agentOptions for one spawned child: the model plus the
-   * reasoning effort when one is configured AND the provider advertises the
-   * effort capability (V3-5). An unsupporting provider gets the model only;
-   * the caller records the downgrade.
+   * reasoning effort when one is configured. Callers only include this value
+   * when the provider advertises the unified agentOptions capability (V3-5).
    * @param model - the effective model id.
    * @param effort - the effective effort level, or undefined for adapter default.
-   * @param supportsEffort - whether the spawn provider advertises the effort capability.
    */
-  private static agentOptionsFor(model: string, effort: string | undefined, supportsEffort: boolean): AgentOptions {
+  private static agentOptionsFor(model: string, effort: string | undefined): AgentOptions {
     return {
       model,
-      ...(effort !== undefined && supportsEffort ? { reasoningEffort: ReasoningEffortId(effort) } : {}),
+      ...(effort !== undefined ? { reasoningEffort: ReasoningEffortId(effort) } : {}),
     }
   }
 
@@ -1198,7 +1196,7 @@ export class TaskboardService extends TypertRemoteService {
       const capabilities = provider?.capabilities
       const supportsOutputSchema = capabilities === undefined || capabilities.outputSchema
       const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
-      const supportsEffort = capabilities === undefined || capabilities.effort
+      const supportsAgentOptions = capabilities === undefined || capabilities.agentOptions
       const basePrompt = reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket)
       // Degraded report mode: without structured output the reviewer returns
       // its verdict as plain text; the prompt says so instead of silently
@@ -1216,13 +1214,15 @@ export class TaskboardService extends TypertRemoteService {
       // recorded instead of failing the spawn (capability downgrade).
       const modelCfg = await this.effectiveModelConfig(ticket.boardId)
       const droppedReviewerEffort = modelCfg.reviewerEffort
-      const effortDowngraded = droppedReviewerEffort !== undefined && !supportsEffort
+      const effortDowngraded = droppedReviewerEffort !== undefined && !supportsAgentOptions
       const request: SubagentStartRequest = {
         label: 'review ' + ticket.id,
         prompt,
         parent,
         signal: controller.signal,
-        agentOptions: TaskboardService.agentOptionsFor(modelCfg.reviewerModel, modelCfg.reviewerEffort, supportsEffort),
+        ...(supportsAgentOptions ? {
+          agentOptions: TaskboardService.agentOptionsFor(modelCfg.reviewerModel, modelCfg.reviewerEffort),
+        } : {}),
         // Report mode: the reviewer returns a structured conclusion only and
         // never decides on the card; direct mode keeps the v1 reviewer tools.
         // Unsupported capabilities are omitted (downgrade) instead of rejected.
@@ -1232,7 +1232,7 @@ export class TaskboardService extends TypertRemoteService {
       const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
       if (effortDowngraded) {
         await this.recordEffortDowngrade(ticket.id, 'reviewer', droppedReviewerEffort, this.resolved.reviewProvider).catch(() => {})
-        this.ctx.logger.info('taskboard: reviewer effort "' + droppedReviewerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.reviewProvider + '" does not advertise the effort capability')
+        this.ctx.logger.info('taskboard: reviewer effort "' + droppedReviewerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.reviewProvider + '" does not advertise the agentOptions capability')
       }
       return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run, controller }
     } catch (error) {
@@ -1299,14 +1299,14 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Follow up the original worker after a rejection (打回原窗口). The worker
-   * was spawned one-shot by V2-1's assign, and the continuation manager only
-   * accepts continuable children, so this is best-effort: when the followup
-   * cannot be delivered the master re-dispatches with taskboard_reassign.
+   * is addressed through the live Agent registry. This is best-effort: when
+   * the session is no longer live the master re-dispatches with
+   * taskboard_reassign.
    */
   private async followupWorker(master: Agent, ticket: TicketView, feedback: string): Promise<'sent' | 'unavailable' | 'none'> {
     if (ticket.workerSessionId === undefined) return 'none'
-    const subagents = this.ctx.get('subagents')
-    if (subagents === undefined || typeof subagents.followup !== 'function') return 'unavailable'
+    const worker = this.ctx.agents.get(ticket.workerSessionId as SessionId)
+    if (worker === undefined) return 'unavailable'
     try {
       const content: ContentBlock[] = [{
         type: 'text',
@@ -1319,15 +1319,15 @@ export class TaskboardService extends TypertRemoteService {
           'Fix the issues above, then finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing the rework.',
         ].join('\n'),
       }]
-      await subagents.followup(
-        master,
-        ticket.workerSessionId as SessionId,
+      worker.followup(createUserMessage({
         content,
-        {
-          source: { kind: 'coordinator', form: 'relay', senderSessionId: master.id },
-          signal: new AbortController().signal,
+        source: {
+          kind: 'taskboard',
+          boardId: ticket.boardId,
+          form: 'relay',
+          senderSessionId: master.id,
         },
-      )
+      }))
       return 'sent'
     } catch {
       return 'unavailable'
@@ -1381,7 +1381,7 @@ export class TaskboardService extends TypertRemoteService {
         : undefined
       const capabilities = provider?.capabilities
       const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
-      const supportsEffort = capabilities === undefined || capabilities.effort
+      const supportsAgentOptions = capabilities === undefined || capabilities.agentOptions
       // The controller outlives start() so taskboard_pause can abort the
       // in-flight worker run through the card's recorded handle.
       const controller = new AbortController()
@@ -1390,7 +1390,7 @@ export class TaskboardService extends TypertRemoteService {
       // cannot honor is omitted and recorded instead of failing the spawn.
       const modelCfg = await this.effectiveModelConfig(ticket.boardId)
       const droppedWorkerEffort = modelCfg.workerEffort
-      const effortDowngraded = droppedWorkerEffort !== undefined && !supportsEffort
+      const effortDowngraded = droppedWorkerEffort !== undefined && !supportsAgentOptions
       const request: SubagentStartRequest = {
         label: workerLabel ?? ticket.title,
         // The master session id names the worker's independent branch
@@ -1402,13 +1402,15 @@ export class TaskboardService extends TypertRemoteService {
           : buildWorkerPrompt(ticket, cwd, parent.id) + '\n' + preflightPromptSection(preflight) }],
         parent,
         signal: controller.signal,
-        agentOptions: TaskboardService.agentOptionsFor(modelCfg.workerModel, modelCfg.workerEffort, supportsEffort),
+        ...(supportsAgentOptions ? {
+          agentOptions: TaskboardService.agentOptionsFor(modelCfg.workerModel, modelCfg.workerEffort),
+        } : {}),
         ...(supportsToolFilter ? { toolFilter: { deny: WORKER_DENIED_TOOLS } } : {}),
       }
       const run: SubagentRun = await subagents.start(this.resolved.workerProvider, request)
       if (effortDowngraded) {
         await this.recordEffortDowngrade(ticket.id, 'worker', droppedWorkerEffort, this.resolved.workerProvider).catch(() => {})
-        this.ctx.logger.info('taskboard: worker effort "' + droppedWorkerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.workerProvider + '" does not advertise the effort capability')
+        this.ctx.logger.info('taskboard: worker effort "' + droppedWorkerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.workerProvider + '" does not advertise the agentOptions capability')
       }
       return { ok: true, sessionId: run.id, run, controller }
     } catch (error) {
@@ -1466,7 +1468,7 @@ export class TaskboardService extends TypertRemoteService {
    * between turns.
    */
   private static lastActivityOf(agent: Agent): number {
-    const events = agent.session.events
+    const events = agent.session.snapshotEvents()
     const last = events.length > 0 ? events[events.length - 1]?.time : undefined
     return last ?? agent.session.header.createdAt
   }

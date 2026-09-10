@@ -127,11 +127,21 @@ export interface TaskboardNoticeSource {
   readonly kind: 'taskboard'
   /** The board whose seat holder receives the notice. */
   readonly boardId: string
+  readonly form?: never
+  readonly senderSessionId?: never
+}
+
+/** Durable attribution for a master-to-worker rework relay. */
+export interface TaskboardRelaySource {
+  readonly kind: 'taskboard'
+  readonly boardId: string
+  readonly form: 'relay'
+  readonly senderSessionId: string
 }
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    taskboard: TaskboardNoticeSource
+    taskboard: TaskboardNoticeSource | TaskboardRelaySource
   }
 }
 
@@ -521,7 +531,12 @@ export interface CompactEventFields {
   anomaly?: string
 }
 
-/** Render one compact master-event line from its fields. */
+/**
+ * Render one compact master-event line from its fields.
+ * @param kind - stable event-kind prefix shown to the master.
+ * @param fields - compact ticket facts appended to the prefix.
+ * @returns one single-line event summary.
+ */
 export function formatCompactEvent(kind: string, fields: CompactEventFields): string {
   const bits = [
     kind + ' ticket=' + fields.ticket,
