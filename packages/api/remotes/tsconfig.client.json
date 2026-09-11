@@ -82,6 +82,9 @@
     },
     {
       "path": "../../taskboard/taskboard"
+    },
+    {
+      "path": "../../feedback/command-feedback"
     }
   ]
 }
