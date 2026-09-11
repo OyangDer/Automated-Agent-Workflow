@@ -80,6 +80,24 @@ function catalog(rows: readonly SessionFormatEvent[], version: 0 | 1 | 3, valida
 }
 
 describe('V2 content admission', () => {
+  it('preserves Taskboard message attribution across a complete V0 to V3 migration', () => {
+    const taskboardSource = { kind: 'taskboard', boardId: 'default' }
+    const inboxMessage = { ...user, id: 'taskboard-inbox', source: taskboardSource }
+    const surfaceMessage = { ...user, id: 'taskboard-surface', source: taskboardSource }
+    const output = catalog([
+      ...opening,
+      event('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [inboxMessage] }),
+      event('user/message', surfaceMessage, true),
+      ...closing,
+    ], 0)
+
+    expect(output.header.version).toBe(3)
+    expect((output.events.find(row => row.type === 'agent/inbox/spliced')?.data as SessionFormatJsonObject)['inserted'])
+      .toEqual([inboxMessage])
+    expect(output.events.find(row => row.type === 'user/message' && (row.data as SessionFormatJsonObject)['id'] === 'taskboard-surface')?.data)
+      .toEqual(surfaceMessage)
+  })
+
   it('preserves opaque JSON, serialized arguments, compact runs and non-content counters exactly', () => {
     const opaque = { ...future, blockType: 'future-content', block: future, blocks: [future], summary: [future], message: { content: [future] } }
     const replayState = { response: opaque, blocks: [opaque, opaque] }
