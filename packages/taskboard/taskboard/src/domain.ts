@@ -48,6 +48,9 @@ export class TaskboardError extends Error {
 /** How many history rows one ticket retains (oldest dropped first). */
 export const HISTORY_LIMIT = 50
 
+/** How many recent history rows a wake-up prompt replays as the recorded progress. */
+const CONTINUATION_PROGRESS_ROWS = 6
+
 /** How many master notices one board retains (oldest dropped first). */
 export const NOTICE_LIMIT = 100
 
@@ -192,9 +195,16 @@ export function buildReviewPrompt(ticket: TicketView, facts?: ReviewerGitFacts |
  * @param ticket - the ticket under review.
  * @param facts - the review-time git facts, when computed (see
  * {@link buildReviewPrompt}).
+ * @param verdictViaTool - V3-28: when the reviewer runs as a durable
+ *   continuable child it cannot carry an outputSchema (structured output is a
+ *   one-shot-only subagent capability), so it returns the same
+ *   { verdict, summary, problems } report through taskboard_review_verdict
+ *   instead of the structured-output tool.
  * @returns the child's user prompt text.
  */
-export function buildReviewReportPrompt(ticket: TicketView, facts?: ReviewerGitFacts | null): string {
+export function buildReviewReportPrompt(
+  ticket: TicketView, facts?: ReviewerGitFacts | null, verdictViaTool = false,
+): string {
   const capsule = compileReviewerCapsule(ticket, facts)
   return [
     ['You are the reviewer for taskboard ticket', ticket.id, '("' + ticket.title + '"), currently In testing.'].join(' '),
@@ -209,11 +219,20 @@ export function buildReviewReportPrompt(ticket: TicketView, facts?: ReviewerGitF
       "- The target branch was confirmed by the master (the confirmed branch is recorded in the ticket's targetBranch field or devNotes); flag any mismatch.",
     ] : []),
     '',
-    'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool; the master resolves the card from your verdict.',
-    'Finish by calling the structured_output tool exactly once with:',
-    '  - verdict: "approve" when the work passes, "reject" when it must be reworked,',
-    '  - summary: what you inspected and why it passes or fails,',
-    '  - problems: concrete, actionable rework items (empty when approving).',
+    ...(verdictViaTool ? [
+      'You are a reporting reviewer: you do NOT move cards; the master resolves the card from your verdict.',
+      'Finish with EXACTLY ONE call to taskboard_review_verdict, nothing else:',
+      '  - ticketId: "' + ticket.id + '",',
+      '  - verdict: "approve" when the work passes, "reject" when it must be reworked,',
+      '  - summary: what you inspected and why it passes or fails,',
+      '  - problems: concrete, actionable rework items (empty when approving).',
+    ] : [
+      'You are a reporting reviewer: you do NOT move cards and you do NOT call any taskboard tool; the master resolves the card from your verdict.',
+      'Finish by calling the structured_output tool exactly once with:',
+      '  - verdict: "approve" when the work passes, "reject" when it must be reworked,',
+      '  - summary: what you inspected and why it passes or fails,',
+      '  - problems: concrete, actionable rework items (empty when approving).',
+    ]),
   ].join('\n')
 }
 
@@ -260,6 +279,40 @@ export function buildWorkerPrompt(
     'When the work is done and verified, finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing what changed, which files were touched, and how it was verified.',
     '',
     'If you cannot complete the work (blocked, missing access, irrecoverable error), finish with EXACTLY ONE call to taskboard_fail with ticketId "' + ticket.id + '" and a concrete reason.',
+  ].join('\n')
+}
+
+/**
+ * The wake-up prompt for a worker session that is already dispatched to a
+ * ticket (V3-28). Unlike {@link buildWorkerPrompt} this message is delivered
+ * into the existing child session, so it never re-briefs the ticket from
+ * scratch: it restates the identity, the acceptance criteria (compiled fresh
+ * from the current card), the recorded progress, why the session was woken and
+ * the standing instruction not to roll back the preserved working tree — then
+ * points back at the unchanged finishing contract.
+ * @param ticket - the card the woken session already owns.
+ * @param reason - why the board judged the session lost and woke it.
+ * @returns the continuation message text.
+ */
+export function buildContinuationPrompt(ticket: TicketView, reason: string): string {
+  const capsule = compileWorkerCapsule(ticket)
+  const recent = ticket.history.slice(-(CONTINUATION_PROGRESS_ROWS))
+  return [
+    ['Wake-up: you are ALREADY the worker for taskboard ticket', ticket.id, '("' + ticket.title + '"), and this message continues YOUR existing session.'].join(' '),
+    'You keep the full context of your earlier exploration; the shared working tree is preserved — 续做勿回滚：勿回滚工作树，不要丢弃未提交的改动，从你停下的地方继续。',
+    'Do NOT roll back the working tree, do NOT discard uncommitted changes, and do NOT restart the work from scratch — resume from where you stopped.',
+    '',
+    renderWorkerCapsule(capsule),
+    '',
+    'Why you were woken: ' + reason,
+    ...(recent.length === 0 ? [] : [
+      '',
+      'Your recorded progress on this card (most recent last):',
+      ...recent.map(row => '  - [' + row.kind + '] ' + row.detail),
+    ]),
+    '',
+    'Continue the pending work against the goal, acceptance criteria and constraints above, then finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing what changed, which files were touched, and how it was verified.',
+    'If you are genuinely blocked, finish with EXACTLY ONE call to taskboard_fail with ticketId "' + ticket.id + '" and a concrete reason.',
   ].join('\n')
 }
 

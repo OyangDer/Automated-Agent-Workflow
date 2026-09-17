@@ -27,7 +27,10 @@ import {
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 // Type-only: resolves ctx.get('subagents') through the subagent seam augmentation.
 import type {} from '@deepseek-ai/dsh-subagent'
-import type { SubagentResult, SubagentStartRequest, SubagentRun } from '@deepseek-ai/dsh-subagent'
+import type {
+  ContinuableStartSpec, SubagentProvider, SubagentResult, SubagentRuntime,
+  SubagentStartRequest, SubagentRun,
+} from '@deepseek-ai/dsh-subagent'
 import {
   TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
@@ -43,8 +46,9 @@ import {
   type RepoPreflightConfig,
 } from './preflight.ts'
 import {
-  agentLabel, appendHistory, appendNotice, buildHandoverNotes, buildHandoverSnapshot, buildReviewPrompt,
-  buildReviewReportPrompt, buildWorkerPrompt, compactCardState, formatCompactEvent, formatHandoverSnapshotText,
+  agentLabel, appendHistory, appendNotice, buildContinuationPrompt, buildHandoverNotes,
+  buildHandoverSnapshot, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
+  compactCardState, formatCompactEvent, formatHandoverSnapshotText,
   formatTicketRowLine, MASTER_SECTION, masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 import type { HandoverCardRow } from './domain.ts'
@@ -163,6 +167,9 @@ function isReviewOutcome(value: unknown): value is { verdict: 'approve' | 'rejec
 }
 
 /** Stable master-notice event kinds (the dedupe key part alongside ticketId). */
+/** Reviewer verdicts a report-mode reviewer may report (validated at the tool boundary). */
+const REVIEW_VERDICTS: readonly string[] = ['approve', 'reject']
+
 const NOTICE_KIND = {
   reviewVerdict: 'review-verdict',
   workerDone: 'worker-done',
@@ -170,6 +177,7 @@ const NOTICE_KIND = {
   workerTerminated: 'worker-terminated',
   workerLost: 'worker-lost',
   workerRedispatched: 'worker-redispatched',
+  workerContinued: 'worker-continued',
   reviewerReleased: 'reviewer-released',
   userScheduled: 'user-scheduled',
   workerPaused: 'worker-paused',
@@ -367,15 +375,29 @@ export const Config: z<Config> = z.object({
 })
 
 /** One worker-spawn outcome. The controller owns the request signal; the
- * caller keeps it so a later taskboard_pause can abort the in-flight run. */
+ * caller keeps it so a later taskboard_pause can abort the in-flight run.
+ * V3-28: a continuable child has no run handle — `run` is undefined and
+ * `continuable` records that the session can be woken instead of respawned. */
 export type WorkerSpawnResult =
-  | { ok: true; sessionId: string; run: SubagentRun; controller: AbortController }
+  | {
+    ok: true
+    sessionId: string
+    run: SubagentRun | undefined
+    controller: AbortController
+    continuable: boolean
+  }
   | { ok: false; reason: 'unavailable' }
   | { ok: false; reason: 'failed'; errorMessage: string }
 
 /** One reviewer-spawn outcome. The controller owns the request signal. */
 export type ReviewSpawnResult =
-  | { spawned: true; reviewer: TicketAssignee; run: SubagentRun; controller: AbortController }
+  | {
+    spawned: true
+    reviewer: TicketAssignee
+    run: SubagentRun | undefined
+    controller: AbortController
+    continuable: boolean
+  }
   | { spawned: false; reason: 'unavailable' }
   | { spawned: false; reason: 'failed'; errorMessage: string }
 
@@ -393,10 +415,13 @@ export interface AssignTicketResult {
   workerAgentId: string | null
 }
 
-/** Tool payload: the card plus what happened to a re-dispatch worker spawn. */
+/**
+ * Tool payload: the card plus what happened to the re-dispatch. `continued`
+ * means the existing worker session was woken instead of re-spawned (V3-28).
+ */
 export interface ReassignTicketResult {
   ticket: TicketView
-  worker: 'spawned' | 'unavailable' | 'failed' | null
+  worker: 'spawned' | 'continued' | 'unavailable' | 'failed' | null
   workerAgentId: string | null
 }
 
@@ -597,7 +622,11 @@ export class TaskboardService extends TypertRemoteService {
    * current worker's run through this handle, and every settle/close path
    * clears the entry so a settled or removed card never leaks a handle.
    */
-  private readonly runHandles = new Map<string, { run: SubagentRun; controller: AbortController }>()
+  private readonly runHandles = new Map<string, {
+    sessionId: string
+    run: SubagentRun | undefined
+    controller: AbortController
+  }>()
 
   constructor(ctx: Context, config: Config = {}) {
     super(ctx, 'taskboard')
@@ -731,7 +760,7 @@ export class TaskboardService extends TypertRemoteService {
    */
   private clearRunHandle(ticketId: string, sessionId: string): void {
     const handle = this.runHandles.get(ticketId)
-    if (handle !== undefined && handle.run.id === sessionId) this.runHandles.delete(ticketId)
+    if (handle !== undefined && handle.sessionId === sessionId) this.runHandles.delete(ticketId)
   }
 
   /** Resolve the opened boards table. */
@@ -1178,6 +1207,65 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Whether the seam and the configured provider can establish a durable
+   * continuable child (V3-28). The seam method is the service capability and
+   * the provider's `prepareContinuable` (method presence) is the provider
+   * capability — the same signal the service itself uses to admit a
+   * continuable start. An unadvertised provider keeps the historic permissive
+   * stance: an unregistered provider fails either start path.
+   */
+  private static supportsContinuable(subagents: SubagentRuntime, providerName: string): boolean {
+    if (typeof subagents.startContinuable !== 'function') return false
+    const provider: SubagentProvider | undefined = typeof subagents.getProvider === 'function'
+      ? subagents.getProvider(providerName)
+      : undefined
+    return provider === undefined || typeof provider.prepareContinuable === 'function'
+  }
+
+  /**
+   * Start one child through the subagent seam, preferring the continuable path
+   * (V3-28): startContinuable establishes a durable child session that can be
+   * woken after a disconnect or restart instead of being re-spawned with an
+   * empty context. Providers that cannot establish continuable children keep
+   * the historic one-shot start().
+   *
+   * The continuable spec deliberately omits label/signal/outputSchema: the
+   * manager persists the label from the spec, owns the child's own signal, and
+   * structured output is a one-shot-only capability (subagent descriptor.ts),
+   * so a single request object can never carry both contracts.
+   * @param subagents - the resolved subagent seam.
+   * @param providerName - the provider for this child.
+   * @param request - the one-shot-shaped delegation request.
+   * @returns the child session id, the one-shot run handle when there is one,
+   *   and whether the child is continuable.
+   */
+  private async startChild(
+    subagents: SubagentRuntime,
+    providerName: string,
+    request: SubagentStartRequest,
+  ): Promise<{ sessionId: string; run: SubagentRun | undefined; continuable: boolean }> {
+    if (!TaskboardService.supportsContinuable(subagents, providerName)) {
+      const run: SubagentRun = await subagents.start(providerName, request)
+      return { sessionId: run.id, run, continuable: false }
+    }
+    const spec: ContinuableStartSpec = {
+      provider: providerName,
+      label: request.label ?? '',
+      request: {
+        prompt: request.prompt,
+        parent: request.parent,
+        ...(request.agentOptions === undefined ? {} : { agentOptions: request.agentOptions }),
+        ...(request.maxDepth === undefined ? {} : { maxDepth: request.maxDepth }),
+        ...(request.toolFilter === undefined ? {} : { toolFilter: request.toolFilter }),
+        ...(request.persona === undefined ? {} : { persona: request.persona }),
+      },
+      signal: request.signal,
+    }
+    const started = await subagents.startContinuable(spec)
+    return { sessionId: started.childId, run: undefined, continuable: true }
+  }
+
+  /**
    * Spawn the reviewer child for one ticket through the subagent seam. In
    * "report" mode the child only inspects and returns a structured verdict
    * ({ verdict, summary, problems }) — it is denied the card-mutating review
@@ -1203,11 +1291,21 @@ export class TaskboardService extends TypertRemoteService {
       const supportsOutputSchema = capabilities === undefined || capabilities.outputSchema
       const supportsToolFilter = capabilities === undefined || capabilities.toolFilter
       const supportsAgentOptions = capabilities === undefined || capabilities.agentOptions
-      const basePrompt = reportMode ? buildReviewReportPrompt(ticket) : buildReviewPrompt(ticket)
+      // V3-28: a continuable child cannot carry an outputSchema (structured
+      // output is one-shot-only, see the subagent descriptor contract), so a
+      // report-mode reviewer running as a durable child returns its verdict
+      // through the taskboard_review_verdict tool instead of the
+      // structured-output capture. Both channels keep the same semantics: the
+      // reviewer reports, the master resolves with taskboard_resolve_review.
+      const continuable = TaskboardService.supportsContinuable(subagents, this.resolved.reviewProvider)
+      const verdictViaTool = reportMode && continuable
+      const basePrompt = reportMode
+        ? buildReviewReportPrompt(ticket, undefined, verdictViaTool)
+        : buildReviewPrompt(ticket)
       // Degraded report mode: without structured output the reviewer returns
       // its verdict as plain text; the prompt says so instead of silently
       // dropping the contract.
-      const promptText = reportMode && !supportsOutputSchema
+      const promptText = reportMode && !verdictViaTool && !supportsOutputSchema
         ? basePrompt + '\n\n[Note: the configured provider does not support structured output; return your verdict (approve or reject) with a summary and problems as plain text in your final message.]'
         : basePrompt
       const prompt: ContentBlock[] = [{ type: 'text', text: promptText }]
@@ -1232,15 +1330,21 @@ export class TaskboardService extends TypertRemoteService {
         // Report mode: the reviewer returns a structured conclusion only and
         // never decides on the card; direct mode keeps the v1 reviewer tools.
         // Unsupported capabilities are omitted (downgrade) instead of rejected.
-        ...(reportMode && supportsOutputSchema ? { outputSchema: REVIEW_OUTCOME_SCHEMA } : {}),
+        ...(reportMode && !verdictViaTool && supportsOutputSchema ? { outputSchema: REVIEW_OUTCOME_SCHEMA } : {}),
         ...(reportMode && supportsToolFilter ? { toolFilter: { deny: REVIEWER_DENIED_TOOLS } } : {}),
       }
-      const run: SubagentRun = await subagents.start(this.resolved.reviewProvider, request)
+      const started = await this.startChild(subagents, this.resolved.reviewProvider, request)
       if (effortDowngraded) {
         await this.recordEffortDowngrade(ticket.id, 'reviewer', droppedReviewerEffort, this.resolved.reviewProvider).catch(() => {})
         this.ctx.logger.info('taskboard: reviewer effort "' + droppedReviewerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.reviewProvider + '" does not advertise the agentOptions capability')
       }
-      return { spawned: true, reviewer: { agentId: run.id, label: reviewerLabel(run.id) }, run, controller }
+      return {
+        spawned: true,
+        reviewer: { agentId: started.sessionId, label: reviewerLabel(started.sessionId) },
+        run: started.run,
+        controller,
+        continuable: started.continuable,
+      }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       return { spawned: false, reason: 'failed', errorMessage }
@@ -1254,8 +1358,14 @@ export class TaskboardService extends TypertRemoteService {
    * model error resolves with stopReason "error"), so the rejection arm is a
    * defensive no-op.
    */
-  private trackReviewerRun(ticketId: string, sessionId: string, run: SubagentRun, controller: AbortController): void {
-    this.runHandles.set(ticketId, { run, controller })
+  private trackReviewerRun(
+    ticketId: string, sessionId: string, run: SubagentRun | undefined, controller: AbortController,
+  ): void {
+    this.runHandles.set(ticketId, { sessionId, run, controller })
+    // A continuable reviewer has no run handle: its verdict arrives through
+    // taskboard_review_verdict, and a seat that never reports is released and
+    // re-reviewed by the existing reviewer-staleness reconciliation.
+    if (run === undefined) return
     const result: Promise<SubagentResult> | undefined = run.result
     if (result === undefined) return
     void result.then(
@@ -1270,6 +1380,22 @@ export class TaskboardService extends TypertRemoteService {
     this.clearRunHandle(ticketId, sessionId)
     const structured = outcome.structured
     if (structured === undefined || !isReviewOutcome(structured)) return
+    await this.landReviewOutcome(ticketId, sessionId, structured)
+  }
+
+  /**
+   * Land one reviewer-reported verdict on the card and notify the master. The
+   * two report channels converge here: the one-shot structured-output capture
+   * (the settled run's `structured` value) and, for a continuable reviewer
+   * (V3-28), the taskboard_review_verdict tool the reviewer itself calls.
+   * Identity checked either way: only the reviewer the card currently names,
+   * while the card is still In testing, can land a verdict.
+   */
+  private async landReviewOutcome(
+    ticketId: string,
+    sessionId: string,
+    structured: { verdict: 'approve' | 'reject'; summary: string; problems: string[] },
+  ): Promise<void> {
     let landed = false
     const next = await this.mutate(ticketId, 'review-claim', (current) => {
       // The card must still name this reviewer and remain under review;
@@ -1301,6 +1427,49 @@ export class TaskboardService extends TypertRemoteService {
         }) + '. Adjudicate with taskboard_resolve_review.',
         NOTICE_KIND.reviewVerdict, next.id)
     }
+  }
+
+  /**
+   * Report one reviewer verdict from a continuable reviewer session (V3-28).
+   * A durable reviewer child cannot carry an outputSchema — structured output
+   * is a one-shot-only subagent capability — so instead of the
+   * structured-output capture it calls the taskboard_review_verdict tool,
+   * which lands the same { verdict, summary, problems } report through the one
+   * landing path. The reviewer still never decides the card: the master
+   * resolves it with taskboard_resolve_review.
+   * @param agent - the reviewer session agent.
+   * @param ticketId - the In testing ticket under review.
+   * @param verdict - 'approve' or 'reject'.
+   * @param summary - what the reviewer inspected and concluded.
+   * @param problems - concrete rework items (empty when approving).
+   * @returns the card with reviewOutcome recorded.
+   */
+  async submitReviewVerdict(
+    agent: Agent,
+    ticketId: string,
+    verdict: 'approve' | 'reject',
+    summary: string,
+    problems: readonly string[],
+  ): Promise<TicketView> {
+    if (!REVIEW_VERDICTS.includes(verdict)) {
+      throw new TaskboardError('reviewer verdict must be "approve" or "reject"', 'TASKBOARD_INVALID_INPUT')
+    }
+    const notes = resolveRequiredText(summary, 'reviewer summary')
+    const current = (await this.tickets()).get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    if (current.column !== 'in_testing' || current.reviewer === null || current.reviewer.agentId !== agent.id) {
+      throw new TaskboardError(
+        'ticket "' + ticketId + '" is not under review by session "' + agent.id + '"',
+        'TASKBOARD_NOT_REVIEWER',
+      )
+    }
+    const items = (Array.isArray(problems) ? problems : [])
+      .map(problem => typeof problem === 'string' ? problem.trim() : '')
+      .filter(problem => problem !== '')
+    await this.landReviewOutcome(ticketId, agent.id, { verdict, summary: notes, problems: items })
+    return (await this.tickets()).get(ticketId) ?? current
   }
 
   /**
@@ -1413,12 +1582,12 @@ export class TaskboardService extends TypertRemoteService {
         } : {}),
         ...(supportsToolFilter ? { toolFilter: { deny: WORKER_DENIED_TOOLS } } : {}),
       }
-      const run: SubagentRun = await subagents.start(this.resolved.workerProvider, request)
+      const started = await this.startChild(subagents, this.resolved.workerProvider, request)
       if (effortDowngraded) {
         await this.recordEffortDowngrade(ticket.id, 'worker', droppedWorkerEffort, this.resolved.workerProvider).catch(() => {})
         this.ctx.logger.info('taskboard: worker effort "' + droppedWorkerEffort + '" downgraded for ticket ' + ticket.id + ': provider "' + this.resolved.workerProvider + '" does not advertise the agentOptions capability')
       }
-      return { ok: true, sessionId: run.id, run, controller }
+      return { ok: true, sessionId: started.sessionId, run: started.run, controller, continuable: started.continuable }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       return { ok: false, reason: 'failed', errorMessage }
@@ -1430,8 +1599,15 @@ export class TaskboardService extends TypertRemoteService {
    * is still In progress and still owned by that session, so the worker was
    * terminated mid-flight.
    */
-  private trackWorkerRun(ticketId: string, sessionId: string, run: SubagentRun, controller: AbortController): void {
-    this.runHandles.set(ticketId, { run, controller })
+  private trackWorkerRun(
+    ticketId: string, sessionId: string, run: SubagentRun | undefined, controller: AbortController,
+  ): void {
+    this.runHandles.set(ticketId, { sessionId, run, controller })
+    // V3-28: a continuable worker has no run result to observe. A mid-flight
+    // death is caught by the existing liveness reconciliation, which then
+    // wakes the durable session through recoverLostWorker instead of
+    // re-spawning it.
+    if (run === undefined) return
     const result: Promise<SubagentResult> | undefined = run.result
     if (result === undefined) return
     void result.then(
@@ -1496,6 +1672,45 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Wake one lost worker's durable session instead of re-spawning it (V3-28).
+   * The continuation message carries the ticket identity, the acceptance
+   * criteria, the recorded progress and the standing "do not roll back"
+   * instruction, and sendMessage delivers it to the exact child session the
+   * card records: a running child admits it at the nearest step boundary, an
+   * idle child starts a turn, and an absent child cold-resumes from
+   * persistence.
+   *
+   * The sender is the live master Agent (`board.masterAgentId` from the
+   * registry) — sendMessage requires an exact live direct parent, but not a
+   * master *turn*, so the automatic recovery path can wake without one.
+   * Fail-closed: every refusal (no seam method, no live master, a worker
+   * dispatched before V3-28 whose session carries no continuation state, or a
+   * provider that cannot resume) is returned as a detail so the caller falls
+   * back to the historic re-spawn.
+   * @returns woken once the message was accepted by the child's inbox.
+   */
+  private async wakeWorker(
+    master: Agent, ticket: TicketView, reason: string,
+  ): Promise<{ woken: true } | { woken: false; detail: string }> {
+    const subagents = this.ctx.get('subagents')
+    if (subagents === undefined) return { woken: false, detail: 'the subagent seam is unavailable' }
+    if (typeof subagents.sendMessage !== 'function') {
+      return { woken: false, detail: 'the subagent seam exposes no continuable sendMessage' }
+    }
+    const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
+    if (sessionId === undefined) return { woken: false, detail: 'the card records no worker session' }
+    const content: ContentBlock[] = [{ type: 'text', text: buildContinuationPrompt(ticket, reason) }]
+    try {
+      await subagents.sendMessage(master, sessionId as SessionId, content, {
+        signal: new AbortController().signal,
+      })
+    } catch (error) {
+      return { woken: false, detail: error instanceof Error ? error.message : String(error) }
+    }
+    return { woken: true }
+  }
+
+  /**
    * One lost-worker recovery: auto-redispatch a fresh worker while the
    * per-card budget lasts and a live master session exists to spawn from,
    * otherwise mark the card blocked. Shared by the settlement callback
@@ -1512,9 +1727,15 @@ export class TaskboardService extends TypertRemoteService {
    * Reentry-safe: the guarded mutate re-checks column/status/worker identity
    * atomically, so a card another path already recovered is returned
    * untouched and exactly one recovery ever lands per loss.
-   * @returns 'redispatched' | 'blocked' | 'skipped'
+   * V3-28: before spending a fresh spawn the recovery tries to WAKE the
+   * durable worker session (see {@link wakeWorker}). A successful wake keeps
+   * the card running with the same worker session — its context and working
+   * tree survive — and only a refusal falls through to the re-spawn below.
+   * @returns 'continued' | 'redispatched' | 'blocked' | 'skipped'
    */
-  private async recoverLostWorker(ticket: TicketView, reason: string): Promise<'redispatched' | 'blocked' | 'skipped'> {
+  private async recoverLostWorker(
+    ticket: TicketView, reason: string,
+  ): Promise<'continued' | 'redispatched' | 'blocked' | 'skipped'> {
     const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
     if (registry === undefined || typeof registry.get !== 'function') return 'skipped'
     const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
@@ -1536,6 +1757,55 @@ export class TaskboardService extends TypertRemoteService {
         + ' (no live master session to auto-redispatch)')
     }
     const attempt = ticket.autoRetries + 1
+    // Wake first (V3-28): the durable child session already holds the
+    // exploration context, so a wake costs one message instead of a fresh
+    // worker re-reading the repository from scratch.
+    const wake = await this.wakeWorker(master, ticket, reason)
+    if (wake.woken) {
+      // Same guarded attach as the re-spawn path, but the card keeps the
+      // worker session it already names: only the loss record and the budget
+      // counter move.
+      let continued = false
+      let woken: TicketView
+      try {
+        woken = await this.mutate(ticket.id, 'reassign', (current) => {
+          if (current.column !== 'in_progress' || current.status !== 'running') return current
+          const currentSession = current.workerSessionId ?? current.workerAgentId
+          if (currentSession !== sessionId) return current
+          continued = true
+          return appendHistory(
+            {
+              ...current,
+              status: 'running',
+              failure: null,
+              autoRetries: attempt,
+              description: current.description.trim() === ''
+                ? `[auto-continue #${attempt}] 续做勿回滚：the existing worker session was woken; continue from the preserved working tree.`
+                : `${current.description}\n\n[auto-continue #${attempt}] 续做勿回滚：the existing worker session was woken; continue from the preserved working tree.`,
+              updatedAt: Date.now(),
+            },
+            'reassign',
+            'woken to continue after ' + reason,
+          )
+        })
+      } catch {
+        return 'skipped'
+      }
+      if (!continued) return 'skipped'
+      await this.notifyMaster(woken.boardId,
+        'Taskboard notice: ' + formatCompactEvent('WORKER_CONTINUED', {
+          ticket: woken.id,
+          title: woken.title,
+          state: compactCardState(woken),
+          scope: woken.filesScope,
+          anomaly: `lost (${reason}); woke the existing worker session (attempt ${attempt} of ${this.resolved.workerAutoRetryLimit}); its context and working tree are preserved`,
+        }),
+        NOTICE_KIND.workerContinued, woken.id)
+      return 'continued'
+    }
+    // No continuation state (a worker dispatched before V3-28, or a provider
+    // that cannot resume) and a failed wake both land here: the historic
+    // fresh re-spawn on the preserved working tree.
     const spawn = await this.spawnWorker(master, ticket, 'auto-redispatch ' + attempt + ' ' + ticket.title)
     if (!spawn.ok) {
       const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
@@ -1585,7 +1855,7 @@ export class TaskboardService extends TypertRemoteService {
         title: next.title,
         state: compactCardState(next),
         scope: next.filesScope,
-        anomaly: 'lost (' + reason + '); auto-redispatched (attempt ' + attempt + ' of ' + this.resolved.workerAutoRetryLimit + '); working tree preserved — the new worker continues without rolling back',
+        anomaly: `lost (${reason}); auto-redispatched (attempt ${attempt} of ${this.resolved.workerAutoRetryLimit}); working tree preserved — the new worker continues without rolling back; wake refused (${wake.detail})`,
       }),
       NOTICE_KIND.workerRedispatched, next.id)
     return 'redispatched'
@@ -2866,20 +3136,60 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * Master re-dispatches one card: "retry" spawns a fresh worker (card back
-   * to running, failure cleared), "backlog" returns the card to Not started.
+   * to running, failure cleared), "backlog" returns the card to Not started,
+   * and "continue" (V3-28) wakes the card's existing worker session instead of
+   * spawning a replacement — the manual entry into the same wake path the
+   * automatic recovery uses for a running, blocked, or paused card. A refused
+   * wake (no continuation state, dead session, no seam) degrades to the
+   * historic fresh spawn, so "continue" never leaves the card without a
+   * worker.
    * @param agent - the master session agent.
    * @param ticketId - the In progress card to re-dispatch.
-   * @param action - retry or backlog.
+   * @param action - retry, backlog, or continue.
    * @param workerLabel - optional display label for a retry worker.
    * @returns the re-dispatched card plus the worker-spawn outcome.
    */
-  async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult> {
+  async reassign(
+    agent: Agent, ticketId: string, action: 'retry' | 'backlog' | 'continue', workerLabel?: string,
+  ): Promise<ReassignTicketResult> {
     const table = await this.tickets()
     const current = table.get(ticketId)
     if (current === undefined) {
       throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
     await this.assertMasterOfTicket(current, agent)
+    if (action === 'continue') {
+      if (current.column !== 'in_progress') {
+        throw new TaskboardError(
+          'ticket "' + current.id + '" is in "' + current.column + '" (continue requires In progress)',
+          'TASKBOARD_INVALID_TRANSITION',
+        )
+      }
+      const wake = await this.wakeWorker(agent, current, current.status === 'paused'
+        ? 'the master resumed this card from pause'
+        : 'the master asked this worker session to continue')
+      if (wake.woken) {
+        const continued = await this.mutate(ticketId, 'reassign', (woken) => {
+          if (woken.column !== 'in_progress') return woken
+          const currentSession = woken.workerSessionId ?? woken.workerAgentId
+          if (currentSession !== (current.workerSessionId ?? current.workerAgentId)) return woken
+          return appendHistory(
+            { ...woken, status: 'running', failure: null, updatedAt: Date.now() },
+            'reassign',
+            'master woke the existing worker session (续做勿回滚)',
+          )
+        })
+        return {
+          ticket: continued,
+          worker: 'continued',
+          workerAgentId: continued.workerSessionId ?? continued.workerAgentId ?? null,
+        }
+      }
+      this.ctx.logger.warn('taskboard: cannot continue ticket ' + ticketId + ' (' + wake.detail
+        + '); spawning a fresh worker on the preserved working tree')
+      // Fall through to the retry path below: a fresh worker is the only
+      // remaining option once the recorded session cannot be resumed.
+    }
     if (action === 'backlog') {
       const ticket = await this.mutate(ticketId, 'reassign', (returned) => {
         if (returned.column !== 'in_progress') {
@@ -3000,6 +3310,20 @@ export class TaskboardService extends TypertRemoteService {
     const handle = this.runHandles.get(ticketId)
     if (handle !== undefined) {
       handle.controller.abort()
+      // A continuable worker (V3-28) is not driven by the request signal once
+      // its prompt was accepted: its current turn is cancelled through the
+      // subagent interrupt authority. Best effort — the paused status itself
+      // already keeps the card out of every automatic recovery path.
+      if (handle.run === undefined) {
+        const subagents = this.ctx.get('subagents')
+        if (subagents !== undefined && typeof subagents.interrupt === 'function') {
+          try {
+            subagents.interrupt(handle.sessionId as SessionId, { kind: 'ancestor', agent })
+          } catch {
+            // Best effort: an absent or unauthorized target is already paused.
+          }
+        }
+      }
       this.runHandles.delete(ticketId)
     }
     await this.notifyMaster(paused.boardId,
@@ -3009,7 +3333,7 @@ export class TaskboardService extends TypertRemoteService {
         state: compactCardState(paused),
         scope: paused.filesScope,
         anomaly: 'worker run aborted by master',
-      }) + '. Resume with taskboard_reassign action "retry", which spawns a fresh worker.',
+      }) + '. Resume with taskboard_reassign action "continue" (wake the same session) or "retry" (fresh worker).',
       NOTICE_KIND.workerPaused, paused.id)
     return paused
   }
@@ -3955,6 +4279,50 @@ export class TaskboardService extends TypertRemoteService {
     }))
 
     this.ctx.tools.register(defineTool({
+      name: 'taskboard_review_verdict',
+      description: 'Report your review verdict on an In testing taskboard ticket you are the designated reviewer of (V3-28 report-mode reviewers running as a durable continuable child): the verdict is recorded on the card and the master resolves it with taskboard_resolve_review. This tool never moves the card, so report only after actually inspecting the work.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The In testing ticket you review.' },
+        verdict: {
+          type: 'string' as const, required: true, enum: ['approve', 'reject'],
+          description: '"approve" when the work passes, "reject" when it must be reworked.',
+        },
+        summary: { type: 'string' as const, required: true, description: 'What you inspected and why it passes or fails.' },
+        problems: {
+          type: 'array' as const,
+          items: { type: 'string' as const },
+          description: 'Concrete, actionable rework items; empty when approving.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            verdict: { type: 'string', required: true, enum: ['approve', 'reject'] },
+          },
+        },
+        render: (_args, value: { id: string; verdict: string }) => [{
+          type: 'text' as const,
+          text: 'ticket ' + value.id + ' review verdict "' + value.verdict + '" recorded; the master resolves the card',
+        }],
+      },
+      execute: async (args: {
+        ticketId: string
+        verdict: 'approve' | 'reject'
+        summary: string
+        problems?: string[]
+      }, exec) => {
+        const value = await this.submitReviewVerdict(
+          TaskboardService.agentOf(exec), args.ticketId, args.verdict, args.summary, args.problems ?? [],
+        )
+        return { id: value.id, column: value.column, verdict: args.verdict }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Report review verdict', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
       name: 'taskboard_update',
       description: 'Update a taskboard ticket this agent owns: title, description, and/or devNotes. Omitted fields stay unchanged.',
       parameters: {
@@ -4305,12 +4673,12 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_reassign',
-      description: 'Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.',
+      description: 'Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "continue" (V3-28) instead wakes the card\'s existing worker session — it keeps its context and the preserved working tree, so prefer it for a blocked, paused or silent worker, and it degrades to a fresh spawn by itself when the session cannot be resumed; action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The In progress card to re-dispatch.' },
         action: {
-          type: 'string' as const, required: true, enum: ['retry', 'backlog'],
-          description: 'retry spawns a new worker; backlog returns the card to Not started.',
+          type: 'string' as const, required: true, enum: ['retry', 'continue', 'backlog'],
+          description: 'retry spawns a new worker; continue wakes the existing worker session (falling back to a fresh spawn); backlog returns the card to Not started.',
         },
         workerLabel: {
           type: 'string' as const,
@@ -4324,7 +4692,7 @@ export class TaskboardService extends TypertRemoteService {
             ticketId: { type: 'string', required: true },
             column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
             status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
-            worker: { oneOf: [{ type: 'string', enum: ['spawned', 'unavailable', 'failed'] }, { type: 'null' }] as const, required: true },
+            worker: { oneOf: [{ type: 'string', enum: ['spawned', 'continued', 'unavailable', 'failed'] }, { type: 'null' }] as const, required: true },
             workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
           },
         },
@@ -4332,10 +4700,12 @@ export class TaskboardService extends TypertRemoteService {
           type: 'text' as const,
           text: value.worker === 'spawned'
             ? 'ticket ' + value.ticketId + ' re-dispatched; new worker started'
-            : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker),
+            : value.worker === 'continued'
+              ? 'ticket ' + value.ticketId + ' re-dispatched; the existing worker session was woken (context and working tree preserved)'
+              : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker),
         }],
       },
-      execute: async (args: { ticketId: string; action: 'retry' | 'backlog'; workerLabel?: string }, exec) => {
+      execute: async (args: { ticketId: string; action: 'retry' | 'continue' | 'backlog'; workerLabel?: string }, exec) => {
         const result = await this.reassign(TaskboardService.agentOf(exec), args.ticketId, args.action, args.workerLabel)
         return {
           ticketId: result.ticket.id,
@@ -4680,6 +5050,7 @@ export class TaskboardService extends TypertRemoteService {
  * list is consulted, so denying them here is safe.
  */
 const WORKER_DENIED_TOOLS = [
+  'taskboard_review_verdict',
   'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
   'taskboard_assign', 'taskboard_reassign', 'taskboard_pause', 'taskboard_claim_master',

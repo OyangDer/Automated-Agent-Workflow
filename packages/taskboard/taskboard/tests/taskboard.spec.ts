@@ -156,6 +156,10 @@ interface Harness {
   spawnedWorkerId: string
   /** The vi.fn backing the stubbed subagents.start seam. */
   subagentsStart: ReturnType<typeof vi.fn>
+  /** The vi.fn backing the stubbed subagents.startContinuable seam (V3-28). */
+  subagentsStartContinuable: ReturnType<typeof vi.fn>
+  /** The vi.fn backing the stubbed subagents.sendMessage seam (V3-28 wake-ups). */
+  subagentsSendMessage: ReturnType<typeof vi.fn>
   /** The request signals of every worker spawn, in spawn order (taskboard_pause aborts the latest one). */
   workerSignals: AbortSignal[]
   /** The request signals of every reviewer spawn, in spawn order. */
@@ -223,6 +227,19 @@ interface HarnessOptions {
   reviewerStaleTimeoutMs?: number
   /** When set, a fake session-persistence seam (append/inspect) is provided to the service. */
   sessionPersistence?: ReturnType<typeof fakeSessionPersistence>
+  /**
+   * V3-28: when true the stubbed subagent seam exposes the continuable surface
+   * (startContinuable + sendMessage) and its provider advertises
+   * prepareContinuable, so dispatch/serve go through the durable child path.
+   */
+  continuable?: boolean
+  /**
+   * When false the stubbed provider advertises no prepareContinuable even with
+   * `continuable` (capability downgrade); defaults to `continuable`.
+   */
+  providerSupportsContinuable?: boolean
+  /** When set, the stubbed continuable sendMessage rejects with this message (a refused wake). */
+  sendMessageError?: string
 }
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
@@ -241,8 +258,32 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const spawnedWorkerId = 'worker-child-agent'
   const workerIds = options.workerSpawnIds ?? ['worker-child-agent']
   let workerSpawnCount = 0
+  let continuableSpawnCount = 0
   const workerSignals: AbortSignal[] = []
   const reviewerSignals: AbortSignal[] = []
+  // V3-28 continuable surface: startContinuable resolves a durable child id
+  // (never a run handle — structured output and run.result are one-shot-only)
+  // and sendMessage is the wake channel the recovery uses.
+  const continuableProvider = options.providerSupportsContinuable ?? options.continuable === true
+  const subagentsStartContinuable = vi.fn(async (spec: { provider: string; label: string }) => {
+    if (options.failReviewerSpawn === true && spec.label.startsWith('review ')) {
+      throw new Error('reviewer spawn exploded')
+    }
+    if (spec.label.startsWith('review ')) return { childId: spawnedReviewerId, messageId: 'continuable-reviewer' }
+    const id = workerIds[Math.min(continuableSpawnCount, workerIds.length - 1)]!
+    continuableSpawnCount += 1
+    return { childId: id, messageId: `continuable-worker-${continuableSpawnCount}` }
+  })
+  const subagentsSendMessage = vi.fn(async (_sender: Agent, target: string) => {
+    if (options.sendMessageError !== undefined) throw new Error(options.sendMessageError)
+    // Faithful to the seam: a provider that mints no continuable descriptor
+    // leaves a child with no continuation state, and a cold resume of such a
+    // child is refused exactly this way.
+    if (!continuableProvider) {
+      throw new Error('subagent "' + target + '" has no supported continuation state and cannot be resumed')
+    }
+    return 'wake-message-1'
+  })
   let subagentsStart: ReturnType<typeof vi.fn>
   if (spawn === 'spawn') {
     subagentsStart = vi.fn(async (_provider: string, request: SubagentStartRequest) => {
@@ -269,10 +310,15 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     })
     ctx.provide('subagents', {
       start: subagentsStart,
-      ...(options.providerCapabilities === undefined ? {} : {
+      ...(options.continuable === true ? {
+        startContinuable: subagentsStartContinuable,
+        sendMessage: subagentsSendMessage,
+      } : {}),
+      ...(options.providerCapabilities === undefined && options.continuable !== true ? {} : {
         getProvider: () => ({
           name: 'spawn',
           capabilities: options.providerCapabilities,
+          ...(continuableProvider ? { prepareContinuable: () => undefined } : {}),
         }),
       }),
     } as never)
@@ -331,7 +377,8 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   }
   return {
     ctx, service, root, changes, devA, devB, reviewerChild, workerChild,
-    spawnedReviewerId, spawnedWorkerId, subagentsStart, workerSignals, reviewerSignals,
+    spawnedReviewerId, spawnedWorkerId, subagentsStart, subagentsStartContinuable, subagentsSendMessage,
+    workerSignals, reviewerSignals,
     unregisterWorker, unregisterReviewer, unregisterMaster,
   }
 }
@@ -3734,3 +3781,176 @@ describe('column vocabulary', () => {
 function devAgent(ticket: TicketView): Agent {
   return stubAgent('move-agent-' + ticket.id)
 }
+describe('V3-28 continuable dispatch and wake-up recovery', () => {
+  /** One stubbed continuable start spec as the fake seam receives it. */
+  interface StartedSpec {
+    provider: string
+    label: string
+    request: {
+      prompt: { type: string; text: string }[]
+      outputSchema?: unknown
+      toolFilter?: { deny?: string[] }
+    }
+  }
+
+  it('dispatches the worker through startContinuable (provider stays "spawn") and records the durable child session', async () => {
+    const h = await harness({ continuable: true })
+    await h.service.claimMaster('default', h.devA)
+    const card = await createTicket(h.service, 'continuable dispatch')
+    await scheduleToNotStarted(h.service, h.devA, card)
+    const assigned = await h.service.assign(h.devA, card.id)
+    expect(h.subagentsStart).not.toHaveBeenCalled()
+    expect(h.subagentsStartContinuable).toHaveBeenCalledTimes(1)
+    const spec = h.subagentsStartContinuable.mock.calls[0]![0] as StartedSpec
+    expect(spec.provider).toBe('spawn')
+    expect(spec.label).toBe(card.title)
+    // A durable child can never carry the one-shot structured-output contract.
+    expect(spec.request.outputSchema).toBeUndefined()
+    expect(assigned.worker).toBe('spawned')
+    const current = await h.service.viewTicket(card.id)
+    expect(current.status).toBe('running')
+    expect(current.workerAgentId).toBe('worker-child-agent')
+    expect(current.workerSessionId).toBe('worker-child-agent')
+  })
+
+  it('wakes the recorded child session when the worker is judged lost — no replacement is spawned', async () => {
+    const h = await harness({ continuable: true })
+    await h.service.claimMaster('default', h.devA)
+    const followup = vi.spyOn(h.devA, 'followup')
+    const card = await createTicket(h.service, 'wake me instead of respawning')
+    await scheduleToNotStarted(h.service, h.devA, card)
+    await h.service.assign(h.devA, card.id)
+    // The worker session vanishes (host restart / hard death).
+    h.unregisterWorker()
+    expect(await h.service.reconcileLostWorkers()).toBe(1)
+    expect(h.subagentsSendMessage).toHaveBeenCalledTimes(1)
+    const call = h.subagentsSendMessage.mock.calls[0] as unknown as [Agent, string, { type: string; text: string }[]]
+    // The sender is the exact live master agent (sendMessage's live-sender
+    // requirement) and the target is the same child session the card records.
+    expect(call[0]).toBe(h.devA)
+    expect(call[1]).toBe('worker-child-agent')
+    const message = call[2].map(part => part.text).join('')
+    expect(message).toContain(card.id)
+    expect(message).toContain(card.title)
+    expect(message).toContain('续做勿回滚')
+    expect(message).toContain('Why you were woken')
+    // No second start: the durable session was woken in place.
+    expect(h.subagentsStartContinuable).toHaveBeenCalledTimes(1)
+    expect(h.subagentsStart).not.toHaveBeenCalled()
+    const current = await h.service.viewTicket(card.id)
+    expect(current.status).toBe('running')
+    expect(current.failure).toBeNull()
+    expect(current.workerSessionId).toBe('worker-child-agent')
+    expect(current.autoRetries).toBe(1)
+    expect(current.description).toContain('续做勿回滚')
+    // History and the master notice both record a wake, not a re-spawn.
+    expect(current.history.some(row => row.detail.startsWith('woken to continue after'))).toBe(true)
+    expect(followup).toHaveBeenCalledTimes(1)
+    expect(textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })).toContain('WORKER_CONTINUED')
+    const notice = (await h.service.snapshot(h.devA)).notices?.at(-1)
+    expect(notice).toMatchObject({ kind: 'worker-continued', ticketId: card.id })
+  })
+
+  it('degrades to a fresh spawn when the wake is refused, and stays one-shot when the provider cannot resume', async () => {
+    // A seam that exposes startContinuable but whose sendMessage refuses the
+    // wake (no continuation state for that child): recovery falls back.
+    const refused = await harness({
+      continuable: true,
+      sendMessageError: 'subagent has no supported continuation state',
+      workerSpawnIds: ['worker-child-agent', 'worker-child-2'],
+    })
+    await refused.service.claimMaster('default', refused.devA)
+    const card = await createTicket(refused.service, 'refused wake')
+    await scheduleToNotStarted(refused.service, refused.devA, card)
+    await refused.service.assign(refused.devA, card.id)
+    refused.unregisterWorker()
+    expect(await refused.service.reconcileLostWorkers()).toBe(1)
+    expect(refused.subagentsSendMessage).toHaveBeenCalledTimes(1)
+    // The fallback is a fresh child (a new durable session), never the one the
+    // refused wake targeted.
+    expect(refused.subagentsStartContinuable).toHaveBeenCalledTimes(2)
+    expect(refused.subagentsStart).not.toHaveBeenCalled()
+    const spawned = await refused.service.viewTicket(card.id)
+    expect(spawned.status).toBe('running')
+    expect(spawned.autoRetries).toBe(1)
+    expect(spawned.workerSessionId).toBe('worker-child-2')
+    expect(spawned.description).toContain('auto-redispatch #1')
+    // A provider without prepareContinuable keeps the historic one-shot path
+    // end to end — including recovery, which never tries to wake.
+    const oneShot = await harness({ continuable: true, providerSupportsContinuable: false })
+    await oneShot.service.claimMaster('default', oneShot.devA)
+    const card2 = await createTicket(oneShot.service, 'one shot provider')
+    await scheduleToNotStarted(oneShot.service, oneShot.devA, card2)
+    await oneShot.service.assign(oneShot.devA, card2.id)
+    expect(oneShot.subagentsStart).toHaveBeenCalledTimes(1)
+    expect(oneShot.subagentsStartContinuable).not.toHaveBeenCalled()
+    oneShot.unregisterWorker()
+    expect(await oneShot.service.reconcileLostWorkers()).toBe(1)
+    // The wake is refused (the child has no continuation state) and the
+    // recovery degrades to the historic spawn.
+    expect(oneShot.subagentsSendMessage).toHaveBeenCalledTimes(1)
+    expect(oneShot.subagentsStart).toHaveBeenCalledTimes(2)
+  })
+
+  it('spawns the report-mode reviewer through startContinuable and lands its verdict through taskboard_review_verdict', async () => {
+    const h = await harness({ continuable: true })
+    await h.service.claimMaster('default', h.devA)
+    const card = await createTicket(h.service, 'continuable review')
+    await toNotStarted(h.service, h.devA, card)
+    await h.service.assign(h.devA, card.id)
+    const reported = await h.service.report(h.workerChild, card.id, 'implemented and tested')
+    expect(reported.review).toBe('spawned')
+    expect(reported.reviewerAgentId).toBe('reviewer-child-agent')
+    expect(h.subagentsStartContinuable).toHaveBeenCalledTimes(2)
+    const spec = h.subagentsStartContinuable.mock.calls[1]![0] as StartedSpec
+    expect(spec.provider).toBe('spawn')
+    expect(spec.label).toBe('review ' + card.id)
+    // A continuable reviewer cannot return a run result / structured output, so
+    // its verdict travels through the reviewer-facing tool instead.
+    expect(spec.request.outputSchema).toBeUndefined()
+    const prompt = spec.request.prompt.map(part => part.text).join('')
+    expect(prompt).toContain('taskboard_review_verdict')
+    expect(prompt).toContain(card.id)
+    expect(spec.request.toolFilter?.deny).toContain('taskboard_approve')
+    // Only the designated reviewer seat may land a verdict.
+    await expect(h.service.submitReviewVerdict(h.workerChild, card.id, 'approve', 'sneaky', []))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_REVIEWER' })
+    const landed = await h.service.submitReviewVerdict(h.reviewerChild, card.id, 'reject', 'the parse path is broken', ['fix the parse() path'])
+    expect(landed.reviewOutcome).toMatchObject({ verdict: 'reject' })
+    expect((await h.service.viewTicket(card.id)).reviewOutcome).toMatchObject({ verdict: 'reject' })
+    // The reviewer never moves the card; the master resolves it as before.
+    expect((await h.service.viewTicket(card.id)).column).toBe('in_testing')
+    const result = await h.service.resolveReview(h.devA, card.id, 'approve', 'verified after rework', [])
+    expect(result.action).toBe('approved')
+    expect(result.ticket.column).toBe('done')
+  })
+
+  it('taskboard_reassign action "continue" wakes a paused or blocked card into the same worker session', async () => {
+    const h = await harness({ continuable: true })
+    await h.service.claimMaster('default', h.devA)
+    const card = await createTicket(h.service, 'resume by waking')
+    await scheduleToNotStarted(h.service, h.devA, card)
+    await h.service.assign(h.devA, card.id)
+    await h.service.pause(h.devA, card.id, 'hold on')
+    expect((await h.service.viewTicket(card.id)).status).toBe('paused')
+    const resumed = await h.service.reassign(h.devA, card.id, 'continue')
+    expect(resumed.worker).toBe('continued')
+    expect(resumed.workerAgentId).toBe('worker-child-agent')
+    expect(resumed.ticket.status).toBe('running')
+    expect(resumed.ticket.workerSessionId).toBe('worker-child-agent')
+    expect(resumed.ticket.history.at(-1)?.detail).toContain('master woke the existing worker session')
+    expect(h.subagentsSendMessage).toHaveBeenCalledTimes(1)
+    expect(h.subagentsStart).not.toHaveBeenCalled()
+    // A blocked card is woken the same way: the failure record clears and the
+    // recorded session identity is untouched.
+    await h.service.fail(h.workerChild, card.id, 'stuck on a missing fixture')
+    expect((await h.service.viewTicket(card.id)).status).toBe('blocked')
+    const back = await h.service.reassign(h.devA, card.id, 'continue')
+    expect(back.worker).toBe('continued')
+    expect(back.ticket.status).toBe('running')
+    expect(back.ticket.failure).toBeNull()
+    expect(back.ticket.workerSessionId).toBe('worker-child-agent')
+    expect(h.subagentsSendMessage).toHaveBeenCalledTimes(2)
+    expect(h.subagentsStart).not.toHaveBeenCalled()
+  })
+})
