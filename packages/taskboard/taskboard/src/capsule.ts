@@ -172,6 +172,15 @@ function indent(value: string): string {
   return value.split('\n').map(line => '  ' + line).join('\n')
 }
 
+/** The built-in output-discipline constraint that rides every role capsule
+ * (V3-24): oversized tool output is the dominant avoidable cost of a
+ * dispatched run, because every printed byte stays in the context and is
+ * re-sent on every later turn. Shared verbatim by both role capsules. */
+const RUNTIME_OUTPUT_DISCIPLINE = '  - Keep tool output small: cap long output at the shell (bash: `tail -n 120`; PowerShell: `Select-Object -Last 120`) and read only the lines you need (bash: `sed -n 10,25p`; PowerShell: `Select-Object -Skip 9 -First 16`) instead of printing a whole large file. Every byte you print stays in your context and is re-sent on every later turn, so oversized output is the main avoidable cost of this run.'
+
+/** The built-in "one focused command" constraint, shared by both capsules. */
+const RUNTIME_LOCATE_HINT = '  - Prefer one focused command over a broad repository sweep; locate the code with one targeted search before reading anything.'
+
 /** The one-line "not extracted" placeholder for an absent section. */
 const NO_GOAL = '(no 【目标】 section in the card description)'
 const NO_ACCEPTANCE = '(no 【验收】 section in the card description)'
@@ -230,8 +239,11 @@ export function renderWorkerCapsule(capsule: WorkerCapsule, cwd = ''): string {
     '  The card declares which files/directories it affects; stay inside that scope and do not edit files outside it (other parallel workers may own them). An undeclared scope means you are responsible for reporting exactly which paths you touched in devNotes.',
     '',
     '- Runtime constraints (built-in, always apply):',
-    '  - Keep tool output small: cap long output at the shell (bash: `tail -n 120`; PowerShell: `Select-Object -Last 120`) and read only the lines you need (bash: `sed -n 10,25p`; PowerShell: `Select-Object -Skip 9 -First 16`) instead of printing a whole large file. Every byte you print stays in your context and is re-sent on every later turn, so oversized output is the main avoidable cost of this run.',
+    RUNTIME_OUTPUT_DISCIPLINE,
     locationHint,
+    '',
+    '- Reporting contract (built-in, always apply):',
+    "  - Make every claim checkable: give the command you ran plus the key output line it produced (devNotes labels 'Tests run:' and 'Key output line:'). The reviewer re-runs the command and compares exactly that line, so a claim without its key output line is unverifiable and is treated as missing.",
     '',
     '- Constraints (verbatim from the card):',
     indent(capsule.constraints === '' ? NO_CONSTRAINTS : capsule.constraints),
@@ -248,27 +260,33 @@ export interface WorkerClaims {
   rootCause: string
   /** Claimed files changed, when labeled. */
   filesChanged: string
-  /** Claimed tests run, when labeled. */
+  /** Claimed tests run (the command), when labeled. */
   testsRun: string
+  /** The key output line the claimed command produced (V3-24): the reviewer
+   * re-runs the command and compares exactly this line. Empty = the claim
+   * arrived without its key line and is treated as missing, never guessed. */
+  keyOutputLine: string
   /** Claimed known anomaly / known issue, when labeled. */
   knownAnomaly: string
   /** The developer's notes verbatim — the compact claim source. */
   devNotes: string
 }
 
-const CLAIM_LABEL_PATTERN = /^\s*[-*]?\s*(Root cause|Files changed|Tests run|Known anomaly|Known issue|Anomaly)\s*[:：]\s*(.*)$/i
+const CLAIM_LABEL_PATTERN = /^\s*[-*]?\s*(Root cause|Files changed|Tests run|Key output line|关键输出行|Known anomaly|Known issue|Anomaly)\s*[:：]\s*(.*)$/i
 
 /**
  * Structure the worker's compact claims from its devNotes: labeled lines
- * ("Root cause:", "Files changed:", "Tests run:", "Known anomaly:") fill
- * their claim slots; the notes stay verbatim as the claim source. Lines
- * without a label are ignored by the extractor — the notes field always
- * carries the full text, so nothing is lost.
+ * ("Root cause:", "Files changed:", "Tests run:", "Key output line:",
+ * "Known anomaly:") fill their claim slots; the notes stay verbatim as the
+ * claim source. Lines without a label are ignored by the extractor — the
+ * notes field always carries the full text, so nothing is lost. An absent
+ * "Key output line:" leaves the slot empty on purpose (V3-24): the reviewer
+ * treats that claim as missing instead of inventing a line to compare.
  * @param devNotes - the developer's completion notes.
  * @returns the structured claims.
  */
 export function parseWorkerClaims(devNotes: string): WorkerClaims {
-  const claims: WorkerClaims = { rootCause: '', filesChanged: '', testsRun: '', knownAnomaly: '', devNotes }
+  const claims: WorkerClaims = { rootCause: '', filesChanged: '', testsRun: '', keyOutputLine: '', knownAnomaly: '', devNotes }
   for (const line of devNotes.split(/\r?\n/)) {
     const match = CLAIM_LABEL_PATTERN.exec(line)
     if (match === null) continue
@@ -277,6 +295,7 @@ export function parseWorkerClaims(devNotes: string): WorkerClaims {
     if (label === 'root cause') claims.rootCause = value
     else if (label === 'files changed') claims.filesChanged = value
     else if (label === 'tests run') claims.testsRun = value
+    else if (label === 'key output line' || label === '关键输出行') claims.keyOutputLine = value
     else claims.knownAnomaly = value
   }
   return claims
@@ -315,12 +334,42 @@ export function reviewerFactsFromPreflight(report: PreflightReport): ReviewerGit
   }
 }
 
+/** The reviewer verification depth (V3-24): 'standard' is the default and
+ * 'deep' is opt-in from the card — the card's 【审核】 section must read
+ * exactly "deep" to upgrade the reviewer. */
+export type ReviewerDepth = 'standard' | 'deep'
+
+/** The card section whose body switches the reviewer depth. */
+const REVIEW_DEPTH_MARKER = '审核'
+
+/**
+ * Derive the reviewer verification depth from the card description (V3-24).
+ * The default is 'standard': run the card's acceptance command once, derive
+ * the change set from the workspace, check the scope, probe the named
+ * boundary inputs — and read outside the change set only when a claim
+ * conflicts with the evidence. The card upgrades the reviewer to 'deep' only
+ * when its description carries a 【审核】 section whose body is exactly
+ * "deep" (case-insensitive); any other 【审核】 body is ordinary card content
+ * and leaves the default.
+ * @param description - the raw card description.
+ * @returns the reviewer depth.
+ */
+export function reviewerDepthFromDescription(description: string): ReviewerDepth {
+  for (const section of parseSections(description)) {
+    if (section.marker === null || section.title !== REVIEW_DEPTH_MARKER) continue
+    if (section.body.trim().toLowerCase() === 'deep') return 'deep'
+  }
+  return 'standard'
+}
+
 /** The reviewer capsule: exactly the fields the reviewer role needs. */
 export interface ReviewerCapsule {
   ticketId: string
   title: string
   /** The acceptance criteria, extracted verbatim from the 【验收】 section ('' when absent). */
   acceptance: string
+  /** The verification depth (V3-24), derived from the card description. */
+  depth: ReviewerDepth
   /** The card's declared file scope (verbatim). */
   filesScope: string
   /** The base/candidate commits and touched files under review. */
@@ -358,6 +407,7 @@ export function compileReviewerCapsule(
     ticketId: ticket.id,
     title: ticket.title,
     acceptance,
+    depth: reviewerDepthFromDescription(ticket.description),
     filesScope: ticket.filesScope,
     git: facts === null || facts === undefined
       ? { available: false, repoRoot: '', baseCommit: '', candidateCommit: '', touchedFiles: [] }
@@ -370,16 +420,23 @@ export function compileReviewerCapsule(
 /**
  * Render the reviewer capsule as the model-visible markdown block: the
  * acceptance criteria, base/candidate commits, declared scope, touched files,
- * the worker's compact claims, and the independent diff-first (not
- * diff-only) verification path.
+ * the worker's compact claims, the built-in runtime output discipline, the
+ * ≤10-step budget with its no-evidence-no-approval failure posture, and the
+ * independent diff-first (not diff-only) verification path at the capsule's
+ * depth — standard reads outside the change set only on a claim/evidence
+ * conflict, deep may follow the acceptance call paths out of it.
  * @param capsule - the compiled reviewer capsule.
  * @returns the capsule section text.
  */
 export function renderReviewerCapsule(capsule: ReviewerCapsule): string {
+  const deep = capsule.depth === 'deep'
   const lines: string[] = [
     '# Reviewer capsule (compiled from the current board state)',
     '',
     '- Ticket: ' + capsule.ticketId + ' ("' + capsule.title + '")',
+    '- Review depth: ' + (deep
+      ? 'deep (the card\'s 【审核】 section reads "deep" — open-ended reading along the acceptance call paths is allowed)'
+      : 'standard (default — the card does not mark 【审核】 as deep; read outside the change set only when a claim conflicts with the evidence you gathered)'),
     '',
     '- Acceptance criteria (verbatim from the card):',
     indent(capsule.acceptance === '' ? NO_ACCEPTANCE : capsule.acceptance),
@@ -405,26 +462,56 @@ export function renderReviewerCapsule(capsule: ReviewerCapsule): string {
     '  - Root cause: ' + (claims.rootCause === '' ? '(not claimed)' : claims.rootCause),
     '  - Files changed: ' + (claims.filesChanged === '' ? '(not claimed)' : claims.filesChanged),
     '  - Tests run: ' + (claims.testsRun === '' ? '(not claimed)' : claims.testsRun),
+    '  - Key output line: ' + (claims.keyOutputLine === ''
+      ? '(missing — the claim arrived without the key output line it produced; treat it as missing, never guess or substitute a line of your own)'
+      : claims.keyOutputLine),
     '  - Known anomaly: ' + (claims.knownAnomaly === '' ? '(not claimed)' : claims.knownAnomaly),
     '  - devNotes: ' + (claims.devNotes.trim() === '' ? '(none)' : claims.devNotes.trim()),
+    '  Each claim must carry the command that was run plus the key output line it produced: re-run the command and compare exactly that line. A claim without its key output line is missing evidence — treat it as missing, never guess.',
     '',
     '- Additional card details (verbatim):',
     indent(capsule.additionalDetails === '' ? NO_DETAILS : capsule.additionalDetails),
+    '',
+    '- Runtime constraints (built-in, always apply):',
+    RUNTIME_OUTPUT_DISCIPLINE,
+    RUNTIME_LOCATE_HINT,
+    '',
+    '- Review budget and failure posture (default target ≤10 steps):',
+    '  - Budget the review at ≤10 steps: one git diff / git status to derive the change set, each acceptance command run once, and stop as soon as every acceptance point has independent evidence.',
+    '  - 若在预算内无法独立验证，就用具体阻塞点打回，绝不在缺乏证据时通过。',
+    '  - If you cannot verify a point independently within that budget, reject with the concrete blocking point — never approve without evidence.',
   )
   const verification: string[] = [
     '',
-    'Independent verification (diff-first, not diff-only):',
-    '1. Acceptance → diff: map every acceptance criterion onto the base/candidate diff — each acceptance point must be covered by a concrete change, or an explicit reason it needs none.',
-    '2. Call paths: read the files on the acceptance-relevant call paths, including files beyond the changed set when they sit directly on such a path (diff-first does not forbid reading context).',
-    "3. Run the relevant tests and builds independently; do not rely on the worker's word.",
+    'Independent verification (diff-first, not diff-only) — depth: ' + capsule.depth + ':',
   ]
-  let step = 4
+  let step = 1
+  verification.push(
+    String(step) + '. Derive the change set yourself from the workspace (git diff / git status against the base commit); the claimed file list is a claim, not the change set.',
+  )
+  step += 1
+  verification.push(
+    String(step) + '. Acceptance → diff: map every acceptance criterion onto the base/candidate diff — each acceptance point must be covered by a concrete change, or an explicit reason it needs none.',
+  )
+  step += 1
+  verification.push(
+    String(step) + (deep
+      ? ". Run the acceptance-relevant commands and builds independently, with falsification probes on the boundary inputs the card names and on the failure paths those inputs imply; do not rely on the worker's word."
+      : ". Run the card's acceptance command once (standard depth does not repeat runs) and add a small number of falsification probes on the boundary inputs the card names; do not rely on the worker's word."),
+  )
+  step += 1
+  verification.push(
+    String(step) + (deep
+      ? '. Call paths: read the files on the acceptance-relevant call paths, including files beyond the changed set when they sit directly on such a path (diff-first does not forbid reading context).'
+      : '. Call paths: read the files on the acceptance-relevant call paths; read files beyond the changed set only when a claim conflicts with the evidence you gathered (standard depth does not read outside the change set otherwise).'),
+  )
+  step += 1
   if (capsule.filesScope.trim() !== '') {
     verification.push(String(step) + '. Check the change stays inside the declared file scope: flag any edit outside "' + capsule.filesScope + '".')
     step += 1
   }
   verification.push(
-    String(step) + ". Check the worker's claims (files changed, tests run, root cause) against the evidence you gathered — a claim is never a fact.",
+    String(step) + ". Check the worker's claims (files changed, tests run, root cause) against the evidence you gathered — a claim is never a fact; re-run each claimed command and compare the claimed key output line, and when devNotes gives no key output line, treat that claim as missing rather than guessing.",
     String(step + 1) + '. Verdict: approve only when every acceptance point is independently verified; otherwise reject with concrete, actionable problems.',
   )
   lines.push(...verification)

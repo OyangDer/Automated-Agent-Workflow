@@ -31,7 +31,8 @@ import {
   MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
 } from '../src/domain.ts'
 import {
-  compileReviewerCapsule, compileWorkerCapsule, parseSections, parseWorkerClaims, reviewerFactsFromPreflight,
+  compileReviewerCapsule, compileWorkerCapsule, parseSections, parseWorkerClaims,
+  reviewerDepthFromDescription, reviewerFactsFromPreflight,
 } from '../src/capsule.ts'
 import type { ReviewerGitFacts } from '../src/capsule.ts'
 import type { PreflightReport } from '../src/types.ts'
@@ -2270,6 +2271,40 @@ describe('TaskboardService workflow', () => {
     expect(plainPrompt).not.toContain('stays inside the declared file scope')
   })
 
+  it('switches the reviewer depth from the card: only 【审核】deep upgrades it', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const promptAt = (index: number): string => {
+      const call = subagentsStart.mock.calls[index] as [string, SubagentStartRequest]
+      return (call[1].prompt as { type: string; text: string }[])[0]!.text
+    }
+    // A 【审核】 section that is an instruction (not exactly "deep") leaves the
+    // default in place.
+    const standard = await service.createRemote(devA, {
+      title: 'standard depth', description: '【目标】x\n\n【审核】deep 标记能切换分档。并运行 tsc。',
+      priority: 'normal', dependsOn: [], filesScope: 'src/a.ts',
+    })
+    await toNotStarted(service, devA, standard)
+    await service.assign(devA, standard.id)
+    await service.report(workerChild, standard.id, 'implemented')
+    expect(promptAt(1)).toContain('Review depth: standard')
+
+    const deep = await service.createRemote(devA, {
+      title: 'deep depth', description: '【目标】y\n\n【审核】deep',
+      priority: 'normal', dependsOn: [], filesScope: 'src/b.ts',
+    })
+    await toNotStarted(service, devA, deep)
+    await service.assign(devA, deep.id)
+    await service.report(workerChild, deep.id, 'implemented')
+    const deepPrompt = promptAt(3)
+    expect(deepPrompt).toContain('Review depth: deep')
+    expect(deepPrompt).toContain('including files beyond the changed set when they sit directly on such a path')
+    // Both reviewer modes carry the cost-narrowing blocks.
+    expect(deepPrompt).toContain('Runtime constraints (built-in, always apply)')
+    expect(deepPrompt).toContain('Review budget and failure posture')
+  })
+
+
   // ── V3-19: role context capsules (worker/reviewer) ────────────────────────
 
   describe('role context capsules (V3-19)', () => {
@@ -2456,6 +2491,118 @@ describe('TaskboardService workflow', () => {
       const prompt = buildReviewPrompt(ticket)
       expect(prompt).toContain('CLAIMS to verify independently, never facts')
       expect(prompt).toContain('Root cause: fixed the bug')
+    })
+
+    // ── V3-24: reviewer cost narrowing (output discipline, budget, depth, claims) ──
+
+    it('reviewer capsule: carries the worker runtime output discipline verbatim', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/capsule.ts' })
+      const reviewPrompt = buildReviewPrompt(ticket, {
+        available: true, repoRoot: 'C:/repo', baseCommit: 'base-commit-1',
+        candidateCommit: 'candidate-head-1', touchedFiles: ['src/capsule.ts'],
+      })
+      expect(reviewPrompt).toContain('Runtime constraints (built-in, always apply)')
+      expect(reviewPrompt).toContain('Keep tool output small')
+      // Same dialect and the same examples as the worker capsule (V3-24).
+      expect(reviewPrompt).toContain('bash: `tail -n 120`; PowerShell: `Select-Object -Last 120`')
+      expect(reviewPrompt).toContain('bash: `sed -n 10,25p`; PowerShell: `Select-Object -Skip 9 -First 16`')
+      // The reason the discipline exists is kept, not paraphrased away.
+      expect(reviewPrompt).toContain('Every byte you print stays in your context and is re-sent on every later turn')
+      // Verbatim parity: the worker capsule's own discipline line appears
+      // unchanged in the reviewer capsule (one shared block, two roles).
+      const workerPrompt = buildWorkerPrompt(ticket, 'C:/work', 'master-session-1', preflightReport())
+      const discipline = workerPrompt.split('\n').find(line => line.includes('Keep tool output small'))
+      expect(discipline).toBeDefined()
+      expect(reviewPrompt).toContain(discipline as string)
+    })
+
+    it('reviewer capsule: ≤10-step budget with the no-evidence failure posture', () => {
+      const ticket = capsuleTicket({ description: MARKER_DESCRIPTION, filesScope: 'src/capsule.ts' })
+      const prompt = buildReviewPrompt(ticket)
+      expect(prompt).toContain('Review budget and failure posture')
+      expect(prompt).toContain('≤10 steps')
+      // Both reviewer modes (approve/reject and the report-mode child) carry
+      // the same cost-narrowing blocks.
+      const reportPrompt = buildReviewReportPrompt(ticket)
+      expect(reportPrompt).toContain('Runtime constraints (built-in, always apply)')
+      expect(reportPrompt).toContain('Review budget and failure posture')
+      expect(reportPrompt).toContain('Review depth: standard')
+      // The exact contract: reject with the concrete blockage inside the
+      // budget rather than approving without evidence.
+      expect(prompt).toContain('若在预算内无法独立验证，就用具体阻塞点打回，绝不在缺乏证据时通过。')
+      expect(prompt).toContain('never approve without evidence')
+    })
+
+    it('reviewer capsule: standard by default, deep only when the card marks it', () => {
+      const standard = buildReviewPrompt(capsuleTicket({ description: MARKER_DESCRIPTION }))
+      expect(standard).toContain('Review depth: standard')
+      expect(standard).not.toContain('Review depth: deep')
+      expect(standard).toContain('depth: standard')
+      // Standard tightens the open call-path read to a conflict-driven one.
+      expect(standard).toContain('read files beyond the changed set only when a claim conflicts with the evidence you gathered')
+      expect(standard).not.toContain('including files beyond the changed set when they sit directly on such a path')
+      // Standard: the acceptance command runs once.
+      expect(standard).toContain("Run the card's acceptance command once")
+
+      const deepPrompt = buildReviewPrompt(capsuleTicket({
+        description: MARKER_DESCRIPTION + '\n\n【审核】deep',
+      }))
+      expect(deepPrompt).toContain('Review depth: deep')
+      expect(deepPrompt).toContain('depth: deep')
+      // Deep allows the open read along the acceptance call paths (the old
+      // unrestricted step 2), and probes the failure paths too.
+      expect(deepPrompt).toContain('including files beyond the changed set when they sit directly on such a path')
+      expect(deepPrompt).toContain('failure paths those inputs imply')
+      expect(deepPrompt).not.toContain('read files beyond the changed set only when a claim conflicts')
+    })
+
+    it('reviewer depth: only a 【审核】 section whose body is exactly deep upgrades it', () => {
+      expect(reviewerDepthFromDescription('')).toBe('standard')
+      expect(reviewerDepthFromDescription('【审核】deep')).toBe('deep')
+      expect(reviewerDepthFromDescription('【审核】 DEEP ')).toBe('deep')
+      // An instruction in the section is ordinary card content, not a marker
+      // (this card's own 【审核】 body must not flip its reviewer to deep).
+      expect(reviewerDepthFromDescription('【审核】deep 标记能切换分档。并运行 tsc。')).toBe('standard')
+      expect(reviewerDepthFromDescription('【审核】standard')).toBe('standard')
+      expect(reviewerDepthFromDescription('【验收】deep')).toBe('standard')
+      // The compiled capsule carries the derived depth.
+      expect(compileReviewerCapsule(capsuleTicket({ description: '【审核】deep' })).depth).toBe('deep')
+      expect(compileReviewerCapsule(capsuleTicket({ description: MARKER_DESCRIPTION })).depth).toBe('standard')
+    })
+
+    it('reviewer capsule: claims must carry the command and the key output line', () => {
+      const withLine = buildReviewPrompt(capsuleTicket({
+        description: MARKER_DESCRIPTION,
+        devNotes: [
+          'Tests run: corepack pnpm exec vitest run packages/taskboard/taskboard',
+          'Key output line: Tests  384 passed (384)',
+        ].join('\n'),
+      }))
+      expect(withLine).toContain('Tests run: corepack pnpm exec vitest run packages/taskboard/taskboard')
+      expect(withLine).toContain('Key output line: Tests  384 passed (384)')
+      // The key line is the re-run comparison target.
+      expect(withLine).toContain('re-run the command and compare exactly that line')
+
+      const withoutLine = buildReviewPrompt(capsuleTicket({
+        description: MARKER_DESCRIPTION,
+        devNotes: 'Tests run: corepack pnpm exec vitest run',
+      }))
+      expect(withoutLine).toContain('missing — the claim arrived without the key output line')
+      expect(withoutLine).toContain('treat it as missing, never guess')
+      expect(withoutLine).toContain('when devNotes gives no key output line, treat that claim as missing rather than guessing')
+
+      const claims = parseWorkerClaims('关键输出行：12 passed\nKnown anomaly: none')
+      expect(claims.keyOutputLine).toBe('12 passed')
+      expect(claims.knownAnomaly).toBe('none')
+      expect(parseWorkerClaims('Root cause: x').keyOutputLine).toBe('')
+    })
+
+    it('worker capsule: the reporting contract demands a checkable key output line', () => {
+      const prompt = buildWorkerPrompt(capsuleTicket({ description: MARKER_DESCRIPTION }), 'C:/work', 'master-session-1')
+      expect(prompt).toContain('Reporting contract (built-in, always apply)')
+      expect(prompt).toContain('Make every claim checkable')
+      expect(prompt).toContain('Key output line:')
+      expect(prompt).toContain('treated as missing')
     })
 
     it('workflow and master sections keep one copy of the claim rule (V3-19 dedup)', () => {
