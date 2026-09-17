@@ -71,11 +71,18 @@
           * Please run long lived commands in the background, e.g. 'Start-Job' or start a server with Start-Process.
 
 # ── compaction ──────────────────────────────────────────────────────────────
-# Workers run for many turns; without compaction every request re-uploads the
-# whole accumulated context (files read + build logs), which dominates the
-# token cost of dispatched sessions. compaction-basic folds the history as the
-# window fills, and the tool-result pruner caps any single tool result so one
-# huge build log can never sit in context for the rest of the run.
+# A dispatched session pays for its whole accumulated context on every single
+# request, so cost tracks steps x context size. Compaction is the only mechanism
+# that shrinks that context, and it is ceiling-triggered, not periodic:
+#   thresholdTokens = contextWindow * thresholdRatio   (compaction-basic's default
+#   ratio is 0.8, i.e. a 1M-token window only folds at 800K)
+# Real sessions end long before such a ceiling: measured taskboard runs plateau
+# at 100K-600K, so a default-ratio compaction never fires and the context grows
+# to the end of the run. These explicit budgets put the ceiling inside the range
+# sessions actually occupy (1M x 0.10 = 100K, retaining 1M x 0.03 = 30K), which a
+# replay of 33 recorded sessions prices at 45-89% fewer tokens on the long ones.
+# The tool-result pruner additionally caps any single oversized tool result so
+# one huge file read cannot sit in context for the rest of the run.
 - id: compaction
   name: cordis:group
   group: true
@@ -85,6 +92,10 @@
   config:
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
+      config:
+        # Ceiling 100K / retained tail 30K on the shipped 1M-token window.
+        thresholdRatio: 0.1
+        retainRatio: 0.03
 
     - id: tool-result-pruner
       name: '@deepseek-ai/dsh-compaction-tool-result-pruner'

@@ -178,5 +178,26 @@ describe('shipped agent presets gate both shell tools by platform', () => {
     const pruner = byId.get('tool-result-pruner')
     expect(pruner?.name).toBe('@deepseek-ai/dsh-compaction-tool-result-pruner')
     expect(pruner?.config).toMatchObject({ thresholdChars: 8192, headChars: 4096, tailChars: 1024 })
+
+    // Compaction is ceiling-triggered: below thresholdTokens it does nothing at
+    // all, so the default ratio (0.8) leaves a 1M-token window folding only at
+    // 800K — above where measured sessions actually plateau (100K-600K), which
+    // is why the default never fired for them. Pin the explicit budget instead.
+    const SHIPPED_WINDOW = 1_000_000
+    const budget = byId.get('compaction-basic')?.config as
+      | { thresholdRatio?: number; retainRatio?: number }
+      | undefined
+    const thresholdRatio = budget?.thresholdRatio
+    const retainRatio = budget?.retainRatio
+    expect(typeof thresholdRatio).toBe('number')
+    expect(typeof retainRatio).toBe('number')
+    if (thresholdRatio === undefined || retainRatio === undefined) {
+      throw new TypeError('compaction-basic must carry an explicit token budget')
+    }
+    // The ceiling has to sit inside the range real sessions occupy, and the
+    // retained tail has to leave room for the fold (retain < threshold).
+    expect(thresholdRatio * SHIPPED_WINDOW).toBe(100_000)
+    expect(retainRatio * SHIPPED_WINDOW).toBe(30_000)
+    expect(retainRatio).toBeLessThan(thresholdRatio)
   })
 })
