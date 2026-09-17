@@ -170,12 +170,15 @@ interface Harness {
   unregisterReviewer: () => void
   /** Remove the harness master agent (devA) from the live agent registry (simulates the master session vanishing, e.g. a host restart). */
   unregisterMaster: () => void
+  /** Remove the second harness agent (devB) from the live agent registry. */
+  unregisterDevB: () => void
 }
 
 interface HarnessOptions {
   maxInProgress?: number
   spawn?: SpawnBehavior
-  masterSeatTimeoutMs?: number
+  /** V3-25 master-seat idle-arm timeout passed to the plugin (0 disables the idle arm). */
+  masterIdleTimeoutMs?: number
   /** Pre-seeded storage root; a fresh temp root when omitted. */
   root?: string
   /** When set, worker spawns return a run carrying this result promise. */
@@ -346,7 +349,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   // is exercised explicitly or with a short explicit interval.
   await ctx.plugin(TaskboardService, {
     maxInProgress,
-    ...(options.masterSeatTimeoutMs === undefined ? {} : { masterSeatTimeoutMs: options.masterSeatTimeoutMs }),
+    ...(options.masterIdleTimeoutMs === undefined ? {} : { masterIdleTimeoutMs: options.masterIdleTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
     ...(options.workerModel === undefined ? {} : { workerModel: options.workerModel }),
     ...(options.workerEffort === undefined ? {} : { workerEffort: options.workerEffort }),
@@ -367,7 +370,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   const reviewerChild = stubAgent(spawnedReviewerId)
   const workerChild = stubAgent(spawnedWorkerId)
   const unregisterMaster = ctx.agents.register(devA)
-  ctx.agents.register(devB)
+  const unregisterDevB = ctx.agents.register(devB)
   const unregisterReviewer = ctx.agents.register(reviewerChild)
   const unregisterWorker = ctx.agents.register(workerChild)
   // Register every configured worker spawn id as a live stub agent so an
@@ -379,7 +382,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     ctx, service, root, changes, devA, devB, reviewerChild, workerChild,
     spawnedReviewerId, spawnedWorkerId, subagentsStart, subagentsStartContinuable, subagentsSendMessage,
     workerSignals, reviewerSignals,
-    unregisterWorker, unregisterReviewer, unregisterMaster,
+    unregisterWorker, unregisterReviewer, unregisterMaster, unregisterDevB,
   }
 }
 
@@ -516,27 +519,29 @@ describe('TaskboardService workflow', () => {
     await expect(service.archiveBoardRemote(devA, { boardId: 'no-such-board' })).rejects.toMatchObject({ code: 'TASKBOARD_BOARD_NOT_FOUND' })
   })
 
-  it('claims, holds, preempts and releases the master seat', async () => {
+  it('claims, holds and releases the master seat with no clock lease (V3-25)', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const { service, devA, devB } = await harness()
       const claimed = await service.claimMaster('default', devA)
       expect(claimed.masterAgentId).toBe(devA.id)
       expect(claimed.masterClaimedAt).not.toBeNull()
-      // A second agent cannot steal a live seat.
+      // The retired lease field never carries a deadline any more.
+      expect(claimed.masterExpiresAt).toBeNull()
+      // A second agent cannot steal a live seat, and no amount of elapsed time
+      // changes that: there is no lease left to expire.
       await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
-      // Past the 15-minute lease the seat is stale and can be preempted.
-      vi.advanceTimersByTime(900001)
-      const preempted = await service.claimMaster('default', devB)
-      expect(preempted.masterAgentId).toBe(devB.id)
+      vi.advanceTimersByTime(30 * 24 * 60 * 60 * 1000)
+      await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
       // Only the current master may release.
-      await expect(service.releaseMaster('default', devA)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
-      const released = await service.releaseMaster('default', devB)
+      await expect(service.releaseMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+      const released = await service.releaseMaster('default', devA)
       expect(released.masterAgentId).toBeNull()
       expect(released.masterClaimedAt).toBeNull()
-      // After release the first agent claims cleanly.
-      const again = await service.claimMaster('default', devA)
-      expect(again.masterAgentId).toBe(devA.id)
+      expect(released.masterExpiresAt).toBeNull()
+      // After release the next agent claims cleanly.
+      const again = await service.claimMaster('default', devB)
+      expect(again.masterAgentId).toBe(devB.id)
     } finally {
       vi.useRealTimers()
     }
@@ -1937,7 +1942,7 @@ describe('TaskboardService workflow', () => {
   it('appends masterHistory on claim and transfer for the hierarchy tree', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
-      const { service, devA, devB } = await harness()
+      const { service, devA, devB, unregisterDevB } = await harness()
       const claimed = await service.claimMaster('default', devA)
       expect(claimed.masterHistory).toHaveLength(1)
       expect(claimed.masterHistory![0]).toMatchObject({ fromAgentId: null, toAgentId: devA.id, notes: '' })
@@ -1947,11 +1952,13 @@ describe('TaskboardService workflow', () => {
       expect(transferred.masterHistory![1]).toMatchObject({
         fromAgentId: devA.id, toAgentId: devB.id, notes: 'handing over the board',
       })
-      // A stale-seat preemption records the displaced master as the source.
-      vi.advanceTimersByTime(900001)
+      // A lost-holder preemption records the displaced master as the source:
+      // liveness — not a clock — takes the seat back (V3-25).
+      unregisterDevB()
       const preempted = await service.claimMaster('default', devA)
       expect(preempted.masterHistory).toHaveLength(3)
       expect(preempted.masterHistory![2]).toMatchObject({ fromAgentId: devB.id, toAgentId: devA.id })
+      expect(preempted.masterHistory![2]!.notes).toContain('lost seat')
       // A same-owner re-claim does not duplicate a history row.
       const again = await service.claimMaster('default', devA)
       expect(again.masterHistory).toHaveLength(3)
@@ -3459,13 +3466,17 @@ it('records a notice even when no persistence backend is configured (board-only 
 })
 
 
-it('reports the master lease expiry on every board row', async () => {
+it('never reports a wall-clock master lease on a board row (V3-25)', async () => {
   vi.useFakeTimers({ toFake: ['Date'] })
   try {
-    const { service, devA } = await harness({ masterSeatTimeoutMs: 60000 })
-    const claimed = await service.claimMaster('default', devA)
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    // Even long after any former lease would have expired the field stays null:
+    // the seat has no deadline, only a liveness judgment.
+    vi.advanceTimersByTime(30 * 24 * 60 * 60 * 1000)
     const row = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
-    expect(row.masterExpiresAt).toBe(claimed.masterClaimedAt! + 60000)
+    expect(row.masterExpiresAt).toBeNull()
+    expect(row.masterAgentId).toBe(devA.id)
     await service.releaseMaster('default', devA)
     const vacant = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
     expect(vacant.masterExpiresAt).toBeNull()
@@ -3473,6 +3484,112 @@ it('reports the master lease expiry on every board row', async () => {
   } finally {
     vi.useRealTimers()
   }
+})
+
+it('releases the master seat when the holder session leaves the registry (V3-25)', async () => {
+  const { service, devA, unregisterMaster } = await harness()
+  await service.claimMaster('default', devA)
+  // The holding session vanishes from the live agent registry (host restart):
+  // the same survival signal the worker lost path uses.
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(1)
+  const row = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
+  expect(row.masterAgentId).toBeNull()
+  expect(row.masterClaimedAt).toBeNull()
+  expect(row.masterExpiresAt).toBeNull()
+  // A board history row records the release, with no successor taking the seat.
+  const history = row.masterHistory ?? []
+  expect(history).toHaveLength(2)
+  expect(history[1]).toMatchObject({ fromAgentId: devA.id, toAgentId: '' })
+  expect(history[1]!.notes).toContain('seat released')
+  expect(history[1]!.notes).toContain('registry')
+  // And a durable notice for the successor master landed on the board.
+  expect(row.notices).toHaveLength(1)
+  expect(row.notices[0]).toMatchObject({ kind: 'master-released', ticketId: '' })
+  expect(row.notices[0]!.text).toContain('MASTER_SEAT_RELEASED')
+  expect(row.notices[0]!.text).toContain(devA.id)
+  // A second pass finds nothing left to release (reentry-safe).
+  expect(await service.reconcileMasterSeats()).toBe(0)
+})
+
+it('never releases a live master seat by elapsed time (V3-25)', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  try {
+    // The idle arm is off: nothing about elapsed time may free this seat.
+    const { service, devA, devB } = await harness({ masterIdleTimeoutMs: 0 })
+    await service.claimMaster('default', devA)
+    vi.advanceTimersByTime(7 * 24 * 60 * 60 * 1000)
+    // devA is still registered, so the rival claim is refused...
+    await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+    // ...and the liveness pass releases nothing either.
+    expect(await service.reconcileMasterSeats()).toBe(0)
+    const row = (await service.listBoards(devB)).find(candidate => candidate.boardId === 'default')!
+    expect(row.masterAgentId).toBe(devA.id)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+it('frees a registered but silent master seat only past the idle arm (V3-25)', async () => {
+  /** Re-register the master id as a live session whose activity tail is old. */
+  const standInStaleSession = (
+    ctx: Awaited<ReturnType<typeof harness>>['ctx'], id: string, unregister: () => void,
+  ) => {
+    unregister()
+    const stale = Session.create(SessionId(id), undefined, {
+      version: SESSION_FORMAT_VERSION,
+      id: SessionId(id),
+      createdAt: Date.now() - 60_000,
+      isSeeded: false,
+    })
+    ctx.agents.register(stubAgentForSession(stale))
+  }
+  // Idle arm off (0): a registered holder keeps the seat however silent it is.
+  const off = await harness({ masterIdleTimeoutMs: 0 })
+  await off.service.claimMaster('default', off.devA)
+  standInStaleSession(off.ctx, off.devA.id, off.unregisterMaster)
+  expect(await off.service.reconcileMasterSeats()).toBe(0)
+  expect((await off.service.listBoards(off.devA)).find(b => b.boardId === 'default')!.masterAgentId).toBe(off.devA.id)
+  // Idle arm on: the same silent-but-registered holder is released.
+  const on = await harness({ masterIdleTimeoutMs: 2000 })
+  await on.service.claimMaster('default', on.devA)
+  standInStaleSession(on.ctx, on.devA.id, on.unregisterMaster)
+  expect(await on.service.reconcileMasterSeats()).toBe(1)
+  const released = (await on.service.listBoards(on.devB)).find(b => b.boardId === 'default')!
+  expect(released.masterAgentId).toBeNull()
+  expect((released.masterHistory ?? []).at(-1)).toMatchObject({ fromAgentId: on.devA.id, toAgentId: '' })
+  expect((released.masterHistory ?? []).at(-1)!.notes).toContain('idle')
+  expect(released.notices.at(-1)).toMatchObject({ kind: 'master-released' })
+})
+
+it('still hands the structured takeover snapshot to the successor after a liveness release (V3-25)', async () => {
+  const { ctx, service, devA, devB, unregisterMaster } = await harness()
+  await service.claimMaster('default', devA)
+  const planned = await createTicket(service, 'planned card')
+  const running = await createTicket(service, 'running card')
+  await scheduleToNotStarted(service, devA, running)
+  await service.assign(devA, running.id)
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(1)
+  // The explicit takeover entry point is unchanged: the successor's
+  // taskboard_claim_master carries the complete structured snapshot.
+  const claim = await ctx.tools.execute({
+    callId: ToolCallId('tool-claim-after-liveness-release'),
+    name: 'taskboard_claim_master',
+    arguments: {},
+    agent: devB,
+    signal: new AbortController().signal,
+  })
+  expect(claim.isError).toBe(false)
+  const value = (claim as { value: Record<string, unknown> }).value
+  const cards = value.cards as { ticketId: string; column: string; status: string }[]
+  expect(cards.map(card => card.ticketId).sort()).toEqual([planned.id, running.id].sort())
+  expect(value.backlogSummary).toContain('Backlog 1')
+  expect(value.backlogSummary).toContain('In progress 1')
+  expect(value.pendingAdjudications).toEqual([])
+  expect(value.handoverNotes).toBe('')
+  // The release notice rides the successor's claim result.
+  expect((value.notices as { kind: string }[]).map(n => n.kind)).toContain('master-released')
 })
 
 it('executes the taskboard_handover tool as the master and releases the seat', async () => {

@@ -38,6 +38,18 @@
 - 席位状态存 `boards` 表的 board 记录里：`masterAgentId`, `masterClaimedAt`,
   `handoverNotes`。席位绑定**会话 agent**（agentId），跨会话可交接。
 - 只有 master 能调 `assign` / `dispatch` / `plan` / `createForBoard` / `moveForBoard`。
+- **V3-25：席位释放按存活状态，不按墙上时钟。** 原先的时钟租约
+  （`masterSeatTimeoutMs` / `masterExpiryOf = masterClaimedAt + leaseMs`）已删除，
+  与 worker 的 `lost`、reviewer 的 `reviewerStaleTimeoutMs` 统一到会话注册表：
+  - 持有会话**不在注册表**里（重启 / 硬死）→ 席位立即释放，落一条 `masterHistory`
+    行（`toAgentId = ''`，即席位空置）+ 一条 `master-released` board notice 给继任
+    master；`claimMaster` 也据此当场夺回失联席位（不再等租约到期）。
+  - 可选 idle 臂 `masterIdleTimeoutMs`（默认 900000，0 = 关闭）：会话仍在注册表、
+    但没有 running 工具且活动尾超过 N → 判定卡死并释放。
+  - 释放只改**归属**：不动在跑的卡，也不会因此重派 In progress 的卡。
+  - 接管入口不变：`taskboard_handover` + `claim_master` 的结构快照
+    （cards / notices / pendingAdjudications / backlogSummary）仍是唯一的显式接管路径；
+    `masterExpiresAt` 为兼容旧客户端保留，但恒为 `null`。
 
 ### 1.3 派单协议（取代自由领取）
 

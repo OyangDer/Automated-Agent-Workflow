@@ -1259,7 +1259,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_claim_master`
 
-Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board's durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.
+Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. The seat is held by liveness, not by a clock (V3-25): a seat whose holder session has left the agent registry is released and preempted here at once and recorded in the master history, while a live holder keeps the seat however long it has been held. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board's durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.
 
 ```json
 {

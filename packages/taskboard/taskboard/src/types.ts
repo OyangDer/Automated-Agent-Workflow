@@ -174,7 +174,11 @@ export interface BoardModelConfig {
 export interface MasterHistoryEntry {
   /** The previous master session id; null when the seat was empty. */
   fromAgentId: string | null
-  /** The session id taking the seat. */
+  /**
+   * The session id taking the seat; empty when the row records a V3-25
+   * liveness release instead (the seat was vacated because its holder session
+   * was gone, so no successor took it in that transition).
+   */
   toAgentId: string
   /** Unix epoch milliseconds when the transition was recorded. */
   at: number
@@ -201,10 +205,11 @@ export interface BoardView {
   /** When the master seat was claimed; null while unclaimed. */
   masterClaimedAt: number | null
   /**
-   * When the current master's seat lease expires (claim time plus the
-   * configured lease), derived by the host on every read; null while the
-   * seat is vacant. The browser banner uses it to flag a lease about to
-   * expire.
+   * Retired V3-25 wall-clock lease expiry. The master seat has no time lease
+   * any more: it is held while the holder session is alive and released by
+   * liveness (the session left the agent registry, or the optional idle arm)
+   * or handed over explicitly. The host now always reports null here; the
+   * field is kept on the wire so older clients keep decoding a board row.
    */
   masterExpiresAt: number | null
   /** Handover notes written on transferMaster/taskboard_handover, for the next master. */

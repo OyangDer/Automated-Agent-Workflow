@@ -182,6 +182,7 @@ const NOTICE_KIND = {
   userScheduled: 'user-scheduled',
   workerPaused: 'worker-paused',
   preflightBlocked: 'preflight-blocked',
+  masterReleased: 'master-released',
 } as const
 
 /**
@@ -288,8 +289,15 @@ export interface Config {
   reviewerEffort?: string
   /** Subagent provider name used to spawn worker agents. */
   workerProvider?: string
-  /** Master seat lease in milliseconds; a stale seat can be preempted. */
-  masterSeatTimeoutMs?: number
+  /**
+   * V3-25 master-seat idle arm in milliseconds: a master session that is
+   * still registered but has had no session activity for longer than this is
+   * judged stuck and its seat is released (0 disables the idle arm; a master
+   * session absent from the agent registry is always released immediately,
+   * exactly like a lost worker). Defaults to 900000 (15 minutes), the same
+   * magnitude as reviewerStaleTimeoutMs.
+   */
+  masterIdleTimeoutMs?: number
   /** Review protocol: "report" has the reviewer return a structured verdict (master resolves); "direct" keeps the v1 reviewer tools. */
   reviewMode?: 'report' | 'direct'
   /**
@@ -357,7 +365,7 @@ export const Config: z<Config> = z.object({
   reviewerModel: z.string(),
   reviewerEffort: z.string(),
   workerProvider: z.string().default('spawn'),
-  masterSeatTimeoutMs: z.number().default(900000),
+  masterIdleTimeoutMs: z.number().default(900000),
   reviewMode: z.union(['report', 'direct'] as const).default('report'),
   reconcileIntervalMs: z.number().default(60000),
   noticeDedupeWindowMs: z.number().default(10000),
@@ -479,10 +487,10 @@ function resolveMaxInProgress(value: number): number {
   return value
 }
 
-/** Validate one explicit master-seat lease. */
-function resolveMasterSeatTimeout(value: number): number {
+/** Validate one explicit master-seat idle timeout (0 disables the idle arm). */
+function resolveMasterIdleTimeout(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error('taskboard: masterSeatTimeoutMs must be a non-negative safe integer')
+    throw new Error('taskboard: masterIdleTimeoutMs must be a non-negative safe integer')
   }
   return value
 }
@@ -543,12 +551,6 @@ function resolveReviewerStaleTimeout(value: number): number {
   return value
 }
 
-/** Derived lease expiry of one board row; null while the seat is vacant. */
-function masterExpiryOf(board: BoardView, leaseMs: number): number | null {
-  if (board.masterAgentId === null || board.masterClaimedAt === null) return null
-  return board.masterClaimedAt + leaseMs
-}
-
 /** Column ids as a runtime set for cheap membership checks. */
 const COLUMN_SET: ReadonlySet<string> = new Set(TASKBOARD_COLUMNS)
 
@@ -604,7 +606,7 @@ export class TaskboardService extends TypertRemoteService {
     reviewerModel: string
     reviewerEffort: string | undefined
     workerProvider: string
-    masterSeatTimeoutMs: number
+    masterIdleTimeoutMs: number
     reviewMode: 'report' | 'direct'
     reconcileIntervalMs: number
     noticeDedupeWindowMs: number
@@ -672,7 +674,7 @@ export class TaskboardService extends TypertRemoteService {
       reviewerModel: config.reviewerModel ?? workerModel,
       reviewerEffort: resolveEffort(config.reviewerEffort) ?? workerEffort,
       workerProvider: config.workerProvider ?? 'spawn',
-      masterSeatTimeoutMs: resolveMasterSeatTimeout(config.masterSeatTimeoutMs ?? 900000),
+      masterIdleTimeoutMs: resolveMasterIdleTimeout(config.masterIdleTimeoutMs ?? 900000),
       reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
       reconcileIntervalMs: resolveReconcileInterval(config.reconcileIntervalMs ?? 60000),
       noticeDedupeWindowMs: resolveNoticeDedupeWindow(config.noticeDedupeWindowMs ?? 10000),
@@ -723,6 +725,7 @@ export class TaskboardService extends TypertRemoteService {
           try {
             await this.reconcileLostWorkers()
             await this.reconcileStaleReviewers()
+            await this.reconcileMasterSeats()
           } catch {
             // A recovery fault must never take the scanner down; the next
             // tick retries.
@@ -1672,6 +1675,33 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * The live agent registry, or undefined when the host exposes none. The
+   * registry is the liveness authority for every seat: presence means alive
+   * (an idle agent is still alive; only an unregistered session is gone).
+   */
+  private agentRegistry(): { get(id: string): Agent | undefined } | undefined {
+    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
+    if (registry === undefined || typeof registry.get !== 'function') return undefined
+    return registry
+  }
+
+  /**
+   * Judge one master seat's holder liveness (V3-25): true when the holding
+   * session is absent from the live agent registry (restart / hard death) —
+   * the worker "lost" survival signal reused verbatim. There is no clock and
+   * no idle arm here: an idle but registered master still holds the seat, so
+   * time alone never takes it. Without a registry the judgment fails closed
+   * (the seat counts as held).
+   * @param sessionId - the seat holder's session id.
+   * @returns whether the holder session is gone.
+   */
+  private masterSeatLost(sessionId: string): boolean {
+    const registry = this.agentRegistry()
+    if (registry === undefined) return false
+    return registry.get(sessionId) === undefined
+  }
+
+  /**
    * Wake one lost worker's durable session instead of re-spawning it (V3-28).
    * The continuation message carries the ticket identity, the acceptance
    * criteria, the recorded progress and the standing "do not roll back"
@@ -1938,8 +1968,8 @@ export class TaskboardService extends TypertRemoteService {
   async reconcileLostWorkers(): Promise<number> {
     // The registry is the liveness authority; without it the pass cannot
     // judge and must not recover anything (mirrors notifyMaster's guard).
-    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
-    if (registry === undefined || typeof registry.get !== 'function') return 0
+    const registry = this.agentRegistry()
+    if (registry === undefined) return 0
     const table = await this.tickets()
     let recovered = 0
     for (const [, ticket] of table.entries()) {
@@ -1977,8 +2007,8 @@ export class TaskboardService extends TypertRemoteService {
    * @returns how many seats this pass released.
    */
   async reconcileStaleReviewers(): Promise<number> {
-    const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
-    if (registry === undefined || typeof registry.get !== 'function') return 0
+    const registry = this.agentRegistry()
+    if (registry === undefined) return 0
     const table = await this.tickets()
     let released = 0
     for (const [, ticket] of table.entries()) {
@@ -2045,6 +2075,108 @@ export class TaskboardService extends TypertRemoteService {
         NOTICE_KIND.reviewerReleased, next.id)
     }
     return released
+  }
+
+  /**
+   * One master-seat liveness pass (V3-25): every board whose seat names a
+   * session that is not alive is released, reusing the worker "lost" liveness
+   * signal. A master session absent from the live agent registry (restart /
+   * hard death) is always released immediately — there are no ghost seats;
+   * a master session still registered but idle (no running tool) with no
+   * session activity past masterIdleTimeoutMs is judged stuck and released
+   * (0 disables this idle arm, exactly like reviewerStaleTimeoutMs; the
+   * registry-absence arm is not configurable).
+   *
+   * A release changes seat ownership only: in-flight cards keep their workers
+   * and reviewers untouched, and no card is ever re-dispatched by this pass.
+   * The board gets one masterHistory row (empty target = vacant seat) and a
+   * durable notice the successor reads back from taskboard_claim_master /
+   * taskboard_notices; taskboard_handover remains the explicit takeover path
+   * while the holder is still alive.
+   *
+   * Reentry-safe: the guarded release only clears the seat that still names
+   * the judged holder, so concurrent passes release each board exactly once.
+   * @returns how many seats this pass released.
+   */
+  async reconcileMasterSeats(): Promise<number> {
+    const registry = this.agentRegistry()
+    if (registry === undefined) return 0
+    const table = await this.boards()
+    let released = 0
+    for (const [boardId, board] of table.entries()) {
+      const holder = board.masterAgentId
+      if (holder === null) continue
+      const master = registry.get(holder)
+      const ghost = master === undefined
+      const idle = !ghost && this.resolved.masterIdleTimeoutMs > 0
+        && master.status !== 'running'
+        && Date.now() - TaskboardService.lastActivityOf(master) > this.resolved.masterIdleTimeoutMs
+      if (!ghost && !idle) continue
+      const reason = ghost
+        ? 'holder session absent from the agent registry'
+        : 'holder idle with no activity for over ' + String(this.resolved.masterIdleTimeoutMs) + 'ms'
+      if (await this.releaseLostMasterSeat(boardId, holder, reason)) released += 1
+    }
+    return released
+  }
+
+  /**
+   * Release one board's lost master seat: clear the seat, append one
+   * master-history row naming the released holder with an empty target (the
+   * seat is vacant), and land the durable successor notice. Reentry-safe: the
+   * guarded board update only clears the seat that still names the judged
+   * holder, so a seat another path already released (or handed over) is
+   * returned untouched and exactly one release lands per loss.
+   * @param boardId - the board whose seat is released.
+   * @param holderAgentId - the judged-lost holder session id.
+   * @param reason - the concrete release reason recorded in history/notice.
+   * @returns whether this call performed the release.
+   */
+  private async releaseLostMasterSeat(boardId: string, holderAgentId: string, reason: string): Promise<boolean> {
+    let released = false
+    try {
+      await this.mutateBoard(boardId, (current) => {
+        if (current.masterAgentId !== holderAgentId) return current
+        released = true
+        return {
+          ...current,
+          masterAgentId: null,
+          masterClaimedAt: null,
+          masterExpiresAt: null,
+          masterHistory: [...(current.masterHistory ?? []), {
+            fromAgentId: holderAgentId,
+            toAgentId: '',
+            at: Date.now(),
+            notes: 'seat released: ' + reason,
+          }],
+        }
+      })
+    } catch {
+      // The board vanished mid-scan (removed by another caller); skip it.
+      return false
+    }
+    if (!released) return false
+    await this.recordMasterRelease(boardId, holderAgentId, reason)
+    return true
+  }
+
+  /**
+   * Record the durable successor-facing notice for one released master seat.
+   * Recorded on the board synchronously (the in-board fallback), so the next
+   * taskboard_claim_master / taskboard_notices read carries it even when no
+   * live or persisted inbox can be reached; a vacant seat makes live delivery
+   * a no-op by construction. Best-effort: a notice fault never fails the
+   * release that triggered it.
+   * @param boardId - the board whose seat was released.
+   * @param holderAgentId - the lost holder session id.
+   * @param reason - the concrete release reason.
+   */
+  private async recordMasterRelease(boardId: string, holderAgentId: string, reason: string): Promise<void> {
+    const text = 'Taskboard notice: MASTER_SEAT_RELEASED board=' + boardId
+      + ' previous=' + holderAgentId
+      + ' reason=' + JSON.stringify(reason)
+      + '; the seat is vacant — claim it with taskboard_claim_master (the result carries the structured snapshot).'
+    await this.notifyMaster(boardId, text, NOTICE_KIND.masterReleased, '')
   }
 
   /** Attach the designated reviewer to an In testing ticket. */
@@ -2230,9 +2362,11 @@ export class TaskboardService extends TypertRemoteService {
     const boards: BoardView[] = []
     for (const [, board] of table.entries()) {
       if (!this.isBoardVisible(board, agent.id, workspaceId)) continue
-      // The lease expiry is derived state: recompute it from the claim time
-      // and the current lease so the browser banner always sees the live value.
-      boards.push({ ...board, masterExpiresAt: masterExpiryOf(board, this.resolved.masterSeatTimeoutMs) })
+      // V3-25: the master seat has no wall-clock lease any more — it is held
+      // while the holder session is alive and released by liveness (or handed
+      // over explicitly). The retired lease field is reported empty so a
+      // legacy stored expiry never resurfaces as a fake deadline.
+      boards.push({ ...board, masterExpiresAt: null })
     }
     if (table.get('default') === undefined) {
       boards.unshift({
@@ -2536,10 +2670,14 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Claim the master seat of one board; a stale seat (past the lease) can be
-   * preempted, and an unclaimed board is claimed by this agent. A board the
-   * caller cannot see is denied as not found (no existence leak), so the
-   * master seat of a foreign session-private board cannot be seized.
+   * Claim the master seat of one board. V3-25: the seat is no longer leased by
+   * a wall clock — a seat whose holder session is absent from the live agent
+   * registry (the worker "lost" survival signal: an unregistered session is
+   * gone, an idle one is still alive) is released here so the successor takes
+   * it immediately, and the release leaves a masterHistory row plus a durable
+   * board notice the claimant reads back from this claim. A board the caller
+   * cannot see is denied as not found (no existence leak), so the master seat
+   * of a foreign session-private board cannot be seized.
    * @param boardId - the board to claim.
    * @param agent - the claiming session agent.
    * @returns the board with its fresh master.
@@ -2548,16 +2686,20 @@ export class TaskboardService extends TypertRemoteService {
     await this.assertBoardAccessible(boardId, agent)
     await this.ensureMasterBoard(boardId, agent)
     const now = Date.now()
-    return this.mutateBoard(boardId, (current) => {
+    let lostHolder: string | null = null
+    const board = await this.mutateBoard(boardId, (current) => {
       if (current.masterAgentId !== null && current.masterAgentId !== agent.id) {
-        const stale = current.masterClaimedAt !== null
-          && now - current.masterClaimedAt >= this.resolved.masterSeatTimeoutMs
-        if (!stale) {
+        // No clock governs the seat: a holder that is still alive keeps it no
+        // matter how long it has been held; only a holder session that left
+        // the registry is lost and may be preempted. Without the registry the
+        // liveness cannot be judged, and the seat fails closed (held).
+        if (!this.masterSeatLost(current.masterAgentId)) {
           throw new TaskboardError(
             'board "' + boardId + '" master seat is held by ' + current.masterAgentId,
             'TASKBOARD_MASTER_HELD',
           )
         }
+        lostHolder = current.masterAgentId
       }
       // A same-owner re-claim is a no-op: the seat and its history stay untouched.
       if (current.masterAgentId === agent.id) return current
@@ -2565,15 +2707,23 @@ export class TaskboardService extends TypertRemoteService {
         fromAgentId: current.masterAgentId,
         toAgentId: agent.id,
         at: now,
-        notes: '',
+        notes: lostHolder === null
+          ? ''
+          : 'preempted a lost seat: holder session ' + lostHolder + ' is absent from the agent registry',
       }
       return {
         ...current,
         masterAgentId: agent.id,
         masterClaimedAt: now,
+        masterExpiresAt: null,
         masterHistory: [...(current.masterHistory ?? []), entry],
       }
     })
+    if (lostHolder === null) return board
+    // Durable release trace for the successor: recorded on the board so the
+    // claim result (and taskboard_notices) carries it back.
+    await this.recordMasterRelease(boardId, lostHolder, 'holder session absent from the agent registry')
+    return (await this.boards()).get(boardId) ?? board
   }
 
   /**
@@ -2589,7 +2739,7 @@ export class TaskboardService extends TypertRemoteService {
       if (current.masterAgentId !== agent.id) {
         throw new TaskboardError('only the current master may release the seat', 'TASKBOARD_NOT_MASTER')
       }
-      return { ...current, masterAgentId: null, masterClaimedAt: null }
+      return { ...current, masterAgentId: null, masterClaimedAt: null, masterExpiresAt: null }
     })
   }
 
@@ -2788,6 +2938,7 @@ export class TaskboardService extends TypertRemoteService {
         ...current,
         masterAgentId: toAgentId,
         masterClaimedAt: now,
+        masterExpiresAt: null,
         handoverNotes: notes,
         masterHistory: [...(current.masterHistory ?? []), entry],
       }
@@ -4351,7 +4502,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_claim_master',
-      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. A stale seat (past the master-seat lease) can be preempted. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board\'s durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.',
+      description: 'Claim the master seat of a taskboard board: the caller becomes the master of that board (default board "default") and gains the exclusive right to taskboard_assign/taskboard_reassign. The seat is held by liveness, not by a clock (V3-25): a seat whose holder session has left the agent registry is released and preempted here at once and recorded in the master history, while a live holder keeps the seat however long it has been held. When the previous master handed over with taskboard_handover, the claim result carries the structured handoverNotes (every card status, worker identity, review seats, backlog summary and master history). The claim result also carries the board\'s durable notices (worker done/failed/lost, review verdicts) — read them first so no event since your last look is missed.',
       parameters: {
         boardId: {
           type: 'string' as const,
