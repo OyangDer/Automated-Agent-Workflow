@@ -2338,6 +2338,13 @@ describe('TaskboardService workflow', () => {
       // and the workflow section own the role permissions).
       expect(prompt).not.toContain('You may not claim')
       expect(prompt).not.toContain('Do not call any other taskboard tool')
+      // Built-in runtime constraints ride every capsule: oversized tool output
+      // is the dominant avoidable cost of a dispatched run (it stays in the
+      // context and is re-sent on every later request).
+      expect(prompt).toContain('Runtime constraints (built-in, always apply)')
+      expect(prompt).toContain('Keep tool output small')
+      expect(prompt).toContain('tail -n 120')
+      expect(prompt).toContain('never cat a whole large file')
     })
 
     it('worker capsule: a marker-less description lands once in the additional details', () => {

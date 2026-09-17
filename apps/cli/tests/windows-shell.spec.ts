@@ -156,4 +156,27 @@ describe('shipped agent presets gate both shell tools by platform', () => {
     }
     expect(byId.get('terminal-pwsh')?.config).toMatchObject({ shellDialect: 'pwsh' })
   })
+
+  it('minimal mounts compaction and the tool-result pruner (dispatched-session token control)', () => {
+    // Regression guard: without compaction a long worker run re-uploads its
+    // whole growing context on every request — the dominant token cost of
+    // taskboard-dispatched sessions. The pruner caps any single tool result so
+    // one huge build log cannot sit in the context for the rest of the run.
+    const entries: unknown = yaml.load(
+      readFileSync(join(presetRoot, 'minimal', 'agent.cordis.yml'), 'utf8'),
+      { schema: entryListSchema },
+    )
+    if (!Array.isArray(entries)) throw new TypeError('minimal preset must parse to an entry array')
+    const group = entries.find((entry): entry is Record<string, unknown> => (
+      typeof entry === 'object' && entry !== null && (entry as Record<string, unknown>).id === 'compaction'
+    ))
+    if (group === undefined) throw new TypeError('minimal preset must mount compaction')
+    const rows = group.config as unknown[]
+    if (!Array.isArray(rows)) throw new TypeError('compaction must carry a row list')
+    const byId = new Map((rows as Record<string, unknown>[]).map(entry => [entry.id, entry]))
+    expect(byId.get('compaction-basic')?.name).toBe('@deepseek-ai/dsh-compaction-basic')
+    const pruner = byId.get('tool-result-pruner')
+    expect(pruner?.name).toBe('@deepseek-ai/dsh-compaction-tool-result-pruner')
+    expect(pruner?.config).toMatchObject({ thresholdChars: 8192, headChars: 4096, tailChars: 1024 })
+  })
 })

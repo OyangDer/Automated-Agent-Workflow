@@ -27,6 +27,15 @@ export interface RepoPreflightConfig {
   worktree?: string
   /** Worktree paths (absolute or repo-root-relative) that workers must never occupy (e.g. the integration worktree). */
   reservedWorktrees?: string[]
+  /**
+   * Whether invariant violations BLOCK the dispatch (default true, fail
+   * closed). With `enforce: false` the report still carries the raw facts and
+   * every violation into the worker prompt (facts-only mode) — used where the
+   * repo's live branch state legitimately differs from the canonical base at
+   * dispatch time (session-branch workflows) and hard gating would block all
+   * work instead of informing it.
+   */
+  enforce?: boolean
 }
 
 /** One registered worktree of the repo (git worktree list). */

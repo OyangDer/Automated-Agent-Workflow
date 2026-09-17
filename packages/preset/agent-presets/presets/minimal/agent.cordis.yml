@@ -67,3 +67,26 @@
           * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
           * Please avoid commands that may produce a very large amount of output.
           * Please run long lived commands in the background, e.g. 'Start-Job' or start a server with Start-Process.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+# Workers run for many turns; without compaction every request re-uploads the
+# whole accumulated context (files read + build logs), which dominates the
+# token cost of dispatched sessions. compaction-basic folds the history as the
+# window fills, and the tool-result pruner caps any single tool result so one
+# huge build log can never sit in context for the rest of the run.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024

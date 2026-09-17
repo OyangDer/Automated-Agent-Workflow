@@ -359,6 +359,8 @@ export const Config: z<Config> = z.object({
     canonicalCommit: z.string(),
     worktree: z.string(),
     reservedWorktrees: z.array(z.string()),
+    // facts-only mode: violations ride the worker capsule but never block.
+    enforce: z.boolean(),
   })),
 })
 
@@ -625,6 +627,8 @@ export class TaskboardService extends TypertRemoteService {
           ? { reservedWorktrees: repo.reservedWorktrees
             .filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '')
             .map(entry => entry.trim()) } : {}),
+        // facts-only mode survives normalization; the default stays enforced.
+        ...(repo.enforce === false ? { enforce: false } : {}),
       }
     }
     this.resolved = {
@@ -2566,7 +2570,7 @@ export class TaskboardService extends TypertRemoteService {
    * @param agent - the master session agent (its cwd names the workspace repo).
    * @returns the preflight outcome, or null when preflight is disabled.
    */
-  private async preflightDispatch(ticket: TicketView, agent: Agent): Promise<{ report: PreflightReport } | null> {
+  private async preflightDispatch(ticket: TicketView, agent: Agent): Promise<{ report: PreflightReport; enforce: boolean } | null> {
     if (Object.keys(this.resolved.preflightRepos).length === 0) return null
     const cwd = agent.session.header.cwd
     const mapping = this.resolvePreflightRepo(cwd)
@@ -2591,9 +2595,15 @@ export class TaskboardService extends TypertRemoteService {
           conflicts: [],
           checkedAt: now,
         },
+        // A configured deployment with no mapping for this repo always fails
+        // closed: an unmapped repo cannot be safely dispatched.
+        enforce: true,
       }
     }
-    return { report: runPreflight(mapping.repoRoot, mapping.config, filesScope, inFlightScopes) }
+    return {
+      report: runPreflight(mapping.repoRoot, mapping.config, filesScope, inFlightScopes),
+      enforce: mapping.config.enforce !== false,
+    }
   }
 
   /**
@@ -2676,7 +2686,9 @@ export class TaskboardService extends TypertRemoteService {
     // A violated repo fails the dispatch closed — the card is blocked with
     // the concrete violations and no worker is ever spawned.
     const preflight = await this.preflightDispatch(running, agent)
-    if (preflight !== null && !preflight.report.safe) {
+    // facts-only mode (enforce: false) still surfaces the facts in the worker
+    // prompt but never blocks; the default remains fail closed.
+    if (preflight !== null && preflight.enforce && !preflight.report.safe) {
       const blocked = await this.blockPreflight(running, preflight.report)
       return { ticket: blocked, worker: 'failed', workerAgentId: null }
     }
@@ -2883,7 +2895,9 @@ export class TaskboardService extends TypertRemoteService {
     // V3-20: deterministic repo/worktree preflight before any re-dispatch
     // spawn; a violated repo fails the retry closed (card blocked, no worker).
     const preflight = await this.preflightDispatch(running, agent)
-    if (preflight !== null && !preflight.report.safe) {
+    // facts-only mode (enforce: false) still surfaces the facts in the worker
+    // prompt but never blocks; the default remains fail closed.
+    if (preflight !== null && preflight.enforce && !preflight.report.safe) {
       const blocked = await this.blockPreflight(running, preflight.report)
       return { ticket: blocked, worker: 'failed', workerAgentId: null }
     }

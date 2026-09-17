@@ -669,6 +669,32 @@ describe('service dispatch preflight (V3-20)', () => {
     expect(subagentsStart).not.toHaveBeenCalled()
   })
 
+  it('facts-only mode (enforce: false) dispatches anyway and still injects the raw facts and violations', async () => {
+    // The session-branch workflow keeps the live tree off the canonical
+    // branch and dirty by design; facts-only mode turns the same mismatch
+    // from a hard block into plain information for the worker.
+    const repo = await createRepo()
+    await writeFile(join(repo, 'extra.txt'), 'x\n')
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: { [repo]: { canonicalBranch: 'main', enforce: false } },
+    })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'facts-only card', 'src/a.ts')
+    const result = await service.assign(dev, ticket.id)
+    // No block: the worker spawns and the card runs.
+    expect(result.worker).toBe('spawned')
+    expect(result.workerAgentId).toBe('worker-child-agent')
+    expect(result.ticket.status).toBe('running')
+    // The capsule still carries the raw facts and the violated invariant.
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('Deterministic repo preflight (computed at dispatch time)')
+    expect(prompt).toContain('extra.txt')
+    expect(prompt).toContain('VIOLATED')
+  })
+
   it('spawns a worker on a clean governed repo and injects the preflight facts into the prompt', async () => {
     const repo = await createRepo()
     const head = git(repo, ['rev-parse', 'HEAD'])
