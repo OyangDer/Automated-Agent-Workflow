@@ -11,7 +11,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -199,5 +199,52 @@ describe('shipped agent presets gate both shell tools by platform', () => {
     expect(thresholdRatio * SHIPPED_WINDOW).toBe(100_000)
     expect(retainRatio * SHIPPED_WINDOW).toBe(30_000)
     expect(retainRatio).toBeLessThan(thresholdRatio)
+  })
+
+  it('every shipped preset that mounts compaction pins an explicit budget', () => {
+    // Regression guard for the trap this change hit: the budget had been written
+    // into `minimal` only, while the deployment actually runs `ptc` (and
+    // `standard` shares its rows), so those agents kept compaction-basic's 0.8
+    // default — a fold at 800K that no measured session ever reached. Deriving
+    // the preset list from the shipped roster, instead of naming presets, makes
+    // a newly added or renamed preset fail here rather than silently ship
+    // without a budget.
+    const SHIPPED_WINDOW = 1_000_000
+    const presets = readdirSync(presetRoot, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .sort()
+    expect(presets.length).toBeGreaterThanOrEqual(3)
+    const withCompaction: string[] = []
+    for (const preset of presets) {
+      let entries: unknown
+      try {
+        entries = yaml.load(readFileSync(join(presetRoot, preset, 'agent.cordis.yml'), 'utf8'), { schema: entryListSchema })
+      } catch {
+        continue
+      }
+      if (!Array.isArray(entries)) continue
+      const group = entries.find((entry): entry is Record<string, unknown> => (
+        typeof entry === 'object' && entry !== null && (entry as Record<string, unknown>).id === 'compaction'
+      ))
+      if (group === undefined) continue
+      const rows = group.config
+      if (!Array.isArray(rows)) throw new TypeError('preset ' + preset + ' compaction must carry a row list')
+      const basic = (rows as Record<string, unknown>[]).find(row => row.id === 'compaction-basic')
+      if (basic === undefined) continue
+      withCompaction.push(preset)
+      const budget = basic.config as { thresholdRatio?: number; retainRatio?: number } | undefined
+      if (budget?.thresholdRatio === undefined || budget.retainRatio === undefined) {
+        throw new TypeError('preset ' + preset + ' mounts compaction-basic without an explicit budget; '
+          + 'the 0.8 default folds only at 80% of the window (800K on the shipped 1M window), '
+          + 'which no measured session reaches')
+      }
+      expect(budget.thresholdRatio * SHIPPED_WINDOW, preset).toBe(100_000)
+      expect(budget.retainRatio * SHIPPED_WINDOW, preset).toBe(30_000)
+      expect(budget.retainRatio, preset).toBeLessThan(budget.thresholdRatio)
+    }
+    // minimal, standard and ptc all mount it today; an empty sweep would mean the
+    // roster lookup itself broke, not that the presets stopped compacting.
+    expect(withCompaction).toEqual(['cordis', 'minimal', 'ptc', 'standard'])
   })
 })
