@@ -3,8 +3,10 @@
 # The persona is the complete system prompt, so global identity, Web orientation,
 # tool guidance, and later assembly listeners cannot add prompt text. Runtime
 # context snapshots are suppressed for this preset, and the model receives only
-# the persistent shell (`bash` on POSIX, `pwsh` on win32). Context compaction is
-# absent.
+# the persistent shell (`bash` on POSIX, `pwsh` on win32). Context compaction IS
+# mounted (compaction-basic plus the tool-result pruner at the tail of this
+# file): without it a long dispatched run re-uploads its whole growing context
+# on every request, which dominates the token cost of taskboard workers.
 
 - id: persona
   name: '@deepseek-ai/dsh-persona'

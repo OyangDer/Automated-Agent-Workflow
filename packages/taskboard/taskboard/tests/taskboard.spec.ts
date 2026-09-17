@@ -2343,8 +2343,12 @@ describe('TaskboardService workflow', () => {
       // context and is re-sent on every later request).
       expect(prompt).toContain('Runtime constraints (built-in, always apply)')
       expect(prompt).toContain('Keep tool output small')
-      expect(prompt).toContain('tail -n 120')
-      expect(prompt).toContain('never cat a whole large file')
+      // Dialect-aware: dispatched workers run pwsh on win32, bash on POSIX —
+      // both examples are named, never a POSIX-only utility.
+      expect(prompt).toContain('bash: `tail -n 120`; PowerShell: `Select-Object -Last 120`')
+      expect(prompt).toContain('Select-Object -Skip 9 -First 16')
+      // With facts available the location hint points at them.
+      expect(prompt).toContain('the repository facts above already locate the code you need')
     })
 
     it('worker capsule: a marker-less description lands once in the additional details', () => {
@@ -2359,6 +2363,10 @@ describe('TaskboardService workflow', () => {
       expect(prompt).toContain('preflight not computed at dispatch')
       expect(prompt).toContain('git branch --show-current')
       expect(prompt).toContain('working directory: C:/work')
+      // Without computed facts the built-in hint must not claim the facts
+      // above locate the code (the reviewer caught the unconditional claim).
+      expect(prompt).toContain('locate the code with one targeted search before reading anything')
+      expect(prompt).not.toContain('the repository facts above already locate the code you need')
     })
 
     it('worker capsule: retry recompiles a fresh capsule — no stale facts, no appended notes', () => {

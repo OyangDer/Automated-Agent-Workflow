@@ -220,13 +220,18 @@ export function renderWorkerCapsule(capsule: WorkerCapsule, cwd = ''): string {
     )
   }
   const scope = capsule.filesScope.trim() === '' ? '(not declared)' : capsule.filesScope
+  // The dispatched shell is dialect-specific (pwsh on win32, bash on POSIX),
+  // so both dialects are named rather than assuming POSIX utilities exist.
+  const locationHint = capsule.gitFacts.available
+    ? '  - Prefer one focused command over a broad repository sweep; the repository facts above already locate the code you need.'
+    : '  - Prefer one focused command over a broad repository sweep; locate the code with one targeted search before reading anything.'
   lines.push(
     '- Declared file scope: ' + scope,
     '  The card declares which files/directories it affects; stay inside that scope and do not edit files outside it (other parallel workers may own them). An undeclared scope means you are responsible for reporting exactly which paths you touched in devNotes.',
     '',
     '- Runtime constraints (built-in, always apply):',
-    '  - Keep tool output small: truncate long command output (e.g. pipe through `tail -n 120`), never cat a whole large file — read only the lines you need (`sed -n 10,25p`). Every byte you print stays in your context and is re-sent on every later turn, so oversized output is the main avoidable cost of this run.',
-    '  - Prefer one focused command over a broad repository sweep; the preflight facts above already locate the code you need.',
+    '  - Keep tool output small: cap long output at the shell (bash: `tail -n 120`; PowerShell: `Select-Object -Last 120`) and read only the lines you need (bash: `sed -n 10,25p`; PowerShell: `Select-Object -Skip 9 -First 16`) instead of printing a whole large file. Every byte you print stays in your context and is re-sent on every later turn, so oversized output is the main avoidable cost of this run.',
+    locationHint,
     '',
     '- Constraints (verbatim from the card):',
     indent(capsule.constraints === '' ? NO_CONSTRAINTS : capsule.constraints),
