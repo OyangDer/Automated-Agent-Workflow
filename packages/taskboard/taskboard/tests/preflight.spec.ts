@@ -915,4 +915,181 @@ describe('service dispatch preflight (V3-20)', () => {
     const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
     expect(prompt).not.toContain('Deterministic repo preflight')
   })
+
+  it('locates the repo from the card filesScope when the master cwd is unmapped (V3-26)', async () => {
+    const repo = await createRepo()
+    const head = git(repo, ['rev-parse', 'HEAD'])
+    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    openDirs.push(elsewhere)
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    // The scope is absolute and inside the mapped repo; the cwd is not.
+    const ticket = await createNotStarted(service, dev, 'scope-located card', join(repo, 'packages', 'x', 'src', 'a.ts'))
+    const result = await service.assign(dev, ticket.id)
+    // The dispatch passes and the report is gathered from the mapped repo,
+    // never from the unmapped cwd (which holds no git facts at all).
+    expect(result.worker).toBe('spawned')
+    expect(result.workerAgentId).toBe('worker-child-agent')
+    expect(result.ticket.status).toBe('running')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('canonical base: main @ ' + head)
+    expect(prompt).toContain('HEAD: ' + head)
+    expect(prompt).toContain('base/candidate relationship: equal')
+    expect(prompt).toContain('SAFE')
+    expect(prompt).not.toContain('VIOLATED')
+  })
+
+  it('prefers the card filesScope repo over a mapped master cwd (V3-26)', async () => {
+    const cwdRepo = await createRepo()
+    const scopeRepo = await createRepo()
+    // Only the scope repo is dirty: a cwd-first resolution would report SAFE.
+    await writeFile(join(scopeRepo, 'extra.txt'), 'x\n')
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: {
+        [cwdRepo]: { canonicalBranch: 'main' },
+        [scopeRepo]: { canonicalBranch: 'main' },
+      },
+    })
+    const dev = masterAgent('dev-agent-a', cwdRepo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'scope wins card', join(scopeRepo, 'src', 'a.ts'))
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('failed')
+    expect(result.ticket.failure?.reason).toContain('extra.txt')
+    expect(subagentsStart).not.toHaveBeenCalled()
+  })
+
+  it('uses the first filesScope entry that lands in a configured root, skipping unlocatable ones (V3-26)', async () => {
+    const repo = await createRepo()
+    const head = git(repo, ['rev-parse', 'HEAD'])
+    const ungoverned = await mkdtemp(join(tmpdir(), 'preflight-ungoverned-'))
+    openDirs.push(ungoverned)
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    // No cwd at all: only the declared scope can locate the repo.
+    const dev = masterAgent('dev-agent-a')
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const scope = join(ungoverned, 'src', 'a.ts') + '; src/relative.ts; ' + join(repo, 'src', 'b.ts')
+    const ticket = await createNotStarted(service, dev, 'multi entry scope card', scope)
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('canonical base: main @ ' + head)
+    expect(prompt).toContain('SAFE')
+  })
+
+  it('fails closed naming both misses when neither the filesScope nor the cwd maps (V3-26)', async () => {
+    const repo = await createRepo()
+    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const ungoverned = await mkdtemp(join(tmpdir(), 'preflight-ungoverned-'))
+    openDirs.push(elsewhere, ungoverned)
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const scope = join(ungoverned, 'src', 'a.ts')
+    const ticket = await createNotStarted(service, dev, 'both unmapped card', scope)
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('failed')
+    expect(result.ticket.status).toBe('blocked')
+    const reason = result.ticket.failure?.reason ?? ''
+    expect(reason).toContain('preflight blocked')
+    expect(reason).toContain('no repo mapping')
+    expect(reason).toContain('neither the declared filesScope')
+    expect(reason).toContain(scope)
+    expect(reason).toContain('master cwd')
+    expect(reason).toContain(elsewhere)
+    expect(reason).toContain('fail closed')
+    expect(subagentsStart).not.toHaveBeenCalled()
+  })
+
+  it('keeps the cwd fallback when the card declares no filesScope (V3-26)', async () => {
+    const repo = await createRepo()
+    const head = git(repo, ['rev-parse', 'HEAD'])
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'no scope card', '')
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('canonical base: main @ ' + head)
+    expect(prompt).toContain('SAFE')
+    expect(prompt).toContain('declared file scope: (not declared)')
+  })
+
+  it('names the missing filesScope when no scope is declared and the cwd is unmapped (V3-26)', async () => {
+    const repo = await createRepo()
+    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    openDirs.push(elsewhere)
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'no scope unmapped card', '')
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('failed')
+    const reason = result.ticket.failure?.reason ?? ''
+    expect(reason).toContain('declares no filesScope')
+    expect(reason).toContain(elsewhere)
+    // Distinct from the both-missing wording: here the operator fixes the cwd.
+    expect(reason).not.toContain('neither the declared filesScope')
+    expect(subagentsStart).not.toHaveBeenCalled()
+  })
+
+  it('facts-only mode injects facts and never blocks when the repo came from the filesScope (V3-26)', async () => {
+    const repo = await createRepo()
+    await writeFile(join(repo, 'extra.txt'), 'x\n')
+    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    openDirs.push(elsewhere)
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: { [repo]: { canonicalBranch: 'main', enforce: false } },
+    })
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'facts-only scope card', join(repo, 'src', 'a.ts'))
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    expect(result.workerAgentId).toBe('worker-child-agent')
+    expect(result.ticket.status).toBe('running')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('Deterministic repo preflight (computed at dispatch time)')
+    expect(prompt).toContain('extra.txt')
+    expect(prompt).toContain('VIOLATED')
+  })
+
+  it('re-dispatch retry locates the repo from the filesScope when the cwd is unmapped (V3-26)', async () => {
+    const repo = await createRepo()
+    await writeFile(join(repo, 'dirty.txt'), 'x\n')
+    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    openDirs.push(elsewhere)
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'retry scope card', join(repo, 'src', 'a.ts'))
+    // The scope-located repo is dirty: the retry must fail closed, no worker.
+    const first = await service.assign(dev, ticket.id)
+    expect(first.worker).toBe('failed')
+    expect(first.ticket.failure?.reason).toContain('dirty.txt')
+    expect(subagentsStart).not.toHaveBeenCalled()
+    await rm(join(repo, 'dirty.txt'))
+    const retried = await service.reassign(dev, ticket.id, 'retry')
+    expect(retried.worker).toBe('spawned')
+    expect(retried.workerAgentId).toBe('worker-child-agent')
+    expect(retried.ticket.status).toBe('running')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('dirty files: (none)')
+    expect(prompt).toContain('SAFE')
+  })
 })

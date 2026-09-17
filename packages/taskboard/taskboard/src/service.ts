@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { basename } from 'node:path'
+import { basename, isAbsolute } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { z as zod } from 'zod'
@@ -39,7 +39,7 @@ import type {
   TicketWorkerStatus,
 } from './types.ts'
 import {
-  isInsidePath, normalizePath, preflightPromptSection, runPreflight,
+  isInsidePath, normalizePath, parseFilesScope, preflightPromptSection, runPreflight,
   type RepoPreflightConfig,
 } from './preflight.ts'
 import {
@@ -322,16 +322,18 @@ export interface Config {
    */
   reviewerStaleTimeoutMs?: number
   /**
-   * V3-20: per-repo deterministic preflight contracts, keyed by absolute repo
-   * root path. When non-empty, every assign/retry dispatch resolves the
-   * card's repo from the master session cwd (the shared workspace) and
-   * refuses to spawn a worker unless the live git facts satisfy the
-   * invariants — the canonical base (branch + commit) is checked out, the
-   * working tree is clean, no reserved worktree (e.g. the integration
-   * worktree) is occupied, and no in-flight card of the same board has an
-   * overlapping file scope. A failing dispatch lands the card blocked with
-   * the concrete violations and never spawns a worker (fail closed). An
-   * empty/absent map keeps the legacy dispatch path (no preflight).
+   * V3-20/V3-26: per-repo deterministic preflight contracts, keyed by
+   * absolute repo root path. When non-empty, every assign/retry dispatch
+   * resolves the card's repo from its declared filesScope first and falls
+   * back to the master session cwd (the shared workspace) only when no
+   * declared scope entry lands inside a configured root, then refuses to
+   * spawn a worker unless the live git facts satisfy the invariants — the
+   * canonical base (branch + commit) is checked out, the working tree is
+   * clean, no reserved worktree (e.g. the integration worktree) is occupied,
+   * and no in-flight card of the same board has an overlapping file scope.
+   * A failing dispatch lands the card blocked with the concrete violations
+   * and never spawns a worker (fail closed). An empty/absent map keeps the
+   * legacy dispatch path (no preflight).
    */
   preflightRepos?: Record<string, RepoPreflightConfig>
 }
@@ -2523,23 +2525,47 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * V3-20: resolve the repo a card dispatches against, from configuration
-   * only (never guessed). The master session cwd names the shared workspace;
-   * the configured preflight repo root that prefixes it wins (longest match).
-   * @param cwd - the master session's working directory.
-   * @returns the matched repo root and its preflight contract, or null when no configured root governs the cwd.
+   * V3-20: resolve a configured repo from one absolute path, from
+   * configuration only (never guessed): the configured preflight repo root
+   * that prefixes the path wins (longest match).
+   * @param path - the absolute path to locate (a master cwd or a declared scope entry).
+   * @returns the matched repo root and its preflight contract, or null when no configured root governs the path.
    */
-  private resolvePreflightRepo(cwd: string | undefined): { repoRoot: string; config: RepoPreflightConfig } | null {
-    if (cwd === undefined || cwd === '') return null
-    const cwdNorm = normalizePath(cwd)
+  private resolvePreflightRepo(path: string | undefined): { repoRoot: string; config: RepoPreflightConfig } | null {
+    if (path === undefined || path === '') return null
+    const targetNorm = normalizePath(path)
     let best: { repoRoot: string; config: RepoPreflightConfig } | null = null
     for (const [root, config] of Object.entries(this.resolved.preflightRepos)) {
-      if (!isInsidePath(root, cwdNorm)) continue
+      if (!isInsidePath(root, targetNorm)) continue
       if (best === null || normalizePath(root).length > normalizePath(best.repoRoot).length) {
         best = { repoRoot: root, config }
       }
     }
     return best
+  }
+
+  /**
+   * V3-26: locate the repo one card dispatches against, preferring the card's
+   * own declared filesScope over the master session cwd. The first declared
+   * scope entry that lands inside a configured repo root wins (longest-prefix
+   * match; a relative entry names nothing on its own and is skipped). Only
+   * when no entry lands anywhere does the master cwd fall back to the
+   * pre-V3-26 resolution, so a master started from an unmapped directory no
+   * longer rejects cards whose declared scope is governed.
+   * @param filesScope - the card's declared file scope.
+   * @param cwd - the master session cwd, used only as a fallback.
+   * @returns the matched root + contract, or null when neither the scope nor the cwd locates a repo.
+   */
+  private locatePreflightRepo(
+    filesScope: string,
+    cwd: string | undefined,
+  ): { repoRoot: string; config: RepoPreflightConfig } | null {
+    for (const entry of parseFilesScope(filesScope)) {
+      if (!isAbsolute(entry)) continue
+      const byScope = this.resolvePreflightRepo(entry)
+      if (byScope !== null) return byScope
+    }
+    return this.resolvePreflightRepo(cwd)
   }
 
   /**
@@ -2561,29 +2587,37 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * V3-20: run the deterministic repo/worktree preflight for one dispatch,
-   * computed fresh at dispatch time (never cached). Returns null when
-   * preflight is not enabled (no configured repos — legacy dispatch path);
-   * otherwise always a report, and a safe=false report carries the concrete
-   * violations the caller must fail the dispatch with (fail closed).
+   * V3-20/V3-26: run the deterministic repo/worktree preflight for one
+   * dispatch, computed fresh at dispatch time (never cached). The card's
+   * declared filesScope locates the repo first (V3-26); the master session
+   * cwd is only the fallback. Returns null when preflight is not enabled (no
+   * configured repos — legacy dispatch path); otherwise always a report, and
+   * a safe=false report carries the concrete violations the caller must fail
+   * the dispatch with (fail closed).
    * @param ticket - the card being dispatched.
-   * @param agent - the master session agent (its cwd names the workspace repo).
+   * @param agent - the master session agent (its cwd is the fallback workspace repo).
    * @returns the preflight outcome, or null when preflight is disabled.
    */
   private async preflightDispatch(ticket: TicketView, agent: Agent): Promise<{ report: PreflightReport; enforce: boolean } | null> {
     if (Object.keys(this.resolved.preflightRepos).length === 0) return null
     const cwd = agent.session.header.cwd
-    const mapping = this.resolvePreflightRepo(cwd)
     const filesScope = ticket.filesScope
+    const located = this.locatePreflightRepo(filesScope, cwd)
     const inFlightScopes = await this.inFlightScopes(ticket)
-    if (mapping === null) {
+    if (located === null) {
       const now = Date.now()
+      const cwdLabel = typeof cwd === 'string' && cwd !== '' ? cwd : '(none)'
+      // The miss is named side by side so the operator knows which declaration
+      // to fix: an unlocatable filesScope, an unmapped cwd, or both.
+      const violation = parseFilesScope(filesScope).length === 0
+        ? 'no repo mapping for ticket "' + ticket.id + '": the card declares no filesScope to locate its repo, and the master cwd "'
+          + cwdLabel + '" is not inside any configured preflight repo root (fail closed)'
+        : 'no repo mapping for ticket "' + ticket.id + '": neither the declared filesScope "'
+          + filesScope + '" nor the master cwd "' + cwdLabel + '" is inside any configured preflight repo root (fail closed)'
       return {
         report: {
           safe: false,
-          violations: ['no repo mapping for ticket "' + ticket.id + '": the master cwd "'
-            + (typeof cwd === 'string' && cwd !== '' ? cwd : '(none)')
-            + '" is not inside any configured preflight repo root (fail closed)'],
+          violations: [violation],
           repoRoot: typeof cwd === 'string' && cwd !== '' ? cwd : '(unknown)',
           canonicalBase: { branch: '', commit: '' },
           assignedWorktree: '',
@@ -2601,8 +2635,8 @@ export class TaskboardService extends TypertRemoteService {
       }
     }
     return {
-      report: runPreflight(mapping.repoRoot, mapping.config, filesScope, inFlightScopes),
-      enforce: mapping.config.enforce !== false,
+      report: runPreflight(located.repoRoot, located.config, filesScope, inFlightScopes),
+      enforce: located.config.enforce !== false,
     }
   }
 
