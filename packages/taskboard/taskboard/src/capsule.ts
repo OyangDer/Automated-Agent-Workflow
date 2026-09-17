@@ -272,7 +272,8 @@ export interface WorkerClaims {
   devNotes: string
 }
 
-const CLAIM_LABEL_PATTERN = /^\s*[-*]?\s*(Root cause|Files changed|Tests run|Key output line|关键输出行|Known anomaly|Known issue|Anomaly)\s*[:：]\s*(.*)$/i
+const CLAIM_LABEL_NAMES = 'Root cause|Files changed|Tests run|Key output line|关键输出行|Known anomaly|Known issue|Anomaly'
+const CLAIM_LABEL_PATTERN = new RegExp('^\\s*[-*]?\\s*(' + CLAIM_LABEL_NAMES + ')\\s*[:：]\\s*(.*)$', 'i')
 
 /**
  * Structure the worker's compact claims from its devNotes: labeled lines
