@@ -44,8 +44,12 @@
   - 持有会话**不在注册表**里（重启 / 硬死）→ 席位立即释放，落一条 `masterHistory`
     行（`toAgentId = ''`，即席位空置）+ 一条 `master-released` board notice 给继任
     master；`claimMaster` 也据此当场夺回失联席位（不再等租约到期）。
-  - 可选 idle 臂 `masterIdleTimeoutMs`（默认 900000，0 = 关闭）：会话仍在注册表、
-    但没有 running 工具且活动尾超过 N → 判定卡死并释放。
+  - **【V3-32 已删除，仅存设计历史】** 此处曾有一个可选的"空闲超时释放"臂（默认
+    900000ms，0 = 关闭）：会话仍在注册表、但没有 running 工具且活动尾超过 N → 判定卡死
+    并释放。该判据把"沉默"当成"卡死"——V3-29 要求 master 派发完即结束回合等通知，而一次
+    worker 运行实测 29~55 分钟，于是 master 每按纪律走一轮就会撞上这个臂；席位被误释后
+    masterAgentId 变 null，丢 worker 的自愈也因此静默关闭。该臂连同其配置项、校验与
+    通知文案已全部删除，席位只按上一条的注册表存活判据释放。
   - 释放只改**归属**：不动在跑的卡，也不会因此重派 In progress 的卡。
   - 接管入口不变：`taskboard_handover` + `claim_master` 的结构快照
     （cards / notices / pendingAdjudications / backlogSummary）仍是唯一的显式接管路径；

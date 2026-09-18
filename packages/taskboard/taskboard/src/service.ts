@@ -287,15 +287,6 @@ export interface Config {
   reviewerEffort?: string
   /** Subagent provider name used to spawn worker agents. */
   workerProvider?: string
-  /**
-   * V3-25 master-seat idle arm in milliseconds: a master session that is
-   * still registered but has had no session activity for longer than this is
-   * judged stuck and its seat is released (0 disables the idle arm; a master
-   * session absent from the agent registry is always released immediately,
-   * exactly like a lost worker). Defaults to 900000 (15 minutes), the same
-   * magnitude as reviewerStaleTimeoutMs.
-   */
-  masterIdleTimeoutMs?: number
   /** Review protocol: "report" has the reviewer return a structured verdict (master resolves); "direct" keeps the v1 reviewer tools. */
   reviewMode?: 'report' | 'direct'
   /**
@@ -362,7 +353,6 @@ export const Config: z<Config> = z.object({
   reviewerModel: z.string(),
   reviewerEffort: z.string(),
   workerProvider: z.string().default('spawn'),
-  masterIdleTimeoutMs: z.number().default(900000),
   reviewMode: z.union(['report', 'direct'] as const).default('report'),
   reconcileIntervalMs: z.number().default(60000),
   noticeDedupeWindowMs: z.number().default(10000),
@@ -476,14 +466,6 @@ export interface TicketRow {
   reviewOutcome?: { verdict: string; summary: string; problems: string[] } | null
 }
 
-/** Validate one explicit master-seat idle timeout (0 disables the idle arm). */
-function resolveMasterIdleTimeout(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error('taskboard: masterIdleTimeoutMs must be a non-negative safe integer')
-  }
-  return value
-}
-
 /** The reasoning-effort vocabulary the deepseek family of models accepts (see llm-deepseek). */
 const EFFORT_LEVELS = ['off', 'high', 'max'] as const
 
@@ -516,7 +498,7 @@ function resolveNoticeDedupeWindow(value: number): number {
   return value
 }
 
-/** Validate one explicit idle-staleness timeout (0 disables the idle arm). */
+/** Validate one explicit idle-staleness timeout (0 disables the idle-staleness arm). */
 function resolveLostWorkerTimeout(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error('taskboard: lostWorkerTimeoutMs must be a non-negative safe integer')
@@ -594,7 +576,6 @@ export class TaskboardService extends TypertRemoteService {
     reviewerModel: string
     reviewerEffort: string | undefined
     workerProvider: string
-    masterIdleTimeoutMs: number
     reviewMode: 'report' | 'direct'
     reconcileIntervalMs: number
     noticeDedupeWindowMs: number
@@ -661,7 +642,6 @@ export class TaskboardService extends TypertRemoteService {
       reviewerModel: config.reviewerModel ?? workerModel,
       reviewerEffort: resolveEffort(config.reviewerEffort) ?? workerEffort,
       workerProvider: config.workerProvider ?? 'spawn',
-      masterIdleTimeoutMs: resolveMasterIdleTimeout(config.masterIdleTimeoutMs ?? 900000),
       reviewMode: config.reviewMode === 'direct' ? 'direct' : 'report',
       reconcileIntervalMs: resolveReconcileInterval(config.reconcileIntervalMs ?? 60000),
       noticeDedupeWindowMs: resolveNoticeDedupeWindow(config.noticeDedupeWindowMs ?? 10000),
@@ -1649,9 +1629,10 @@ export class TaskboardService extends TypertRemoteService {
    * Judge one running card's worker liveness: 'lost' when the session is
    * absent from the registry (restart / hard death) or when it is still
    * registered but idle — no running tool — and has had no session activity
-   * for longer than lostWorkerTimeoutMs (stuck). 'alive' otherwise. The idle
-   * arm is disabled when the timeout is 0; the registry-absence arm is not
-   * configurable (a missing session is always lost, per the restart rule).
+   * for longer than lostWorkerTimeoutMs (stuck). 'alive' otherwise. The
+   * idle-staleness arm is disabled when the timeout is 0; the
+   * registry-absence arm is not configurable (a missing session is always
+   * lost, per the restart rule).
    */
   private workerLost(registry: { get(id: string): Agent | undefined }, sessionId: string): boolean {
     const agent = registry.get(sessionId)
@@ -1675,9 +1656,10 @@ export class TaskboardService extends TypertRemoteService {
   /**
    * Judge one master seat's holder liveness (V3-25): true when the holding
    * session is absent from the live agent registry (restart / hard death) —
-   * the worker "lost" survival signal reused verbatim. There is no clock and
-   * no idle arm here: an idle but registered master still holds the seat, so
-   * time alone never takes it. Without a registry the judgment fails closed
+   * the worker "lost" survival signal reused verbatim. There is no clock
+   * here (V3-32): an idle but registered master still holds the seat, so
+   * time and silence alone never take it. Without a registry the judgment
+   * fails closed
    * (the seat counts as held).
    * @param sessionId - the seat holder's session id.
    * @returns whether the holder session is gone.
@@ -2065,14 +2047,14 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * One master-seat liveness pass (V3-25): every board whose seat names a
-   * session that is not alive is released, reusing the worker "lost" liveness
-   * signal. A master session absent from the live agent registry (restart /
-   * hard death) is always released immediately — there are no ghost seats;
-   * a master session still registered but idle (no running tool) with no
-   * session activity past masterIdleTimeoutMs is judged stuck and released
-   * (0 disables this idle arm, exactly like reviewerStaleTimeoutMs; the
-   * registry-absence arm is not configurable).
+   * One master-seat liveness pass (V3-25, revised by V3-32): every board whose
+   * seat names a session that is not alive is released, reusing the worker
+   * "lost" survival signal. A master session absent from the live agent
+   * registry (restart / hard death) is always released immediately — there
+   * are no ghost seats, and that registry-absence judgment is the only one.
+   * A registered holder keeps the seat however long it stays silent: silence
+   * is not death, and a master that ends its turn after dispatching and waits
+   * for a notice must not be evicted for it.
    *
    * A release changes seat ownership only: in-flight cards keep their workers
    * and reviewers untouched, and no card is ever re-dispatched by this pass.
@@ -2093,15 +2075,10 @@ export class TaskboardService extends TypertRemoteService {
     for (const [boardId, board] of table.entries()) {
       const holder = board.masterAgentId
       if (holder === null) continue
-      const master = registry.get(holder)
-      const ghost = master === undefined
-      const idle = !ghost && this.resolved.masterIdleTimeoutMs > 0
-        && master.status !== 'running'
-        && Date.now() - TaskboardService.lastActivityOf(master) > this.resolved.masterIdleTimeoutMs
-      if (!ghost && !idle) continue
-      const reason = ghost
-        ? 'holder session absent from the agent registry'
-        : 'holder idle with no activity for over ' + String(this.resolved.masterIdleTimeoutMs) + 'ms'
+      // Only registry absence releases a seat (V3-32): a registered holder is
+      // alive however silent it is, so no elapsed-time judgment runs here.
+      if (!this.masterSeatLost(holder)) continue
+      const reason = 'holder session absent from the agent registry'
       if (await this.releaseLostMasterSeat(boardId, holder, reason)) released += 1
     }
     return released

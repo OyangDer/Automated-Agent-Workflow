@@ -176,8 +176,6 @@ interface Harness {
 
 interface HarnessOptions {
   spawn?: SpawnBehavior
-  /** V3-25 master-seat idle-arm timeout passed to the plugin (0 disables the idle arm). */
-  masterIdleTimeoutMs?: number
   /** Pre-seeded storage root; a fresh temp root when omitted. */
   root?: string
   /** When set, worker spawns return a run carrying this result promise. */
@@ -347,7 +345,6 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   // startup pass still runs (harmless on a fresh board), and the scan itself
   // is exercised explicitly or with a short explicit interval.
   await ctx.plugin(TaskboardService, {
-    ...(options.masterIdleTimeoutMs === undefined ? {} : { masterIdleTimeoutMs: options.masterIdleTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
     ...(options.workerModel === undefined ? {} : { workerModel: options.workerModel }),
     ...(options.workerEffort === undefined ? {} : { workerEffort: options.workerEffort }),
@@ -3522,8 +3519,8 @@ it('releases the master seat when the holder session leaves the registry (V3-25)
 it('never releases a live master seat by elapsed time (V3-25)', async () => {
   vi.useFakeTimers({ toFake: ['Date'] })
   try {
-    // The idle arm is off: nothing about elapsed time may free this seat.
-    const { service, devA, devB } = await harness({ masterIdleTimeoutMs: 0 })
+    // Nothing about elapsed time may free this seat (V3-25, revised by V3-32).
+    const { service, devA, devB } = await harness()
     await service.claimMaster('default', devA)
     vi.advanceTimersByTime(7 * 24 * 60 * 60 * 1000)
     // devA is still registered, so the rival claim is refused...
@@ -3537,35 +3534,32 @@ it('never releases a live master seat by elapsed time (V3-25)', async () => {
   }
 })
 
-it('frees a registered but silent master seat only past the idle arm (V3-25)', async () => {
-  /** Re-register the master id as a live session whose activity tail is old. */
-  const standInStaleSession = (
-    ctx: Awaited<ReturnType<typeof harness>>['ctx'], id: string, unregister: () => void,
-  ) => {
-    unregister()
-    const stale = Session.create(SessionId(id), undefined, {
-      version: SESSION_FORMAT_VERSION,
-      id: SessionId(id),
-      createdAt: Date.now() - 60_000,
-      isSeeded: false,
-    })
-    ctx.agents.register(stubAgentForSession(stale))
-  }
-  // Idle arm off (0): a registered holder keeps the seat however silent it is.
-  const off = await harness({ masterIdleTimeoutMs: 0 })
-  await off.service.claimMaster('default', off.devA)
-  standInStaleSession(off.ctx, off.devA.id, off.unregisterMaster)
-  expect(await off.service.reconcileMasterSeats()).toBe(0)
-  expect((await off.service.listBoards(off.devA)).find(b => b.boardId === 'default')!.masterAgentId).toBe(off.devA.id)
-  // Idle arm on: the same silent-but-registered holder is released.
-  const on = await harness({ masterIdleTimeoutMs: 2000 })
-  await on.service.claimMaster('default', on.devA)
-  standInStaleSession(on.ctx, on.devA.id, on.unregisterMaster)
-  expect(await on.service.reconcileMasterSeats()).toBe(1)
-  const released = (await on.service.listBoards(on.devB)).find(b => b.boardId === 'default')!
+it('keeps a registered but silent master seat, releasing it only when the session leaves the registry (V3-32)', async () => {
+  const { ctx, service, devA, devB, unregisterMaster } = await harness()
+  await service.claimMaster('default', devA)
+  // Stand in a session under the holder id whose event log is silent well past
+  // the former 15-minute arm: a registered session is alive, so the seat must
+  // survive however long the holder stays silent between turns.
+  unregisterMaster()
+  const stale = Session.create(SessionId(devA.id), undefined, {
+    version: SESSION_FORMAT_VERSION,
+    id: SessionId(devA.id),
+    createdAt: Date.now() - 16 * 60_000,
+    isSeeded: false,
+  })
+  const unregisterStale = ctx.agents.register(stubAgentForSession(stale))
+  expect(await service.reconcileMasterSeats()).toBe(0)
+  expect((await service.listBoards(devB)).find(b => b.boardId === 'default')!.masterAgentId).toBe(devA.id)
+  // A rival claim is still refused while the holder is registered...
+  await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+  // ...and once the session leaves the registry the release path is unchanged:
+  // one master-history row plus the durable master-released notice.
+  unregisterStale()
+  expect(await service.reconcileMasterSeats()).toBe(1)
+  const released = (await service.listBoards(devB)).find(b => b.boardId === 'default')!
   expect(released.masterAgentId).toBeNull()
-  expect((released.masterHistory ?? []).at(-1)).toMatchObject({ fromAgentId: on.devA.id, toAgentId: '' })
-  expect((released.masterHistory ?? []).at(-1)!.notes).toContain('idle')
+  expect((released.masterHistory ?? []).at(-1)).toMatchObject({ fromAgentId: devA.id, toAgentId: '' })
+  expect((released.masterHistory ?? []).at(-1)!.notes).toContain('registry')
   expect(released.notices!.at(-1)).toMatchObject({ kind: 'master-released' })
 })
 
