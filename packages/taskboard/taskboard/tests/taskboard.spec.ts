@@ -28,7 +28,7 @@ import TaskboardService, { TASKBOARD_COLUMNS } from '@deepseek-ai/dsh-taskboard'
 import type { TaskboardChanged, TicketView } from '@deepseek-ai/dsh-taskboard'
 import {
   branchNameFor, buildHandoverNotes, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
-  MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
+  DISPATCH_TURN_END, MASTER_SECTION, masterModelNote, WORKFLOW_SECTION,
 } from '../src/domain.ts'
 import {
   compileReviewerCapsule, compileWorkerCapsule, parseSections, parseWorkerClaims,
@@ -2195,23 +2195,22 @@ describe('TaskboardService workflow', () => {
     expect(MASTER_SECTION).not.toContain('Workers and reviewers never claim')
   })
 
-  it('teaches the event-driven master discipline: dispatch, then wait for the notice — never poll (V3-21)', () => {
-    // After taskboard_assign confirms the card is In progress, the turn ends:
-    // no looping taskboard_list/notices/view waiting for a worker, no reading
-    // unrelated cards, no filesystem probing.
-    expect(MASTER_SECTION).toContain('Event-driven master, never poll')
-    expect(MASTER_SECTION).toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
-    expect(MASTER_SECTION).toContain('do not read unrelated cards or probe the filesystem')
-    expect(MASTER_SECTION).toContain('end the current turn')
-    expect(MASTER_SECTION).toContain('A proactive refresh')
-    expect(MASTER_SECTION).toContain('genuine anomalies')
-    // The notice channel carries the compact event line the master adjudicates from.
-    expect(MASTER_SECTION).toContain('compact event line')
-    expect(MASTER_SECTION).toContain('ticket/title/state/scope/commit/verdict/blocker/anomaly')
-    // The workflow section repeats the same no-polling rule for every session.
-    expect(WORKFLOW_SECTION).toContain('Event-driven master, never poll')
-    expect(WORKFLOW_SECTION).toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
-    // Card read layering: compact by default, full only when an anomaly needs it.
+  it('drops both anti-poll paragraphs from the prompt: the rule lives once, in the dispatch return (V3-29)', () => {
+    // ② V3-29: the two ~775-char "Event-driven master, never poll" paragraphs
+    // are gone from the prompt — the closing contract is delivered by the
+    // taskboard_assign / taskboard_reassign return text instead of being
+    // repeated to every session's prompt.
+    expect(MASTER_SECTION).not.toContain('never poll')
+    expect(WORKFLOW_SECTION).not.toContain('never poll')
+    expect(MASTER_SECTION).not.toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
+    expect(WORKFLOW_SECTION).not.toContain('do not loop taskboard_list / taskboard_notices / taskboard_view')
+    expect(MASTER_SECTION).not.toContain('A proactive refresh')
+    expect(WORKFLOW_SECTION).not.toContain('A proactive refresh')
+    expect(MASTER_SECTION).not.toContain('do not read unrelated cards or probe the filesystem')
+    // The prompt net shrinks: the V3-28 baseline across both sections was
+    // 15374 chars; removing the two paragraphs drops it under 14000.
+    expect(MASTER_SECTION.length + WORKFLOW_SECTION.length).toBeLessThan(14000)
+    // The rest of the V3-21 discipline (layered card reads) survives.
     expect(MASTER_SECTION).toContain('Read cards in layers')
     expect(MASTER_SECTION).toContain('default compact')
     expect(MASTER_SECTION).toContain('anomaly unresolved')
@@ -3716,6 +3715,60 @@ it('rejects the taskboard_assign tool for a subagent-origin caller', async () =>
   })
   expect(ok.isError).toBe(false)
   expect((ok as { value: { worker: string } }).value.worker).toBe('spawned')
+})
+
+it('closes the dispatch turn in the return text itself: assign + every reassign branch carry the V3-29 contract', async () => {
+  const renderedText = (result: { content: { type: string; text?: string }[] }): string =>
+    result.content.map(block => block.type === 'text' ? (block.text ?? '') : '').join('')
+  const h = await harness({ continuable: true })
+  await h.service.claimMaster('default', h.devA)
+  const card = await createTicket(h.service, 'contract card')
+  await scheduleToNotStarted(h.service, h.devA, card)
+  // Branch 1 — assign spawns a worker.
+  const assigned = await h.ctx.tools.execute({
+    callId: ToolCallId('v329-assign'), name: 'taskboard_assign',
+    arguments: { ticketId: card.id }, agent: h.devA, signal: new AbortController().signal,
+  })
+  expect(assigned.isError).toBe(false)
+  expect(renderedText(assigned)).toContain(DISPATCH_TURN_END)
+  // Branch 2 — reassign "continue" wakes the existing worker session.
+  await h.service.pause(h.devA, card.id, 'hold on')
+  const continued = await h.ctx.tools.execute({
+    callId: ToolCallId('v329-continue'), name: 'taskboard_reassign',
+    arguments: { ticketId: card.id, action: 'continue' }, agent: h.devA, signal: new AbortController().signal,
+  })
+  expect(continued.isError).toBe(false)
+  expect(renderedText(continued)).toContain(DISPATCH_TURN_END)
+  // Branch 3 — reassign "retry" spawns a fresh worker.
+  await h.service.fail(h.workerChild, card.id, 'stuck on a missing fixture')
+  const retried = await h.ctx.tools.execute({
+    callId: ToolCallId('v329-retry'), name: 'taskboard_reassign',
+    arguments: { ticketId: card.id, action: 'retry' }, agent: h.devA, signal: new AbortController().signal,
+  })
+  expect(retried.isError).toBe(false)
+  expect(renderedText(retried)).toContain(DISPATCH_TURN_END)
+  // Branch 4 — reassign "backlog" returns the card to Not started.
+  const backlogged = await h.ctx.tools.execute({
+    callId: ToolCallId('v329-backlog'), name: 'taskboard_reassign',
+    arguments: { ticketId: card.id, action: 'backlog' }, agent: h.devA, signal: new AbortController().signal,
+  })
+  expect(backlogged.isError).toBe(false)
+  expect(renderedText(backlogged)).toContain(DISPATCH_TURN_END)
+  // Branch 5 — an assign that spawns no worker still closes the turn.
+  const blockedRun = await harness({ spawn: 'fail' })
+  await blockedRun.service.claimMaster('default', blockedRun.devA)
+  const blockedCard = await createTicket(blockedRun.service, 'blocked contract card')
+  await scheduleToNotStarted(blockedRun.service, blockedRun.devA, blockedCard)
+  const blocked = await blockedRun.ctx.tools.execute({
+    callId: ToolCallId('v329-assign-blocked'), name: 'taskboard_assign',
+    arguments: { ticketId: blockedCard.id }, agent: blockedRun.devA, signal: new AbortController().signal,
+  })
+  expect(blocked.isError).toBe(false)
+  expect(renderedText(blocked)).toContain(DISPATCH_TURN_END)
+  // The contract is one line appended to the branch text, never duplicated.
+  const assignedText = renderedText(assigned)
+  expect(assignedText).toContain('dispatched')
+  expect(assignedText.indexOf(DISPATCH_TURN_END)).toBe(assignedText.lastIndexOf(DISPATCH_TURN_END))
 })
 
 it('skips the master notice when the agent registry is absent', async () => {

@@ -48,7 +48,7 @@ import {
 import {
   agentLabel, appendHistory, appendNotice, buildContinuationPrompt, buildHandoverNotes,
   buildHandoverSnapshot, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
-  compactCardState, formatCompactEvent, formatHandoverSnapshotText,
+  compactCardState, DISPATCH_TURN_END, formatCompactEvent, formatHandoverSnapshotText,
   formatTicketRowLine, MASTER_SECTION, masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
 import type { HandoverCardRow } from './domain.ts'
@@ -4742,11 +4742,12 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: { ticketId: string; status: string; worker: string; workerAgentId: string | null }) => [{
           type: 'text' as const,
-          text: value.worker === 'spawned'
+          text: (value.worker === 'spawned'
             ? 'ticket ' + value.ticketId + ' dispatched; worker ' + String(value.workerAgentId) + ' started'
             : value.status === 'blocked'
               ? 'ticket ' + value.ticketId + ' blocked before a worker was spawned (see the card failure for the reason)'
-              : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker,
+              : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker)
+            + '\n' + DISPATCH_TURN_END,
         }],
       },
       execute: async (args: { ticketId: string; workerLabel?: string }, exec) => {
@@ -4849,11 +4850,12 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: { ticketId: string; worker: string | null }) => [{
           type: 'text' as const,
-          text: value.worker === 'spawned'
+          text: (value.worker === 'spawned'
             ? 'ticket ' + value.ticketId + ' re-dispatched; new worker started'
             : value.worker === 'continued'
               ? 'ticket ' + value.ticketId + ' re-dispatched; the existing worker session was woken (context and working tree preserved)'
-              : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker),
+              : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker))
+            + '\n' + DISPATCH_TURN_END,
         }],
       },
       execute: async (args: { ticketId: string; action: 'retry' | 'continue' | 'backlog'; workerLabel?: string }, exec) => {
