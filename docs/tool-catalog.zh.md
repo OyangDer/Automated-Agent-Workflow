@@ -1238,7 +1238,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_claim`
 
-Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master's dispatch. Rejected when the caller is not the master of the ticket's board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).
+Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master's dispatch. Rejected when the caller is not the master of the ticket's board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).
 
 ```json
 {

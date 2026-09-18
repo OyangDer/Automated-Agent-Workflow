@@ -1,7 +1,7 @@
 /**
  * Domain-level acceptance of the taskboard workflow: creation, board
  * isolation, the master seat (claim/release/transfer/preemption), user
- * moves, the v1 claim path (owner/capacity/dependency rules), the v2
+ * moves, the v1 claim path (owner/dependency rules), the v2
  * dispatch protocol (assign → report → review, fail → blocked, reassign),
  * worker-model injection, failure reclamation, worker-liveness
  * reconciliation (startup scan + periodic scanner), and old-data
@@ -175,7 +175,6 @@ interface Harness {
 }
 
 interface HarnessOptions {
-  maxInProgress?: number
   spawn?: SpawnBehavior
   /** V3-25 master-seat idle-arm timeout passed to the plugin (0 disables the idle arm). */
   masterIdleTimeoutMs?: number
@@ -247,7 +246,7 @@ interface HarnessOptions {
 
 /** Compose the real storage chain plus the taskboard service with stubs. */
 async function harness(options: HarnessOptions = {}): Promise<Harness> {
-  const { maxInProgress = 2, spawn = 'spawn' } = options
+  const { spawn = 'spawn' } = options
   const root = options.root ?? await mkdtemp(join(tmpdir(), 'taskboard-'))
   openRoots.push(root)
   const ctx = new Context()
@@ -348,7 +347,6 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
   // startup pass still runs (harmless on a fresh board), and the scan itself
   // is exercised explicitly or with a short explicit interval.
   await ctx.plugin(TaskboardService, {
-    maxInProgress,
     ...(options.masterIdleTimeoutMs === undefined ? {} : { masterIdleTimeoutMs: options.masterIdleTimeoutMs }),
     ...(options.reviewMode === undefined ? {} : { reviewMode: options.reviewMode }),
     ...(options.workerModel === undefined ? {} : { workerModel: options.workerModel }),
@@ -1295,7 +1293,7 @@ describe('TaskboardService workflow', () => {
     await expect(service.removeRemote(devA, { ticketId: ticket.id })).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
   })
 
-  it('claims a Not started ticket as the master and enforces ownership and capacity (V3-7)', async () => {
+  it('claims a Not started ticket as the master and enforces ownership (V3-7)', async () => {
     const { service, devA, devB } = await harness()
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'parallel one')
@@ -1308,13 +1306,23 @@ describe('TaskboardService workflow', () => {
     await expect(claimTicket(service, devB, claimed)).rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
     // The master cannot re-claim an already-owned ticket.
     await expect(claimTicket(service, devA, claimed)).rejects.toMatchObject({ code: 'TASKBOARD_ALREADY_CLAIMED' })
-    // Capacity: with maxInProgress 2, two more claims exhaust the board.
+    // No in-progress capacity gate (V3-30): with four cards already In
+    // progress, a fifth claim succeeds instead of being rejected.
     const second = await createTicket(service, 'parallel two')
     await toNotStarted(service, devA, second)
+    await claimTicket(service, devA, second)
     const third = await createTicket(service, 'parallel three')
     await toNotStarted(service, devA, third)
-    await claimTicket(service, devA, second)
-    await expect(claimTicket(service, devA, third)).rejects.toMatchObject({ code: 'TASKBOARD_CAPACITY_EXCEEDED' })
+    await claimTicket(service, devA, third)
+    const fourth = await createTicket(service, 'parallel four')
+    await toNotStarted(service, devA, fourth)
+    await claimTicket(service, devA, fourth)
+    const fifth = await createTicket(service, 'parallel five')
+    await toNotStarted(service, devA, fifth)
+    const fifthClaimed = await claimTicket(service, devA, fifth)
+    expect(fifthClaimed.column).toBe('in_progress')
+    const inProgress = (await service.snapshot(devA)).tickets.filter(ticket => ticket.column === 'in_progress')
+    expect(inProgress).toHaveLength(5)
   })
 
   it('gates claims on dependency order', async () => {
@@ -2169,9 +2177,9 @@ describe('TaskboardService workflow', () => {
     expect(MASTER_SECTION).toContain('Adjudicate whether to start it')
     expect(MASTER_SECTION).toContain('dependsOn')
     expect(MASTER_SECTION).toContain('filesScope')
-    // Dispatch when every dependency is Done and the In-progress cap allows.
+    // Dispatch when every dependency is Done (V3-30 removed the capacity gate).
     expect(MASTER_SECTION).toContain('every dependency is Done')
-    expect(MASTER_SECTION).toContain('In-progress cap')
+    expect(MASTER_SECTION).not.toContain('In-progress cap')
     expect(MASTER_SECTION).toContain('taskboard_assign')
     // Refusal leaves a trace: explain to the user and record it on the card.
     expect(MASTER_SECTION).toContain('refusal reason')

@@ -162,7 +162,6 @@ async function harness(options: { preflightRepos?: Record<string, RepoPreflightC
   })
   ctx.provide('subagents', { start: subagentsStart } as never)
   await ctx.plugin(TaskboardService, {
-    maxInProgress: 4,
     reconcileIntervalMs: 0,
     ...(options.preflightRepos === undefined ? {} : { preflightRepos: options.preflightRepos }),
   })

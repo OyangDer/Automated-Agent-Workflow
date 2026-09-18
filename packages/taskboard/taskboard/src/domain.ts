@@ -20,7 +20,6 @@ export type TaskboardErrorCode =
   | 'TASKBOARD_INVALID_COLUMN'
   | 'TASKBOARD_INVALID_TRANSITION'
   | 'TASKBOARD_INVALID_INPUT'
-  | 'TASKBOARD_CAPACITY_EXCEEDED'
   | 'TASKBOARD_DEPENDENCY_BLOCKED'
   | 'TASKBOARD_DEPENDENCY_UNKNOWN'
   | 'TASKBOARD_DEPENDENCY_CYCLE'
@@ -630,7 +629,7 @@ export const WORKFLOW_SECTION = [
   'A kanban ticket board (the "Taskboard" tab in the web UI) tracks tickets across five columns: Backlog, Not started, In progress, In testing, Done. The USER manages the board from the web UI; you drive the agent side with the taskboard_* tools.',
   '',
   '- When asked to work on the board — or when you are otherwise free and tickets are waiting — call taskboard_list with column "not_started". Tickets are ordered by implementation order; dependsOn lists hard ordering constraints.',
-  '- Claiming a ticket is the master\'s scheduling action: only the board\'s current master may call taskboard_claim, and only for Not started tickets whose dependsOn are all in Done. One ticket at a time per caller, and the board caps how many tickets may be In progress at once (claims beyond the cap are rejected — retry later). Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
+  '- Claiming a ticket is the master\'s scheduling action: only the board\'s current master may call taskboard_claim, and only for Not started tickets whose dependsOn are all in Done. One ticket at a time per caller. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
   '- Parallelize: when several ready Not started tickets exist, dispatch each to a fresh worker with taskboard_assign — the assign spawns the worker subagent with the ticket content, the worker implements it, and finishes with taskboard_report (done) or taskboard_fail (blocked).',
   '- When the implementation is done and verified, the owning agent calls taskboard_complete with devNotes summarizing what changed and how it was verified. The board moves the ticket to In testing and automatically spawns a fresh reviewer agent. Never review your own ticket.',
   '- If you are spawned as a reviewer: inspect the workspace changes and run the relevant tests, then finish with exactly one call — taskboard_approve(ticketId, summary) or taskboard_reject(ticketId, feedback). Rejections must list concrete, actionable problems. If no reviewer is assigned to an In testing ticket, taskboard_claim_review takes the seat.',
@@ -677,7 +676,7 @@ export const MASTER_SECTION = [
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
   '- Claiming a Not started ticket (taskboard_claim) is your scheduling action, not the worker\'s: only the current master may claim.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
-  '- User-scheduled Not started cards wake you: when the user moves a card into Not started, a "user-scheduled" notice (card id, title, priority, type, dependsOn with all-Done status, filesScope) lands in your inbox and on the board. Adjudicate whether to start it: when every dependency is Done and the In-progress cap allows, dispatch with taskboard_assign — the card moves to In progress and the workflow starts. When the card cannot start, tell the user the refusal reason in the conversation (name the unfinished dependency cards, or the capacity reason) and record the reason in the card\'s history or devNotes so the decision leaves a durable trace.',
+  '- User-scheduled Not started cards wake you: when the user moves a card into Not started, a "user-scheduled" notice (card id, title, priority, type, dependsOn with all-Done status, filesScope) lands in your inbox and on the board. Adjudicate whether to start it: when every dependency is Done, dispatch with taskboard_assign — the card moves to In progress and the workflow starts. When the card cannot start, tell the user the refusal reason in the conversation (name the unfinished dependency cards) and record the reason in the card\'s history or devNotes so the decision leaves a durable trace.',
   '',
   '# Workflow discipline (plan → phase → schedule → execute)',
   '',

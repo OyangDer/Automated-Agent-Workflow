@@ -40,7 +40,6 @@ Web 配置挂载服务与看板页签：
 
 ```yaml
 taskboard:
-  maxInProgress: 4    # parallel developer cap; claims beyond it are rejected
   reviewProvider: spawn  # subagent provider for the reviewer child
   masterModel: deepseek-v4-pro-max  # informational: suggested model for a NEW master session (the session's own model is authoritative)
   masterEffort: high   # informational: suggested reasoning effort for a NEW master session (off | high | max; unset = adapter default)
@@ -59,7 +58,7 @@ taskboard:
 <a id="workflow"></a>
 ## 工作流
 
-master 与用户一起规划需求——每个达成一致的需求都会落成 Backlog 卡片——然后用 `taskboard_assign` 派发本阶段的卡片；assign 直接接受 Backlog 或 Not started 卡片，派单前无需搬卡。Not started 是「下一步队列」的排期展示列：master 可以用 `taskboard_move` 把卡片移过去，向用户展示接下来要做什么而暂不开工。当用户直接把卡片拖进 Not started 时，该移动会以一条 "user-scheduled" 通知唤醒看板的 master，由它裁决是否开工或向用户说明拒绝理由。领卡是 master 的排期动作（V3-7）：只有看板当前的 master 才能用 `taskboard_claim` 领取 Not started 卡片（受依赖与容量约束）；worker 与 reviewer 一律不得自行领卡——它们通过 `taskboard_assign`（派单）或 `taskboard_reassign`（重派）获得卡片。看板随即把卡片移到 In testing 并自动派出一名全新审核 Agent，其唯一权限是 `taskboard_approve` / `taskboard_reject`。驳回会把卡片打回 In progress 并附上具体反馈；开发者返修后再次交付。工单通过 storage-domain 持久化，每次变更都会广播 `taskboard/changed` 事件。
+master 与用户一起规划需求——每个达成一致的需求都会落成 Backlog 卡片——然后用 `taskboard_assign` 派发本阶段的卡片；assign 直接接受 Backlog 或 Not started 卡片，派单前无需搬卡。Not started 是「下一步队列」的排期展示列：master 可以用 `taskboard_move` 把卡片移过去，向用户展示接下来要做什么而暂不开工。当用户直接把卡片拖进 Not started 时，该移动会以一条 "user-scheduled" 通知唤醒看板的 master，由它裁决是否开工或向用户说明拒绝理由。领卡是 master 的排期动作（V3-7）：只有看板当前的 master 才能用 `taskboard_claim` 领取 Not started 卡片（受依赖约束）；worker 与 reviewer 一律不得自行领卡——它们通过 `taskboard_assign`（派单）或 `taskboard_reassign`（重派）获得卡片。看板随即把卡片移到 In testing 并自动派出一名全新审核 Agent，其唯一权限是 `taskboard_approve` / `taskboard_reject`。驳回会把卡片打回 In progress 并附上具体反馈；开发者返修后再次交付。工单通过 storage-domain 持久化，每次变更都会广播 `taskboard/changed` 事件。
 
 <a id="master-seat"></a>
 ## 席位

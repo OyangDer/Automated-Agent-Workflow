@@ -6,7 +6,7 @@
 
 ## 列与工作流
 
-五列固定为规范顺序：`backlog`、`not_started`、`in_progress`、`in_testing`、`done`。master 与用户一起规划需求（每个达成一致的需求都会落成 Backlog 卡片），并用 `taskboard_assign` 派发本阶段卡片——assign 直接接受 Backlog 或 Not started 卡片，派单前无需搬卡。Not started 是「下一步队列」的排期展示列：master 可以用 `taskboard_move` 把卡片移过去展示接下来要做什么而暂不开工，用户把卡片拖进 Not started 也仍会以 "user-scheduled" 通知唤醒 master。Agent 领取 Not started 的工单（依赖与容量门控）、实现、并交付进入 In testing。看板指派一名全新审核 Agent，其唯一权限是通过进入 Done，或驳回工单并附上具体反馈打回 In progress。
+五列固定为规范顺序：`backlog`、`not_started`、`in_progress`、`in_testing`、`done`。master 与用户一起规划需求（每个达成一致的需求都会落成 Backlog 卡片），并用 `taskboard_assign` 派发本阶段卡片——assign 直接接受 Backlog 或 Not started 卡片，派单前无需搬卡。Not started 是「下一步队列」的排期展示列：master 可以用 `taskboard_move` 把卡片移过去展示接下来要做什么而暂不开工，用户把卡片拖进 Not started 也仍会以 "user-scheduled" 通知唤醒 master。Agent 领取 Not started 的工单（依赖门控）、实现、并交付进入 In testing。看板指派一名全新审核 Agent，其唯一权限是通过进入 Done，或驳回工单并附上具体反馈打回 In progress。
 
 ```ts
 /** The five workflow columns in canonical left-to-right order. */
@@ -74,7 +74,7 @@ interface TaskboardChanged {
 
 ## 服务行为
 
-[`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（仅 master 领取归属、依赖门控、进行中容量、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授仅 master 领卡的规则（worker/reviewer 通过 `taskboard_assign` / `taskboard_reassign` 获得卡片）与不得自审自卡的规则。
+[`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（仅 master 领取归属、依赖门控、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授仅 master 领卡的规则（worker/reviewer 通过 `taskboard_assign` / `taskboard_reassign` 获得卡片）与不得自审自卡的规则。
 
 席位自愈通道（`reconcileLostWorkers` + `reconcileStaleReviewers`，启动时与配置的周期扫描运行）闭合失联席位闭环：worker 会话不在 live agent 注册表立即判失联，已注册但空闲且超过 `lostWorkerTimeoutMs` 无活动判卡死，reviewer 席位超过 `reviewerStaleTimeoutMs` 仍无结论（或会话已消失）则释放。失联 worker 每卡最多自动重派 `workerAutoRetryLimit` 次——卡片描述会附加"续做勿回滚"标注，让新 worker 从保留的工作树继续——预算耗尽后卡片标 blocked 并通知 master。所有恢复动作防重入（每次失联每卡只恢复一次）、与 worker run 结算回调共存去重（二者只有一个生效）、写入卡片历史，且通知故障不会阻断恢复。
 

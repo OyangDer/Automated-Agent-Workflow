@@ -261,8 +261,6 @@ const TASKBOARD_DOMAIN = defineDomain({
 
 /** Deployment knobs for the taskboard workflow. */
 export interface Config {
-  /** How many tickets may be In progress at once (parallel developer cap for the v1 claim path). */
-  maxInProgress?: number
   /** Subagent provider name used to spawn reviewer agents. */
   reviewProvider?: string
   /** Model id for the master session (informational knob; the session's own model is authoritative). */
@@ -356,7 +354,6 @@ export interface Config {
 
 /** Schemastery configuration for the taskboard consumer. */
 export const Config: z<Config> = z.object({
-  maxInProgress: z.number().default(4),
   reviewProvider: z.string().default('spawn'),
   masterModel: z.string().default('deepseek-v4-pro-max'),
   masterEffort: z.string(),
@@ -479,14 +476,6 @@ export interface TicketRow {
   reviewOutcome?: { verdict: string; summary: string; problems: string[] } | null
 }
 
-/** Validate one explicit capacity knob. */
-function resolveMaxInProgress(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error('taskboard: maxInProgress must be a positive safe integer')
-  }
-  return value
-}
-
 /** Validate one explicit master-seat idle timeout (0 disables the idle arm). */
 function resolveMasterIdleTimeout(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
@@ -597,7 +586,6 @@ export class TaskboardService extends TypertRemoteService {
   static Config = Config
 
   private readonly resolved: {
-    maxInProgress: number
     reviewProvider: string
     masterModel: string
     masterEffort: string | undefined
@@ -665,7 +653,6 @@ export class TaskboardService extends TypertRemoteService {
       }
     }
     this.resolved = {
-      maxInProgress: resolveMaxInProgress(config.maxInProgress ?? 4),
       reviewProvider: config.reviewProvider ?? 'spawn',
       masterModel: config.masterModel ?? 'deepseek-v4-pro-max',
       masterEffort: resolveEffort(config.masterEffort),
@@ -2243,7 +2230,7 @@ export class TaskboardService extends TypertRemoteService {
     ))
     // The user scheduling a card into Not started is the board's "start this"
     // signal: wake the master so it adjudicates whether to dispatch (every
-    // dependency Done and capacity allowing → taskboard_assign) or explains
+    // dependency Done → taskboard_assign) or explains
     // the refusal to the user. Re-entry guarded: the master's own moves never
     // notify, and a card already in Not started or returning from In progress
     // (reassign backlog) is not a fresh user schedule.
@@ -2268,7 +2255,7 @@ export class TaskboardService extends TypertRemoteService {
   /**
    * Notify the board's master that the user scheduled one card into Not
    * started (a user-origin move), so it adjudicates whether to dispatch:
-   * every dependency Done and capacity allowing → taskboard_assign; otherwise
+   * every dependency Done → taskboard_assign; otherwise
    * the master tells the user the refusal reason and records it on the card.
    * Reuses the durable master-notice channel (board notice + live inbox /
    * persisted inbox delivery); best-effort like every master notice, so a
@@ -2294,7 +2281,7 @@ export class TaskboardService extends TypertRemoteService {
       }) + '. The user scheduled ticket ' + ticket.id + ' ("' + ticket.title
         + '", priority ' + ticket.priority + ', type ' + ticket.type + ') into Not started — adjudicate whether to start it. '
         + 'dependsOn [' + dependsOn + ']; filesScope "' + filesScope + '". '
-        + 'When every dependency is Done and capacity allows, dispatch with taskboard_assign (the card moves to In progress and the workflow starts); '
+        + 'When every dependency is Done, dispatch with taskboard_assign (the card moves to In progress and the workflow starts); '
         + 'otherwise tell the user why the card cannot start and record the reason in the card history or devNotes.'
       await this.notifyMaster(ticket.boardId, text, NOTICE_KIND.userScheduled, ticket.id)
     } catch {
@@ -3620,16 +3607,6 @@ export class TaskboardService extends TypertRemoteService {
           )
         }
       }
-      let inProgress = 0
-      for (const [, ticket] of table.entries()) {
-        if (ticket.column === 'in_progress') inProgress++
-      }
-      if (inProgress >= this.resolved.maxInProgress) {
-        throw new TaskboardError(
-          'in-progress capacity ' + this.resolved.maxInProgress + ' reached; retry when a slot frees up',
-          'TASKBOARD_CAPACITY_EXCEEDED',
-        )
-      }
       return appendHistory(
         {
           ...current,
@@ -4297,7 +4274,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_claim',
-      description: 'Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master\'s dispatch. Rejected when the caller is not the master of the ticket\'s board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet, or when the in-progress capacity is full. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
+      description: 'Claim a Not started taskboard ticket as the board master (master only): the card moves to In progress and is scheduled under the master\'s dispatch. Rejected when the caller is not the master of the ticket\'s board (TASKBOARD_NOT_MASTER), when the ticket is claimed by someone else, when a dependsOn ticket is not Done yet. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The Not started ticket to claim (master only).' },
       },

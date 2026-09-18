@@ -40,7 +40,6 @@ The web profile mounts the service and the board tab:
 
 ```yaml
 taskboard:
-  maxInProgress: 4    # parallel developer cap; claims beyond it are rejected
   reviewProvider: spawn  # subagent provider for the reviewer child
   masterModel: deepseek-v4-pro-max  # informational: suggested model for a NEW master session (the session's own model is authoritative)
   masterEffort: high   # informational: suggested reasoning effort for a NEW master session (off | high | max; unset = adapter default)
@@ -59,7 +58,7 @@ Effort levels use the deepseek vocabulary (`off` | `high` | `max`); an unrecogni
 <a id="workflow"></a>
 ## Workflow
 
-The master plans requirements with the user — every agreed requirement becomes a Backlog card — and dispatches the phase's cards with `taskboard_assign`, which accepts a Backlog or Not started card directly (no move is ever required before dispatch). Not started is the scheduling display for the next queue: the master can move a card there with `taskboard_move` to show what is next without starting it. When the user drags a card into Not started directly, the move wakes the board's master with a "user-scheduled" notice so it adjudicates whether to dispatch the card or explain the refusal. Claiming is the master's scheduling action (V3-7): only the board's current master may claim a Not started ticket with `taskboard_claim` (dependency- and capacity-gated); workers and reviewers never claim — they receive cards through `taskboard_assign` (dispatch) or `taskboard_reassign` (re-dispatch). The board then moves the card to In testing and spawns a fresh reviewer agent, whose only authority is `taskboard_approve` / `taskboard_reject`. A reject returns the card to In progress with concrete feedback; the developer reworks and resubmits. Tickets persist through the storage-domain seam and every mutation emits the forwarded `taskboard/changed` event.
+The master plans requirements with the user — every agreed requirement becomes a Backlog card — and dispatches the phase's cards with `taskboard_assign`, which accepts a Backlog or Not started card directly (no move is ever required before dispatch). Not started is the scheduling display for the next queue: the master can move a card there with `taskboard_move` to show what is next without starting it. When the user drags a card into Not started directly, the move wakes the board's master with a "user-scheduled" notice so it adjudicates whether to dispatch the card or explain the refusal. Claiming is the master's scheduling action (V3-7): only the board's current master may claim a Not started ticket with `taskboard_claim` (dependency-gated); workers and reviewers never claim — they receive cards through `taskboard_assign` (dispatch) or `taskboard_reassign` (re-dispatch). The board then moves the card to In testing and spawns a fresh reviewer agent, whose only authority is `taskboard_approve` / `taskboard_reject`. A reject returns the card to In progress with concrete feedback; the developer reworks and resubmits. Tickets persist through the storage-domain seam and every mutation emits the forwarded `taskboard/changed` event.
 
 <a id="master-seat"></a>
 ## Master seat
