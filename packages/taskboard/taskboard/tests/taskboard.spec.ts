@@ -2130,6 +2130,21 @@ describe('TaskboardService workflow', () => {
     expect(branchNameFor('abc12345def', 'ticket-xyz')).toBe('taskboard/abc12345/ticket-xyz')
   })
 
+  it('names the worker branch after the session uuid, not the session- id prefix', () => {
+    // Harness session ids start with `session-`, so slicing the raw id would
+    // collapse every session onto the same branch namespace.
+    const sessionA = 'session-4f9c1a7b-1111-4222-8333-444455556666'
+    const sessionB = 'session-9d2e6c40-7777-4888-8999-aaaabbbbcccc'
+    expect(branchNameFor(sessionA, 'ticket-xyz')).toBe('taskboard/4f9c1a7b/ticket-xyz')
+    expect(branchNameFor(sessionA, 'ticket-xyz')).not.toContain('session-')
+    // One master session's cards share the segment; different sessions do not.
+    expect(branchNameFor(sessionA, 'ticket-other')).toBe('taskboard/4f9c1a7b/ticket-other')
+    expect(branchNameFor('session-4f9c1a7b-9999-4aaa-8bbb-ccccddddeeee', 'ticket-xyz')).toBe('taskboard/4f9c1a7b/ticket-xyz')
+    expect(branchNameFor(sessionB, 'ticket-xyz')).toBe('taskboard/9d2e6c40/ticket-xyz')
+    // A bare id without the harness prefix keeps its own first eight characters.
+    expect(branchNameFor('abc12345def', 'ticket-xyz')).toBe('taskboard/abc12345/ticket-xyz')
+  })
+
   it('teaches the master workflow discipline: plan → phase scope → schedule → execute → numbered cards', () => {
     // Requirement planning: every agreed requirement lands in Backlog as a card.
     expect(MASTER_SECTION).toContain('Requirement planning')

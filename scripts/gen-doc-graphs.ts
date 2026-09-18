@@ -467,7 +467,7 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'taskboard',
     title: 'Five-column kanban ticket domain',
     mode: 'core',
-    note: 'Persists tickets through a storage domain, gates claims by dependencies and capacity, and hands In testing tickets to a spawned reviewer agent.',
+    note: 'Persists tickets through a storage domain, gates claims by dependencies, and hands In testing tickets to a spawned reviewer agent.',
   },
   {
     key: 'e2b',

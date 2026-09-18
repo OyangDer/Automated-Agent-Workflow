@@ -107,18 +107,34 @@ export function workerLabel(childAgentId: string): string {
   return ['worker', childAgentId.slice(0, 8)].join(' ')
 }
 
+/** The prefix every harness-minted session id carries. */
+const SESSION_ID_PREFIX = 'session-'
+
+/**
+ * The session segment of a shared-workspace branch: the random uuid part of
+ * the master session id, not its fixed `session-` prefix, so every session's
+ * cards land on their own branch namespace.
+ * @param sessionId - the master session id.
+ * @returns the uuid part's first eight characters, or the whole id's when the
+ * id carries no uuid part to shorten.
+ */
+function sessionSegment(sessionId: string): string {
+  const bare = sessionId.startsWith(SESSION_ID_PREFIX) ? sessionId.slice(SESSION_ID_PREFIX.length) : sessionId
+  return (bare === '' ? sessionId : bare).slice(0, 8)
+}
+
 /**
  * The independent git branch one session's worker works on for one ticket,
  * following the shared-workspace conflict convention: every session stays on
  * its own branch (taskboard/<session-short-id>/<ticket-id>) so parallel
  * workers in the same working directory never stage/commit over each other;
  * the master aggregates the branches when the work lands.
- * @param sessionId - the master session id (its short form names the branch).
+ * @param sessionId - the master session id (its uuid part names the branch).
  * @param ticketId - the ticket the worker implements.
  * @returns the branch name, e.g. "taskboard/abc12345/ticket-xyz".
  */
 export function branchNameFor(sessionId: string, ticketId: string): string {
-  return 'taskboard/' + sessionId.slice(0, 8) + '/' + ticketId
+  return 'taskboard/' + sessionSegment(sessionId) + '/' + ticketId
 }
 
 /** Message attribution for master-seat notifications injected into the seat

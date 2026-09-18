@@ -1,5 +1,7 @@
 # DeepSeek Harness rc.2 Taskboard Compatibility Implementation Plan
 
+English | [中文](2026-09-11-rc2-taskboard-compat.zh.md)
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Upgrade the running customized Harness from `dsh-v0.1.5-alpha.1` to official `dsh-v0.1.5-rc.2` while preserving Taskboard, legacy-session loading, and existing plugin behavior.
