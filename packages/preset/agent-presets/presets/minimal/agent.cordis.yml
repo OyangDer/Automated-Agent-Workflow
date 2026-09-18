@@ -79,8 +79,9 @@
 # Real sessions end long before such a ceiling: measured taskboard runs plateau
 # at 100K-600K, so a default-ratio compaction never fires and the context grows
 # to the end of the run. These explicit budgets put the ceiling inside the range
-# sessions actually occupy (1M x 0.10 = 100K, retaining 1M x 0.03 = 30K), which a
-# replay of 33 recorded sessions prices at 45-89% fewer tokens on the long ones.
+# sessions actually occupy (1M x 0.30 = 300K, retaining 1M x 0.03 = 30K): still
+# inside a long run, but folding once or twice per run instead of every few
+# turns, each fold being one summarization call over the discarded region.
 # The tool-result pruner additionally caps any single oversized tool result so
 # one huge file read cannot sit in context for the rest of the run.
 - id: compaction
@@ -93,8 +94,8 @@
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        # Ceiling 100K / retained tail 30K on the shipped 1M-token window.
-        thresholdRatio: 0.1
+        # Ceiling 300K / retained tail 30K on the shipped 1M-token window.
+        thresholdRatio: 0.3
         retainRatio: 0.03
 
     - id: tool-result-pruner

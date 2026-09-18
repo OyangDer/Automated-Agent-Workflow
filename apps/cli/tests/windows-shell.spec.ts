@@ -196,7 +196,7 @@ describe('shipped agent presets gate both shell tools by platform', () => {
     }
     // The ceiling has to sit inside the range real sessions occupy, and the
     // retained tail has to leave room for the fold (retain < threshold).
-    expect(thresholdRatio * SHIPPED_WINDOW).toBe(100_000)
+    expect(thresholdRatio * SHIPPED_WINDOW).toBe(300_000)
     expect(retainRatio * SHIPPED_WINDOW).toBe(30_000)
     expect(retainRatio).toBeLessThan(thresholdRatio)
   })
@@ -239,7 +239,7 @@ describe('shipped agent presets gate both shell tools by platform', () => {
           + 'the 0.8 default folds only at 80% of the window (800K on the shipped 1M window), '
           + 'which no measured session reaches')
       }
-      expect(budget.thresholdRatio * SHIPPED_WINDOW, preset).toBe(100_000)
+      expect(budget.thresholdRatio * SHIPPED_WINDOW, preset).toBe(300_000)
       expect(budget.retainRatio * SHIPPED_WINDOW, preset).toBe(30_000)
       expect(budget.retainRatio, preset).toBeLessThan(budget.thresholdRatio)
     }

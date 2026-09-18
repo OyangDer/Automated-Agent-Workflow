@@ -154,11 +154,11 @@
     # above where measured sessions actually plateau (100K-600K), so it never
     # ran and every request kept re-uploading the whole growing context. The
     # explicit budget below puts the ceiling inside the range sessions occupy:
-    # fold at 100K, retain the newest 30K.
+    # fold at 300K, retain the newest 30K.
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        thresholdRatio: 0.1
+        thresholdRatio: 0.3
         retainRatio: 0.03
 
     - id: command-compact
