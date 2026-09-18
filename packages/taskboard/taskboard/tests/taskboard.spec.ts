@@ -3503,10 +3503,10 @@ it('releases the master seat when the holder session leaves the registry (V3-25)
   expect(history[1]!.notes).toContain('seat released')
   expect(history[1]!.notes).toContain('registry')
   // And a durable notice for the successor master landed on the board.
-  expect(row.notices).toHaveLength(1)
-  expect(row.notices[0]).toMatchObject({ kind: 'master-released', ticketId: '' })
-  expect(row.notices[0]!.text).toContain('MASTER_SEAT_RELEASED')
-  expect(row.notices[0]!.text).toContain(devA.id)
+  expect(row.notices!).toHaveLength(1)
+  expect(row.notices![0]).toMatchObject({ kind: 'master-released', ticketId: '' })
+  expect(row.notices![0]!.text).toContain('MASTER_SEAT_RELEASED')
+  expect(row.notices![0]!.text).toContain(devA.id)
   // A second pass finds nothing left to release (reentry-safe).
   expect(await service.reconcileMasterSeats()).toBe(0)
 })
@@ -3558,7 +3558,7 @@ it('frees a registered but silent master seat only past the idle arm (V3-25)', a
   expect(released.masterAgentId).toBeNull()
   expect((released.masterHistory ?? []).at(-1)).toMatchObject({ fromAgentId: on.devA.id, toAgentId: '' })
   expect((released.masterHistory ?? []).at(-1)!.notes).toContain('idle')
-  expect(released.notices.at(-1)).toMatchObject({ kind: 'master-released' })
+  expect(released.notices!.at(-1)).toMatchObject({ kind: 'master-released' })
 })
 
 it('still hands the structured takeover snapshot to the successor after a liveness release (V3-25)', async () => {
