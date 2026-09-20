@@ -42,6 +42,11 @@ async function normPath(p: string): Promise<string> {
   return normalizePath(await realpath(p))
 }
 
+/** The forward-slash form a declared scope entry takes after parseFilesScope. */
+function slash(p: string): string {
+  return p.replace(/\\/g, '/')
+}
+
 /** Run one git command in a directory; throws on failure. */
 function git(dir: string, args: string[]): string {
   const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8', windowsHide: true })
@@ -1289,6 +1294,89 @@ describe('service dispatch preflight (V3-20)', { timeout: GIT_TEST_TIMEOUT_MS },
     const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
     expect(prompt).toContain('canonical base: main @ ' + head)
     expect(prompt).toContain('SAFE')
+    expect(prompt).not.toContain('declares only relative path(s)')
+    expect(prompt).not.toContain('falling back to the master cwd')
+  })
+
+  it('names the cwd fallback when every absolute scope entry misses the configured roots (V3-41)', async () => {
+    const repo = await createRepo()
+    const elsewhere = await makeTempDir('preflight-outside-')
+    openDirs.push(elsewhere)
+    // One absolute entry exists but is governed by no configured root; the
+    // other does not exist at all. Both miss, so the repo still comes from the
+    // mapped master cwd and V3-41 names that instead of passing silently.
+    const existing = join(elsewhere, 'keep.ts')
+    const absent = join(elsewhere, 'gone', 'b.ts')
+    await writeFile(existing, 'x\n')
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'missing absolute scope card', existing + '; ' + absent)
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('failed')
+    expect(result.ticket.status).toBe('blocked')
+    const reason = result.ticket.failure?.reason ?? ''
+    expect(reason).toContain('preflight blocked')
+    expect(reason).toContain('declares absolute entry/entries')
+    // Each entry carries its own miss reason: outside the configured roots vs
+    // absent from disk, so the operator knows which declaration to move. The
+    // report quotes the normalized scope entry (forward slashes), not the raw
+    // platform path.
+    expect(reason).toContain('"' + slash(existing) + '" (exists but is outside every configured preflight repo root)')
+    expect(reason).toContain('"' + slash(absent) + '" (does not exist on disk)')
+    expect(reason).toContain('none of which lands inside any configured preflight repo root')
+    expect(reason).toContain('falling back to the master cwd "' + repo + '"')
+    expect(reason).not.toContain('declares only relative path(s)')
+    expect(subagentsStart).not.toHaveBeenCalled()
+  })
+
+  it('names the missed absolute scope entries in facts-only mode without blocking (V3-41)', async () => {
+    const repo = await createRepo()
+    const elsewhere = await makeTempDir('preflight-outside-facts-')
+    openDirs.push(elsewhere)
+    const absent = join(elsewhere, 'absent', 'b.ts')
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: { [repo]: { canonicalBranch: 'main', enforce: false } },
+    })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'missing scope facts-only card', absent)
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    expect(result.ticket.status).toBe('running')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    // enforce:false keeps the dispatch alive, but the widened fallback notice
+    // still reaches the worker prompt.
+    expect(prompt).toContain('VIOLATED')
+    expect(prompt).toContain('declares absolute entry/entries')
+    expect(prompt).toContain('"' + slash(absent) + '" (does not exist on disk)')
+    expect(prompt).toContain('falling back to the master cwd "' + repo + '"')
+    expect(prompt).toContain('declared file scope: ' + absent)
+  })
+
+  it('never warns while one absolute scope entry still hits a configured root (V3-41)', async () => {
+    const repo = await createRepo()
+    const elsewhere = await makeTempDir('preflight-outside-mixed-')
+    openDirs.push(elsewhere)
+    const head = git(repo, ['rev-parse', 'HEAD'])
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    // The cwd is unmapped, so only the scope can locate the repo: a missing
+    // absolute entry riding alongside a governed one must not trigger the
+    // fallback warning — the miss is judged per entry, not per scope.
+    const dev = masterAgent('dev-agent-a', elsewhere)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'mixed miss scope card', join(elsewhere, 'gone.ts') + '; ' + join(repo, 'src', 'a.ts'))
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('canonical base: main @ ' + head)
+    expect(prompt).toContain('SAFE')
+    expect(prompt).not.toContain('declares absolute entry/entries')
     expect(prompt).not.toContain('declares only relative path(s)')
     expect(prompt).not.toContain('falling back to the master cwd')
   })

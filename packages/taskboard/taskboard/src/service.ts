@@ -10,6 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { basename, isAbsolute } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -3003,7 +3004,9 @@ export class TaskboardService extends TypertRemoteService {
    * pre-V3-26 resolution, so a master started from an unmapped directory no
    * longer rejects cards whose declared scope is governed. When that fallback
    * is what located the repo, the caller names it in the report rather than
-   * letting the card masquerade as scope-located (V3-33).
+   * letting the card masquerade as scope-located (V3-33); V3-41 widens that
+   * naming to a scope whose absolute entries all miss every configured root,
+   * so a miss is judged per entry rather than by the scope's shape.
    * @param filesScope - the card's declared file scope.
    * @param cwd - the master session cwd, used only as a fallback.
    * @returns the matched root + contract, or null when neither the scope nor the cwd locates a repo.
@@ -3045,10 +3048,11 @@ export class TaskboardService extends TypertRemoteService {
    * cwd is only the fallback. Returns null when preflight is not enabled (no
    * configured repos — legacy dispatch path); otherwise always a report, and
    * a safe=false report carries the concrete violations the caller must fail
-   * the dispatch with (fail closed). A filesScope that is non-empty yet
-   * carries no absolute entry is named as a violation whenever the cwd
-   * fallback is what located the repo (V3-33), so the fallback is never
-   * silent.
+   * the dispatch with (fail closed). A filesScope that is non-empty yet no
+   * entry of which lands in a configured repo root is named as a violation
+   * whenever the cwd fallback is what located the repo — no absolute entry at
+   * all (V3-33), or absolute entries that all miss every configured root
+   * (V3-41) — so the fallback is never silent.
    * @param ticket - the card being dispatched.
    * @param agent - the master session agent (its cwd is the fallback workspace repo).
    * @returns the preflight outcome, or null when preflight is disabled.
@@ -3058,10 +3062,15 @@ export class TaskboardService extends TypertRemoteService {
     const cwd = agent.session.header.cwd
     const filesScope = ticket.filesScope
     const scopeEntries = parseFilesScope(filesScope)
-    // V3-33: only absolute entries locate a repo on their own; a scope that is
-    // non-empty yet carries no absolute entry is satisfied entirely by the cwd
-    // fallback below, which is named in the report instead of passing silently.
-    const locatedByCwdOnly = scopeEntries.length > 0 && !scopeEntries.some(entry => isAbsolute(entry))
+    // V3-33 (narrowed) + V3-41 (widened): only an absolute entry locates a repo
+    // on its own, and only when a configured root governs it. The cwd fallback
+    // below is named in the report whenever the scope is non-empty yet no entry
+    // of it lands in a configured root — the scope carries no absolute entry at
+    // all (V3-33), or every absolute entry it carries misses every configured
+    // root (V3-41) — instead of passing silently.
+    const absoluteEntries = scopeEntries.filter(entry => isAbsolute(entry))
+    const scopeLocatesRepo = absoluteEntries.some(entry => this.resolvePreflightRepo(entry) !== null)
+    const locatedByCwdOnly = scopeEntries.length > 0 && !scopeLocatesRepo
     const located = this.locatePreflightRepo(filesScope, cwd)
     const inFlightScopes = await this.inFlightScopes(ticket)
     if (located === null) {
@@ -3095,16 +3104,32 @@ export class TaskboardService extends TypertRemoteService {
       }
     }
     const report = runPreflight(located.repoRoot, located.config, filesScope, inFlightScopes)
-    // V3-33: the cwd fallback landed on a mapped repo, but the card's own scope
-    // located nothing — the repo the worker is sent to was chosen by the master
-    // session's cwd, not by the card. That is a silent misassignment whenever
-    // the two disagree, so the report names it (fail loud; enforce:false still
-    // spawns the worker with the warning inlined into its prompt).
+    // V3-33/V3-41: the cwd fallback landed on a mapped repo, but no entry of
+    // the card's own scope landed in a configured root — the repo the worker is
+    // sent to was chosen by the master session's cwd, not by the card. That is
+    // a silent misassignment whenever the two disagree, so the report names it
+    // (fail loud; enforce:false still spawns the worker with the warning
+    // inlined into its prompt).
     if (locatedByCwdOnly) {
+      const cwdLabel = typeof cwd === 'string' && cwd !== '' ? cwd : '(none)'
+      // V3-33 keeps its exact wording when the scope has no absolute entry at
+      // all; V3-41 adds the sibling case — absolute entries that all miss a
+      // configured root — and names each entry with the concrete reason it
+      // missed, so the operator knows which declaration to move under a
+      // configured root instead of guessing.
       report.violations.push(
-        'filesScope "' + filesScope + '" of ticket "' + ticket.id + '" declares only relative path(s) and no absolute entry, '
-        + 'so the repo was located by falling back to the master cwd "' + (typeof cwd === 'string' && cwd !== '' ? cwd : '(none)')
-        + '" instead of from the card; declare absolute filesScope paths so the card, not the dispatch cwd, chooses the repo',
+        absoluteEntries.length === 0
+          ? 'filesScope "' + filesScope + '" of ticket "' + ticket.id + '" declares only relative path(s) and no absolute entry, '
+            + 'so the repo was located by falling back to the master cwd "' + cwdLabel
+            + '" instead of from the card; declare absolute filesScope paths so the card, not the dispatch cwd, chooses the repo'
+          : 'filesScope "' + filesScope + '" of ticket "' + ticket.id + '" declares absolute entry/entries '
+            + absoluteEntries.map(entry => '"' + entry + '" ('
+              + (existsSync(entry) ? 'exists but is outside every configured preflight repo root' : 'does not exist on disk')
+              + ')')
+              .join(', ')
+            + ', none of which lands inside any configured preflight repo root, '
+            + 'so the repo was located by falling back to the master cwd "' + cwdLabel
+            + '" instead of from the card; declare filesScope paths under the configured repo root(s) so the card, not the dispatch cwd, chooses the repo',
       )
       report.safe = false
     }
