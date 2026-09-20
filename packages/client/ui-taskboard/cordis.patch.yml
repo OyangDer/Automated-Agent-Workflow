@@ -1,0 +1,8 @@
+# The Taskboard browser tab, carried by the plugin package so the kanban tab
+# joins the conversation view ring only where this package is installed (and
+# its host layer @deepseek-ai/dsh-taskboard supplies the Remote surface).
+# Activate with: dsh plugin --profile <name> add @deepseek-ai/dsh-client-ui-taskboard
+
+- insert:
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'

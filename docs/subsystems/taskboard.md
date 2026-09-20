@@ -86,6 +86,17 @@ One board has one master seat (claim with `taskboard_claim_master`, held against
 
 When a worker reports (`taskboard_report`), fails (`taskboard_fail`), or terminates without reporting, or when a reviewer verdict lands on a card, the service injects a lightweight notice into the live inbox of the board's master (following the goal-round driver's inbox-injection precedent). The master's agent loop claims it as ordinary input — adjudicate with `taskboard_resolve_review`, re-dispatch with `taskboard_reassign` — so the master never needs to poll the board. A vacant seat or a not-loaded master session silently skips the notice.
 
+## Installation and mounting
+
+The `@deepseek-ai/dsh-web-app` bundle does not mount this plugin. Each plugin package carries its own patch — the manifest declares `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` and that patch inserts one row — so installing the package is what mounts it. The host layer carries `taskboard`; the browser tab arrives with `@deepseek-ai/dsh-client-ui-taskboard`.
+
+```sh
+dsh plugin --profile web add @deepseek-ai/dsh-taskboard
+dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
+```
+
+`dsh plugin add` installs the package and, because the installed manifest declares `dsh.bundle`, appends it to the profile's `dsh.profile.bundles`, so the package's patch applies as one further layer; no profile-side `insert` is needed on that path. A profile that declares the package by hand instead (a `link:` or version dependency written straight into its `package.json`) never has `bundles` reconciled, so it must either run the command or mount the row in its own `cordis.patch.yml` — mounting one id both ways inserts the row twice. A profile with neither package boots an ordinary Web surface: no board tab and no `taskboard` Remote namespace.
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>

@@ -86,6 +86,17 @@ interface TaskboardChanged {
 
 当 worker 上报完成（`taskboard_report`）、上报失败（`taskboard_fail`）或未上报即终止，或审核结论落到卡片上时，服务会向看板 master 的在线收件箱注入一条轻量通知（沿用 goal 驱动的收件箱注入先例）。master 的 agent loop 会把它作为普通输入处理——用 `taskboard_resolve_review` 裁决、用 `taskboard_reassign` 重新派单——因此 master 无需轮询看板。席位空缺或 master 会话未加载时静默跳过通知。
 
+## 安装与挂载
+
+`@deepseek-ai/dsh-web-app` bundle 不再挂载本插件。每个插件包自带补丁 —— manifest 声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，该补丁插入一行 —— 因此安装插件包就是挂载它。宿主层提供 `taskboard`，浏览器页签由 `@deepseek-ai/dsh-client-ui-taskboard` 带来。
+
+```sh
+dsh plugin --profile web add @deepseek-ai/dsh-taskboard
+dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
+```
+
+`dsh plugin add` 会安装该包，并因已安装的 manifest 声明了 `dsh.bundle` 而把它追加进 profile 的 `dsh.profile.bundles`，于是该包的补丁作为又一层生效；这条路径不需要 profile 侧再写 `insert`。若 profile 改为手写声明该包（把 `link:` 或版本依赖直接写进自己的 `package.json`），其 `bundles` 不会被 reconcile，此时必须要么跑一次该命令、要么在自己的 `cordis.patch.yml` 里挂载该行 —— 同一个 id 两种方式都插会重复插入。两个包都不装的 profile 启动的就是普通 Web 界面：没有看板页签，也没有 `taskboard` Remote 命名空间。
+
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
 <a id="cordis-surface"></a>

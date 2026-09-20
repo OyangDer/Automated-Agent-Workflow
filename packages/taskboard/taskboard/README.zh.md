@@ -25,15 +25,14 @@ DeepSeek Harness 的五列看板工单系统：持久化工作流域（Backlog �
 <a id="assembly"></a>
 ## 组装
 
-Web 配置挂载服务与看板页签：
+本包自行挂载：manifest 声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，该补丁插入 `taskboard` 行。把本包与看板页签包一起装进 profile：
 
-```yaml
-- id: taskboard
-  name: '@deepseek-ai/dsh-taskboard'
-
-- id: ui-taskboard
-  name: '@deepseek-ai/dsh-client-ui-taskboard'
+```sh
+dsh plugin --profile web add @deepseek-ai/dsh-taskboard
+dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
 ```
+
+`dsh plugin` 会把每个声明了 `dsh.bundle` 的已安装依赖追加进 profile 的 `dsh.profile.bundles`，补丁因此作为又一层生效；`@deepseek-ai/dsh-web-app` bundle 不再挂载这两行；两个包都不装的 profile 没有看板页签。
 
 <a id="configuration"></a>
 ## 配置

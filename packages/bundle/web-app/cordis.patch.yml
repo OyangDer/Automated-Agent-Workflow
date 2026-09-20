@@ -55,12 +55,6 @@
       config:
         maxNoteBytes: 8192
 
-    # Five-column kanban ticket board: the durable workflow domain, the
-    # agent-facing claim/complete/review tools, reviewer automation, and
-    # the browser Remote surface the ui-taskboard tab renders.
-    - id: taskboard
-      name: '@deepseek-ai/dsh-taskboard'
-
     # Browser Session export: `/export` command plus the shared download dialog.
     - id: session-log-download
       name: '@deepseek-ai/dsh-session-log-export'
@@ -320,10 +314,6 @@
     # Goal surface: GoalBar in the input dock over the goal session projection.
     - id: ui-goal
       name: '@deepseek-ai/dsh-client-ui-goal'
-
-    # The taskboard kanban tab in the conversation view ring.
-    - id: ui-taskboard
-      name: '@deepseek-ai/dsh-client-ui-taskboard'
 
     # Subagent classification tab: this session's children grouped by their
     # taskboard lifecycle (In progress / In testing / unassigned).

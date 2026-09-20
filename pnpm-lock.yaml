@@ -1897,9 +1897,6 @@ importers:
       '@deepseek-ai/dsh-client-ui-subagent-board':
         specifier: workspace:^
         version: link:../../client/ui-subagent-board
-      '@deepseek-ai/dsh-client-ui-taskboard':
-        specifier: workspace:^
-        version: link:../../client/ui-taskboard
       '@deepseek-ai/dsh-client-ui-theme':
         specifier: workspace:^
         version: link:../../client/ui-theme
@@ -1978,9 +1975,6 @@ importers:
       '@deepseek-ai/dsh-subprocess':
         specifier: workspace:^
         version: link:../../subprocess/subprocess
-      '@deepseek-ai/dsh-taskboard':
-        specifier: workspace:^
-        version: link:../../taskboard/taskboard
       '@deepseek-ai/dsh-tool-subagent':
         specifier: workspace:^
         version: link:../../subagent/tool-subagent

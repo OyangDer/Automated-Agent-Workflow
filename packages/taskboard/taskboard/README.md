@@ -25,15 +25,14 @@ Five-column kanban ticket board for DeepSeek Harness: a durable workflow domain 
 <a id="assembly"></a>
 ## Assembly
 
-The web profile mounts the service and the board tab:
+The package mounts itself: the manifest declares `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` and that patch inserts the `taskboard` row. Install it, plus the browser tab's package, into a profile:
 
-```yaml
-- id: taskboard
-  name: '@deepseek-ai/dsh-taskboard'
-
-- id: ui-taskboard
-  name: '@deepseek-ai/dsh-client-ui-taskboard'
+```sh
+dsh plugin --profile web add @deepseek-ai/dsh-taskboard
+dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
 ```
+
+`dsh plugin` appends every installed dependency whose manifest declares `dsh.bundle` to the profile's `dsh.profile.bundles`, so the patch applies as one more layer; the `@deepseek-ai/dsh-web-app` bundle no longer mounts either row.
 
 <a id="configuration"></a>
 ## Configuration
