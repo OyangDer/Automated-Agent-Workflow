@@ -11,8 +11,8 @@
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { join, parse } from 'node:path'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as storageJson from '@deepseek-ai/dsh-storage-json'
@@ -50,17 +50,106 @@ function git(dir: string, args: string[]): string {
   return result.stdout.trim()
 }
 
+/**
+ * Explicit per-case budget for the suites that drive real git repositories.
+ *
+ * Every red observed in this file was "Test timed out in 5000ms" — vitest's
+ * default — never an assertion. Measured on this host (Windows, quiet), the
+ * slowest case (the pinned-commit ahead/behind/diverged matrix) takes ~2.3s
+ * and the file costs ~29s of test time; the same code crosses 5s once the
+ * machine carries a few dozen node processes. 30s is ~12x the quiet-machine
+ * worst case, so a loaded machine stays distinguishable from a real
+ * regression: a real break still fails on an assertion, not on the clock. The
+ * pure suites keep vitest's 5s default, so a genuine hang there still fails
+ * fast.
+ */
+const GIT_TEST_TIMEOUT_MS = 30_000
+
 /** Temp directories created by the helpers, cleaned between cases. */
 const openDirs: string[] = []
 
+/** The per-file temp root, selected and created in beforeAll. */
+let suiteTmpRoot = ''
+
+/**
+ * Choose the root every real-git fixture lives under.
+ *
+ * `os.tmpdir()` here is the 8.3 short form of a profile that carries an
+ * apostrophe ("C:\Users\O'YAN'~1\AppData\Local\Temp"): real git init/commit
+ * calls under it are measurably slower to settle, and apostrophe temp paths are
+ * the family that historically broke path/URL handling. On Windows we therefore
+ * prefer a drive-root directory with no apostrophe, no space and no 8.3 alias;
+ * a writability probe falls back to the platform temp dir where the drive root
+ * is not writable. DSH_TEST_TMP_ROOT overrides the choice outright.
+ */
+async function selectTempBase(): Promise<string> {
+  const override = process.env.DSH_TEST_TMP_ROOT
+  if (override !== undefined && override !== '') return override
+  const candidates = process.platform === 'win32'
+    ? [join(parse(tmpdir()).root, 'dsh-test-tmp'), join(tmpdir(), 'dsh-test-tmp')]
+    : [join(tmpdir(), 'dsh-test-tmp')]
+  for (const candidate of candidates) {
+    try {
+      await mkdir(candidate, { recursive: true })
+      const probe = join(candidate, '.write-probe-' + String(process.pid))
+      await writeFile(probe, '')
+      await rm(probe, { force: true })
+      return candidate
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? String(error)
+      console.warn('[preflight-test] temp root ' + candidate + ' is unusable (' + code + '), trying the next candidate')
+    }
+  }
+  console.warn('[preflight-test] no candidate temp root worked; using ' + tmpdir())
+  return tmpdir()
+}
+
+/**
+ * Delete a path, retrying the Windows refusals (ENOTEMPTY/EBUSY/EPERM) that
+ * appear while a just-exited git process still holds a handle. `force` makes
+ * it idempotent and `maxRetries` backs it off. This variant rethrows, for
+ * deletions a case's own precondition depends on.
+ */
+async function removeTestPath(target: string): Promise<void> {
+  await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+}
+
+/**
+ * Delete a test temp directory without ever reddening a case: cleanup residue
+ * is logged (so it stays visible next to a failure) and the whole suite root is
+ * removed again in afterAll.
+ */
+async function removeTree(target: string, label: string): Promise<void> {
+  try {
+    await removeTestPath(target)
+  } catch (error) {
+    const code = (error as { code?: string }).code ?? String(error)
+    console.warn('[preflight-test] cleanup could not remove ' + label + ' (' + code + '): ' + target)
+  }
+}
+
+beforeAll(async () => {
+  suiteTmpRoot = join(await selectTempBase(), 'preflight-' + String(process.pid) + '-' + Date.now().toString(36))
+  await mkdir(suiteTmpRoot, { recursive: true })
+})
+
 afterEach(async () => {
   vi.restoreAllMocks()
-  await Promise.all(openDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
+  await Promise.all(openDirs.splice(0).map(dir => removeTree(dir, 'case temp dir')))
 })
+
+afterAll(async () => {
+  await removeTree(suiteTmpRoot, 'suite temp root')
+})
+
+/** A fresh directory under the suite temp root (no apostrophe, no 8.3 alias). */
+async function makeTempDir(prefix: string): Promise<string> {
+  return await mkdtemp(join(suiteTmpRoot, prefix))
+}
 
 /** Create a fresh real git repository on branch "main" with a committed file. */
 async function createRepo(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), 'preflight-repo-'))
+  const dir = await makeTempDir('preflight-repo-')
   openDirs.push(dir)
   git(dir, ['init', '-b', 'main'])
   git(dir, ['config', 'user.email', 'test@example.com'])
@@ -148,7 +237,7 @@ interface Harness {
 }
 
 async function harness(options: { preflightRepos?: Record<string, RepoPreflightConfig> } = {}): Promise<Harness> {
-  const root = await mkdtemp(join(tmpdir(), 'taskboard-preflight-'))
+  const root = await makeTempDir('taskboard-preflight-')
   openDirs.push(root)
   const ctx = new Context()
   await ctx.plugin(AgentRegistry)
@@ -174,7 +263,7 @@ async function createNotStarted(service: TaskboardService, agent: Agent, title: 
   return await service.moveAsMaster(agent, { ticketId: ticket.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
 }
 
-describe('collectGitFacts with real temp git repositories', () => {
+describe('collectGitFacts with real temp git repositories', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('gathers branch, HEAD, a clean tree and an equal relationship on the canonical base', async () => {
     const repo = await createRepo()
     const head = git(repo, ['rev-parse', 'HEAD'])
@@ -257,7 +346,7 @@ describe('collectGitFacts with real temp git repositories', () => {
   })
 
   it('fails closed outside a git repository', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'preflight-nogit-'))
+    const dir = await makeTempDir('preflight-nogit-')
     openDirs.push(dir)
     const facts = collectGitFacts(dir, 'main')
     expect(facts.ok).toBe(false)
@@ -265,7 +354,7 @@ describe('collectGitFacts with real temp git repositories', () => {
   })
 
   it('reports an unborn repo with an empty HEAD and a missing canonical ref', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'preflight-unborn-'))
+    const dir = await makeTempDir('preflight-unborn-')
     openDirs.push(dir)
     git(dir, ['init', '-b', 'main'])
     git(dir, ['config', 'user.email', 'test@example.com'])
@@ -287,7 +376,7 @@ describe('collectGitFacts with real temp git repositories', () => {
   })
 
   it('fails closed when the repo root does not exist', () => {
-    const missing = join(tmpdir(), 'preflight-missing-' + Date.now())
+    const missing = join(suiteTmpRoot, 'preflight-missing-' + String(Date.now()))
     const facts = collectGitFacts(missing, 'main')
     expect(facts.ok).toBe(false)
     expect(facts.error).toBeTruthy()
@@ -353,7 +442,7 @@ describe('worktree porcelain parsing', () => {
   })
 })
 
-describe('path helpers', () => {
+describe('path helpers', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('normalizes paths and judges containment at separator boundaries', async () => {
     const repo = await createRepo()
     const child = join(repo, 'src', 'a.ts')
@@ -375,7 +464,7 @@ describe('path helpers', () => {
   })
 })
 
-describe('runPreflight invariants against real repos', () => {
+describe('runPreflight invariants against real repos', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('reports a safe report on a clean repo sitting exactly on the canonical base', async () => {
     const repo = await createRepo()
     const head = git(repo, ['rev-parse', 'HEAD'])
@@ -424,7 +513,7 @@ describe('runPreflight invariants against real repos', () => {
   })
 
   it('fails closed when the repo is not a git repository', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'preflight-norepo-'))
+    const dir = await makeTempDir('preflight-norepo-')
     openDirs.push(dir)
     const report = runPreflight(dir, { canonicalBranch: 'main' }, '')
     expect(report.safe).toBe(false)
@@ -461,7 +550,7 @@ describe('runPreflight invariants against real repos', () => {
 
   it('accepts an absolute assigned worktree outside the repo', async () => {
     const repo = await createRepo()
-    const absolute = join(tmpdir(), 'preflight-custom-wt')
+    const absolute = join(suiteTmpRoot, 'preflight-custom-wt')
     const report = runPreflight(repo, { canonicalBranch: 'main', worktree: absolute }, '')
     expect(report.safe).toBe(true)
     expect(normalizePath(report.assignedWorktree)).toBe(normalizePath(absolute))
@@ -649,7 +738,7 @@ describe('worker prompt preflight section', () => {
   })
 })
 
-describe('service dispatch preflight (V3-20)', () => {
+describe('service dispatch preflight (V3-20)', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('blocks dispatch on a dirty governed repo: card blocked, violations in failure, no worker', async () => {
     const repo = await createRepo()
     await writeFile(join(repo, 'extra.txt'), 'x\n')
@@ -723,7 +812,7 @@ describe('service dispatch preflight (V3-20)', () => {
 
   it('fails closed when the master cwd maps to no configured repo', async () => {
     const repo = await createRepo()
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
     openDirs.push(elsewhere)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     const dev = masterAgent('dev-agent-a', elsewhere)
@@ -816,7 +905,7 @@ describe('service dispatch preflight (V3-20)', () => {
     const blocked = await service.assign(dev, first.id)
     expect(blocked.ticket.status).toBe('blocked')
     // Clean the repo; the blocked card is not running, so no scope conflict.
-    await rm(join(repo, 'dirty.txt'))
+    await removeTestPath(join(repo, 'dirty.txt'))
     const second = await createNotStarted(service, dev, 'second card', join(repo, 'src', 'components'))
     const result = await service.assign(dev, second.id)
     expect(result.worker).toBe('spawned')
@@ -864,7 +953,7 @@ describe('service dispatch preflight (V3-20)', () => {
     expect(retried.ticket.failure?.reason).toContain('dirty.txt')
     expect(subagentsStart).toHaveBeenCalledTimes(1)
     // After cleaning, the retry spawns a fresh worker with the preflight facts.
-    await rm(join(repo, 'dirty.txt'))
+    await removeTestPath(join(repo, 'dirty.txt'))
     const clean = await service.reassign(dev, ticket.id, 'retry')
     expect(clean.worker).toBe('spawned')
     expect(clean.workerAgentId).toBe('worker-child-agent')
@@ -877,7 +966,7 @@ describe('service dispatch preflight (V3-20)', () => {
   })
 
   it('drops invalid preflight repo configs with warnings and normalizes valid ones', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'taskboard-preflight-cfg-'))
+    const root = await makeTempDir('taskboard-preflight-cfg-')
     openDirs.push(root)
     const ctx = new Context()
     await ctx.plugin(AgentRegistry)
@@ -921,7 +1010,7 @@ describe('service dispatch preflight (V3-20)', () => {
   it('locates the repo from the card filesScope when the master cwd is unmapped (V3-26)', async () => {
     const repo = await createRepo()
     const head = git(repo, ['rev-parse', 'HEAD'])
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
     openDirs.push(elsewhere)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     const dev = masterAgent('dev-agent-a', elsewhere)
@@ -968,7 +1057,7 @@ describe('service dispatch preflight (V3-20)', () => {
   it('uses the first filesScope entry that lands in a configured root, skipping unlocatable ones (V3-26)', async () => {
     const repo = await createRepo()
     const head = git(repo, ['rev-parse', 'HEAD'])
-    const ungoverned = await mkdtemp(join(tmpdir(), 'preflight-ungoverned-'))
+    const ungoverned = await makeTempDir('preflight-ungoverned-')
     openDirs.push(ungoverned)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     // No cwd at all: only the declared scope can locate the repo.
@@ -987,8 +1076,8 @@ describe('service dispatch preflight (V3-20)', () => {
 
   it('fails closed naming both misses when neither the filesScope nor the cwd maps (V3-26)', async () => {
     const repo = await createRepo()
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
-    const ungoverned = await mkdtemp(join(tmpdir(), 'preflight-ungoverned-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
+    const ungoverned = await makeTempDir('preflight-ungoverned-')
     openDirs.push(elsewhere, ungoverned)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     const dev = masterAgent('dev-agent-a', elsewhere)
@@ -1029,7 +1118,7 @@ describe('service dispatch preflight (V3-20)', () => {
 
   it('names the missing filesScope when no scope is declared and the cwd is unmapped (V3-26)', async () => {
     const repo = await createRepo()
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
     openDirs.push(elsewhere)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     const dev = masterAgent('dev-agent-a', elsewhere)
@@ -1049,7 +1138,7 @@ describe('service dispatch preflight (V3-20)', () => {
   it('facts-only mode injects facts and never blocks when the repo came from the filesScope (V3-26)', async () => {
     const repo = await createRepo()
     await writeFile(join(repo, 'extra.txt'), 'x\n')
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
     openDirs.push(elsewhere)
     const { ctx, service, subagentsStart } = await harness({
       preflightRepos: { [repo]: { canonicalBranch: 'main', enforce: false } },
@@ -1072,7 +1161,7 @@ describe('service dispatch preflight (V3-20)', () => {
   it('re-dispatch retry locates the repo from the filesScope when the cwd is unmapped (V3-26)', async () => {
     const repo = await createRepo()
     await writeFile(join(repo, 'dirty.txt'), 'x\n')
-    const elsewhere = await mkdtemp(join(tmpdir(), 'preflight-elsewhere-'))
+    const elsewhere = await makeTempDir('preflight-elsewhere-')
     openDirs.push(elsewhere)
     const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
     const dev = masterAgent('dev-agent-a', elsewhere)
@@ -1084,7 +1173,7 @@ describe('service dispatch preflight (V3-20)', () => {
     expect(first.worker).toBe('failed')
     expect(first.ticket.failure?.reason).toContain('dirty.txt')
     expect(subagentsStart).not.toHaveBeenCalled()
-    await rm(join(repo, 'dirty.txt'))
+    await removeTestPath(join(repo, 'dirty.txt'))
     const retried = await service.reassign(dev, ticket.id, 'retry')
     expect(retried.worker).toBe('spawned')
     expect(retried.workerAgentId).toBe('worker-child-agent')
