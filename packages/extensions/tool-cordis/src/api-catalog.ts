@@ -2463,6 +2463,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'The taskboard service (ctx.taskboard): storage-backed tickets and boards, the master seat, workflow transitions, the browser Remote surface, and the model-facing tools.',
     methods: [
       {
+        signature: 'async submitReviewVerdict( agent: Agent, ticketId: string, verdict: \'approve\' | \'reject\', summary: string, problems: readonly string[], ): Promise<TicketView>',
+        description: 'Report one reviewer verdict from a continuable reviewer session (V3-28). A durable reviewer child cannot carry an outputSchema — structured output is a one-shot-only subagent capability — so instead of the structured-output capture it calls the taskboard_review_verdict tool, which lands the same { verdict, summary, problems } report through the one landing path. The reviewer still never decides the card: the master resolves it with taskboard_resolve_review.',
+        parameters: [{ name: 'agent', description: 'the reviewer session agent.' }, { name: 'ticketId', description: 'the In testing ticket under review.' }, { name: 'verdict', description: '\'approve\' or \'reject\'.' }, { name: 'summary', description: 'what the reviewer inspected and concluded.' }, { name: 'problems', description: 'concrete rework items (empty when approving).' }],
+        returns: 'the card with reviewOutcome recorded.',
+      },
+      {
         signature: 'async reconcileLostWorkers(): Promise<number>',
         description: 'One worker-liveness reconciliation pass: every In progress/running card whose worker is lost — absent from the live agent registry (restart / hard death) or registered but idle with no activity past the configured timeout — is recovered through recoverLostWorker: auto-redispatch while the per-card budget lasts, block with a master notice once exhausted. Shared by the startup scan and the periodic scanner.\n\nLiveness authority research (service dependency surface): the agent registry is the exact "is this session\'s agent alive right now" authority — agents.get(id) returns the live Agent or undefined; presence means live (an idle agent is still alive, only an unregistered session is lost), which is precisely the restart scenario where the in-memory run settlement callbacks are gone. The session event log supplies the activity tail for the idle-staleness arm. The subagent seam\'s listChildren / listDescendants are parent-rooted tree listings that throw without a mounted projection registry + session store, and the session store tracks persisted sessions rather than live agent loops — neither is a general flat liveness probe, so the registry is used directly, and a missing registry (never in the host, where \'agents\' is an injected dependency) degrades to a silent skip without blocking anything.\n\nIdempotent by construction and coexistent with the settlement callback: only running cards are considered, and the guarded recovery re-checks column/status/worker identity atomically on the committed record, so a card the settlement callback already recovered (or whose worker came back) is returned untouched — exactly one recovery ever lands per card.',
         parameters: [],
@@ -2471,6 +2477,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       {
         signature: 'async reconcileStaleReviewers(): Promise<number>',
         description: 'One reviewer-staleness reconciliation pass: every In testing card that still has a review seat but no reviewOutcome is checked against the live agent registry and the review-start clock:\n\n- a reviewer session absent from the registry is a ghost seat and is released immediately (no ghost seats, per the spec);\n- a reviewer that is registered but idle — no running tool — with the review pending longer than reviewerStaleTimeoutMs is judged stuck and the seat is released. On release the card history gets one \'review-release\' row, the master is notified, and a fresh reviewer is auto-redispatched when a live master session exists to spawn from; otherwise the seat is left vacant so taskboard_claim_review can take it.\n\nReentry-safe: the guarded mutate only releases a seat that still names the same reviewer and is still In testing without an outcome, so a card another path already released (or resolved) is returned untouched.',
+        parameters: [],
+        returns: 'how many seats this pass released.',
+      },
+      {
+        signature: 'async reconcileMasterSeats(): Promise<number>',
+        description: 'One master-seat liveness pass (V3-25, revised by V3-32 and V3-34): every board whose seat names a session that is gone for good is released. Seat ownership follows the session, not the process: a holder merely absent from the live agent registry (host restart, idle eviction) but still carrying a stored session record keeps the seat and is never released — the reported "master keeps dropping" fault. Only a holder that has left the registry *and* has no stored record (the session was deleted or cleaned up) is released. A registered holder keeps the seat however long it stays silent: silence is not death, and a master that ends its turn after dispatching and waits for a notice must not be evicted for it.\n\nA release changes seat ownership only: in-flight cards keep their workers and reviewers untouched, and no card is ever re-dispatched by this pass. The board gets one masterHistory row (empty target = vacant seat) and a durable notice the successor reads back from taskboard_claim_master / taskboard_notices; taskboard_handover remains the explicit takeover path while the holder is still alive.\n\nReentry-safe: the guarded release only clears the seat that still names the judged holder, so concurrent passes release each board exactly once.',
         parameters: [],
         returns: 'how many seats this pass released.',
       },
@@ -2530,7 +2542,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'async claimMaster(boardId: string, agent: Agent): Promise<BoardView>',
-        description: 'Claim the master seat of one board; a stale seat (past the lease) can be preempted, and an unclaimed board is claimed by this agent. A board the caller cannot see is denied as not found (no existence leak), so the master seat of a foreign session-private board cannot be seized.',
+        description: 'Claim the master seat of one board. V3-25/V3-34: the seat is no longer leased by a wall clock and no longer follows the process either — only a holder session that is gone for good (absent from the live agent registry *and* holding no stored session record) is preempted here, so the successor takes a genuinely vacant seat immediately; a holder the host merely restarted or unloaded still owns it. A preemption leaves a masterHistory row plus a durable board notice the claimant reads back from this claim. A board the caller cannot see is denied as not found (no existence leak), so the master seat of a foreign session-private board cannot be seized.\n\nThe liveness judgment runs before the (synchronous) board updater because the stored-record probe is asynchronous; the updater then re-checks that the judged holder is still the one on the row, and a seat that changed hands in between fails closed as held rather than preempted on stale evidence.',
         parameters: [{ name: 'boardId', description: 'the board to claim.' }, { name: 'agent', description: 'the claiming session agent.' }],
         returns: 'the board with its fresh master.',
       },
@@ -2571,9 +2583,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the blocked ticket.',
       },
       {
-        signature: 'async reassign(agent: Agent, ticketId: string, action: \'retry\' | \'backlog\', workerLabel?: string): Promise<ReassignTicketResult>',
-        description: 'Master re-dispatches one card: "retry" spawns a fresh worker (card back to running, failure cleared), "backlog" returns the card to Not started.',
-        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the In progress card to re-dispatch.' }, { name: 'action', description: 'retry or backlog.' }, { name: 'workerLabel', description: 'optional display label for a retry worker.' }],
+        signature: 'async reassign( agent: Agent, ticketId: string, action: \'retry\' | \'backlog\' | \'continue\', workerLabel?: string, ): Promise<ReassignTicketResult>',
+        description: 'Master re-dispatches one card: "retry" spawns a fresh worker (card back to running, failure cleared), "backlog" returns the card to Not started, and "continue" (V3-28) wakes the card\'s existing worker session instead of spawning a replacement — the manual entry into the same wake path the automatic recovery uses for a running, blocked, or paused card. A refused wake (no continuation state, dead session, no seam) degrades to the historic fresh spawn, so "continue" never leaves the card without a worker.',
+        parameters: [{ name: 'agent', description: 'the master session agent.' }, { name: 'ticketId', description: 'the In progress card to re-dispatch.' }, { name: 'action', description: 'retry, backlog, or continue.' }, { name: 'workerLabel', description: 'optional display label for a retry worker.' }],
         returns: 'the re-dispatched card plus the worker-spawn outcome.',
       },
       {
@@ -4308,6 +4320,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface DeepSeekLlmApiExtensionProvider<T extends DeepSeekLlmApiJson> {\n    prepare(request: DeepSeekLlmApiExtensionRequest): PreparedDeepSeekLlmApiExtension<T> | undefined | Promise<PreparedDeepSeekLlmApiExtension<T> | undefined>;\n}',
   },
   {
+    name: 'DeepSeekLlmApiExtensionRegistration',
+    declaration: 'export interface DeepSeekLlmApiExtensionRegistration {\n    readonly optional?: boolean;\n}',
+  },
+  {
     name: 'DeepSeekLlmApiExtensionRequest',
     declaration: 'export interface DeepSeekLlmApiExtensionRequest {\n    readonly body: Readonly<Record<string, DeepSeekLlmApiJson>>;\n    readonly sessionId?: string;\n    readonly purpose?: \'compaction\' | \'session-title\';\n    readonly signal: AbortSignal;\n}',
   },
@@ -5133,7 +5149,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ReassignTicketResult',
-    declaration: 'export interface ReassignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'unavailable\' | \'failed\' | null;\n    workerAgentId: string | null;\n}',
+    declaration: 'export interface ReassignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'continued\' | \'unavailable\' | \'failed\' | null;\n    workerAgentId: string | null;\n}',
   },
   {
     name: 'RedactedSecret',

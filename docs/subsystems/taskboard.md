@@ -145,6 +145,23 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 
 ```ts cordis-catalog
 /**
+ * Report one reviewer verdict from a continuable reviewer session (V3-28).
+ * A durable reviewer child cannot carry an outputSchema — structured output
+ * is a one-shot-only subagent capability — so instead of the
+ * structured-output capture it calls the taskboard_review_verdict tool,
+ * which lands the same { verdict, summary, problems } report through the one
+ * landing path. The reviewer still never decides the card: the master
+ * resolves it with taskboard_resolve_review.
+ * @param agent - the reviewer session agent.
+ * @param ticketId - the In testing ticket under review.
+ * @param verdict - 'approve' or 'reject'.
+ * @param summary - what the reviewer inspected and concluded.
+ * @param problems - concrete rework items (empty when approving).
+ * @returns the card with reviewOutcome recorded.
+ */
+async submitReviewVerdict( agent: Agent, ticketId: string, verdict: 'approve' | 'reject', summary: string, problems: readonly string[], ): Promise<TicketView>
+
+/**
  * One worker-liveness reconciliation pass: every In progress/running card
  * whose worker is lost — absent from the live agent registry (restart /
  * hard death) or registered but idle with no activity past the configured
@@ -196,6 +213,31 @@ async reconcileLostWorkers(): Promise<number>
  * @returns how many seats this pass released.
  */
 async reconcileStaleReviewers(): Promise<number>
+
+/**
+ * One master-seat liveness pass (V3-25, revised by V3-32 and V3-34): every
+ * board whose seat names a session that is gone for good is released. Seat
+ * ownership follows the session, not the process: a holder merely absent
+ * from the live agent registry (host restart, idle eviction) but still
+ * carrying a stored session record keeps the seat and is never released —
+ * the reported "master keeps dropping" fault. Only a holder that has left
+ * the registry *and* has no stored record (the session was deleted or
+ * cleaned up) is released. A registered holder keeps the seat however long
+ * it stays silent: silence is not death, and a master that ends its turn
+ * after dispatching and waits for a notice must not be evicted for it.
+ *
+ * A release changes seat ownership only: in-flight cards keep their workers
+ * and reviewers untouched, and no card is ever re-dispatched by this pass.
+ * The board gets one masterHistory row (empty target = vacant seat) and a
+ * durable notice the successor reads back from taskboard_claim_master /
+ * taskboard_notices; taskboard_handover remains the explicit takeover path
+ * while the holder is still alive.
+ *
+ * Reentry-safe: the guarded release only clears the seat that still names
+ * the judged holder, so concurrent passes release each board exactly once.
+ * @returns how many seats this pass released.
+ */
+async reconcileMasterSeats(): Promise<number>
 
 /**
  * Whole-board snapshot, sorted by column then position, scoped to one
@@ -295,10 +337,22 @@ async reconcileStaleReviewers(): Promise<number>
 @Remote('requestReview') async requestReviewRemote(agent: Agent, request: RequestReviewRequest): Promise<TicketView>
 
 /**
- * Claim the master seat of one board; a stale seat (past the lease) can be
- * preempted, and an unclaimed board is claimed by this agent. A board the
- * caller cannot see is denied as not found (no existence leak), so the
- * master seat of a foreign session-private board cannot be seized.
+ * Claim the master seat of one board. V3-25/V3-34: the seat is no longer
+ * leased by a wall clock and no longer follows the process either — only a
+ * holder session that is gone for good (absent from the live agent registry
+ * *and* holding no stored session record) is preempted here, so the
+ * successor takes a genuinely vacant seat immediately; a holder the host
+ * merely restarted or unloaded still owns it. A preemption leaves a
+ * masterHistory row plus a durable board notice the claimant reads back from
+ * this claim. A board the caller cannot see is denied as not found (no
+ * existence leak), so the master seat of a foreign session-private board
+ * cannot be seized.
+ *
+ * The liveness judgment runs before the (synchronous) board updater because
+ * the stored-record probe is asynchronous; the updater then re-checks that
+ * the judged holder is still the one on the row, and a seat that changed
+ * hands in between fails closed as held rather than preempted on stale
+ * evidence.
  * @param boardId - the board to claim.
  * @param agent - the claiming session agent.
  * @returns the board with its fresh master.
@@ -374,14 +428,20 @@ async fail(agent: Agent, ticketId: string, reason: string): Promise<TicketView>
 
 /**
  * Master re-dispatches one card: "retry" spawns a fresh worker (card back
- * to running, failure cleared), "backlog" returns the card to Not started.
+ * to running, failure cleared), "backlog" returns the card to Not started,
+ * and "continue" (V3-28) wakes the card's existing worker session instead of
+ * spawning a replacement — the manual entry into the same wake path the
+ * automatic recovery uses for a running, blocked, or paused card. A refused
+ * wake (no continuation state, dead session, no seam) degrades to the
+ * historic fresh spawn, so "continue" never leaves the card without a
+ * worker.
  * @param agent - the master session agent.
  * @param ticketId - the In progress card to re-dispatch.
- * @param action - retry or backlog.
+ * @param action - retry, backlog, or continue.
  * @param workerLabel - optional display label for a retry worker.
  * @returns the re-dispatched card plus the worker-spawn outcome.
  */
-async reassign(agent: Agent, ticketId: string, action: 'retry' | 'backlog', workerLabel?: string): Promise<ReassignTicketResult>
+async reassign( agent: Agent, ticketId: string, action: 'retry' | 'backlog' | 'continue', workerLabel?: string, ): Promise<ReassignTicketResult>
 
 /**
  * Master pauses one In progress/running card (taskboard_pause): the
