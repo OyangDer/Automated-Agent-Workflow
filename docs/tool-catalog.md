@@ -1369,7 +1369,7 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
     },
     "filesScope": {
       "type": "string",
-      "description": "Declared file scope: the paths (files or directories) this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards."
+      "description": "Declared file scope: the ABSOLUTE paths (files or directories, e.g. \"C:/repo/packages/x/src\") this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards; it also locates the card's repo, so a scope written only as relative paths makes the dispatch fall back to the master cwd (V3-33)."
     }
   },
   "required": [

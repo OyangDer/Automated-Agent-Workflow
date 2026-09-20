@@ -701,7 +701,10 @@ describe('service dispatch preflight (V3-20)', () => {
     const dev = masterAgent('dev-agent-a', repo)
     ctx.agents.register(dev)
     await service.claimMaster('default', dev)
-    const ticket = await createNotStarted(service, dev, 'clean repo card', 'src/a.ts')
+    // V3-33: the scope must be absolute to locate the repo, so this card's
+    // scope names the mapped repo explicitly instead of relying on the cwd.
+    const scope = join(repo, 'src', 'a.ts')
+    const ticket = await createNotStarted(service, dev, 'clean repo card', scope)
     const result = await service.assign(dev, ticket.id)
     expect(result.worker).toBe('spawned')
     expect(result.workerAgentId).toBe('worker-child-agent')
@@ -715,7 +718,7 @@ describe('service dispatch preflight (V3-20)', () => {
     expect(prompt).toContain('base/candidate relationship: equal')
     expect(prompt).toContain('SAFE')
     // The raw facts travel with the ticket's own scope, not just a flag.
-    expect(prompt).toContain('declared file scope: src/a.ts')
+    expect(prompt).toContain('declared file scope: ' + scope)
   })
 
   it('fails closed when the master cwd maps to no configured repo', async () => {
@@ -771,10 +774,10 @@ describe('service dispatch preflight (V3-20)', () => {
     const dev = masterAgent('dev-agent-a', repo)
     ctx.agents.register(dev)
     await service.claimMaster('default', dev)
-    const first = await createNotStarted(service, dev, 'first card', 'src/components')
+    const first = await createNotStarted(service, dev, 'first card', join(repo, 'src', 'components'))
     const firstResult = await service.assign(dev, first.id)
     expect(firstResult.worker).toBe('spawned')
-    const second = await createNotStarted(service, dev, 'second card', 'src/components/button.tsx')
+    const second = await createNotStarted(service, dev, 'second card', join(repo, 'src', 'components', 'button.tsx'))
     const secondResult = await service.assign(dev, second.id)
     expect(secondResult.worker).toBe('failed')
     expect(secondResult.ticket.status).toBe('blocked')
@@ -790,12 +793,12 @@ describe('service dispatch preflight (V3-20)', () => {
     await service.claimMaster('default', dev)
     await service.claimMaster('alpha', dev)
     const otherBoard = await service.createRemote(dev, {
-      title: 'other board card', description: '', priority: 'normal', dependsOn: [], filesScope: 'src/components', boardId: 'alpha',
+      title: 'other board card', description: '', priority: 'normal', dependsOn: [], filesScope: join(repo, 'src', 'components'), boardId: 'alpha',
     })
     await service.moveAsMaster(dev, { ticketId: otherBoard.id, column: 'not_started', beforeTicketId: null, afterTicketId: null })
     const otherResult = await service.assign(dev, otherBoard.id)
     expect(otherResult.worker).toBe('spawned')
-    const ticket = await createNotStarted(service, dev, 'default card', 'src/components')
+    const ticket = await createNotStarted(service, dev, 'default card', join(repo, 'src', 'components'))
     const result = await service.assign(dev, ticket.id)
     expect(result.worker).toBe('spawned')
     expect(subagentsStart).toHaveBeenCalledTimes(2)
@@ -809,12 +812,12 @@ describe('service dispatch preflight (V3-20)', () => {
     await service.claimMaster('default', dev)
     // Dirty repo blocks the first card (In progress, status blocked).
     await writeFile(join(repo, 'dirty.txt'), 'x\n')
-    const first = await createNotStarted(service, dev, 'first card', 'src/components')
+    const first = await createNotStarted(service, dev, 'first card', join(repo, 'src', 'components'))
     const blocked = await service.assign(dev, first.id)
     expect(blocked.ticket.status).toBe('blocked')
     // Clean the repo; the blocked card is not running, so no scope conflict.
     await rm(join(repo, 'dirty.txt'))
-    const second = await createNotStarted(service, dev, 'second card', 'src/components')
+    const second = await createNotStarted(service, dev, 'second card', join(repo, 'src', 'components'))
     const result = await service.assign(dev, second.id)
     expect(result.worker).toBe('spawned')
     expect(subagentsStart).toHaveBeenCalledTimes(1)
@@ -849,7 +852,7 @@ describe('service dispatch preflight (V3-20)', () => {
     const dev = masterAgent('dev-agent-a', repo)
     ctx.agents.register(dev)
     await service.claimMaster('default', dev)
-    const ticket = await createNotStarted(service, dev, 'retry card', 'src/a.ts')
+    const ticket = await createNotStarted(service, dev, 'retry card', join(repo, 'src', 'a.ts'))
     const first = await service.assign(dev, ticket.id)
     expect(first.worker).toBe('spawned')
     // The tree is now dirty; a master retry must fail closed, no worker.
@@ -1090,5 +1093,73 @@ describe('service dispatch preflight (V3-20)', () => {
     const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
     expect(prompt).toContain('dirty files: (none)')
     expect(prompt).toContain('SAFE')
+  })
+
+  it('names the cwd fallback when the scope carries no absolute entry (V3-33)', async () => {
+    const repo = await createRepo()
+    const { ctx, service, subagentsStart } = await harness({ preflightRepos: { [repo]: { canonicalBranch: 'main' } } })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    // Every entry is relative, so locatePreflightRepo skips all of them and the
+    // repo comes from the mapped master cwd: the card never chose its repo.
+    const ticket = await createNotStarted(service, dev, 'relative scope card', 'packages/x/src; scripts/')
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('failed')
+    expect(result.ticket.status).toBe('blocked')
+    const reason = result.ticket.failure?.reason ?? ''
+    expect(reason).toContain('preflight blocked')
+    expect(reason).toContain('declares only relative path(s) and no absolute entry')
+    expect(reason).toContain('falling back to the master cwd "' + repo + '"')
+    expect(reason).toContain('declare absolute filesScope paths')
+    expect(subagentsStart).not.toHaveBeenCalled()
+  })
+
+  it('names the relative-scope cwd fallback in facts-only mode without blocking (V3-33)', async () => {
+    const repo = await createRepo()
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: { [repo]: { canonicalBranch: 'main', enforce: false } },
+    })
+    const dev = masterAgent('dev-agent-a', repo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    const ticket = await createNotStarted(service, dev, 'relative facts-only card', 'packages/x/src')
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    expect(result.ticket.status).toBe('running')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    // enforce:false keeps the dispatch alive, but the fallback is still named
+    // where the operator and the worker both read it.
+    expect(prompt).toContain('VIOLATED')
+    expect(prompt).toContain('declares only relative path(s) and no absolute entry')
+    expect(prompt).toContain('falling back to the master cwd "' + repo + '"')
+    expect(prompt).toContain('declared file scope: packages/x/src')
+  })
+
+  it('never warns while an absolute scope entry still chooses the repo (V3-33)', async () => {
+    const cwdRepo = await createRepo()
+    const scopeRepo = await createRepo()
+    const head = git(scopeRepo, ['rev-parse', 'HEAD'])
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: {
+        [cwdRepo]: { canonicalBranch: 'main' },
+        [scopeRepo]: { canonicalBranch: 'main' },
+      },
+    })
+    const dev = masterAgent('dev-agent-a', cwdRepo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    // A relative entry rides alongside the absolute one: the absolute entry
+    // still chooses the repo, and no cwd-fallback warning is raised.
+    const ticket = await createNotStarted(service, dev, 'mixed scope card', 'packages/relative; ' + join(scopeRepo, 'src', 'a.ts'))
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    expect(prompt).toContain('canonical base: main @ ' + head)
+    expect(prompt).toContain('SAFE')
+    expect(prompt).not.toContain('declares only relative path(s)')
+    expect(prompt).not.toContain('falling back to the master cwd')
   })
 })

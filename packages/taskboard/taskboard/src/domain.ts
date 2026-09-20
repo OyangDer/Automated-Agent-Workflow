@@ -712,7 +712,7 @@ export const MASTER_SECTION = [
   '',
   '# File-scope declarations (filesScope)',
   '',
-  '- Every card carries a filesScope field (\'\' by default): the paths (files or directories) the card affects. Declare it when creating or editing a card — during planning you and the user agree on which files the work touches.',
+  '- Every card carries a filesScope field (\'\' by default): the ABSOLUTE paths (files or directories, e.g. "C:/repo/packages/x/src") the card affects. Declare it when creating or editing a card — during planning you and the user agree on which files the work touches.',
   '- When dispatching with taskboard_assign, read the filesScope of every In-flight and Not started card before starting new workers: two workers whose scopes overlap must not run in parallel (serialize them or tighten the scopes), and a card whose scope depends on another card\'s output is a soft dependency — order it after that card even without a dependsOn edge.',
   '- When a card has no filesScope declared, ask the user or record one before dispatching so parallel safety is judged on facts, not guesses.',
   '',

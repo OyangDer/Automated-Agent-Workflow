@@ -2978,7 +2978,9 @@ export class TaskboardService extends TypertRemoteService {
    * match; a relative entry names nothing on its own and is skipped). Only
    * when no entry lands anywhere does the master cwd fall back to the
    * pre-V3-26 resolution, so a master started from an unmapped directory no
-   * longer rejects cards whose declared scope is governed.
+   * longer rejects cards whose declared scope is governed. When that fallback
+   * is what located the repo, the caller names it in the report rather than
+   * letting the card masquerade as scope-located (V3-33).
    * @param filesScope - the card's declared file scope.
    * @param cwd - the master session cwd, used only as a fallback.
    * @returns the matched root + contract, or null when neither the scope nor the cwd locates a repo.
@@ -3020,7 +3022,10 @@ export class TaskboardService extends TypertRemoteService {
    * cwd is only the fallback. Returns null when preflight is not enabled (no
    * configured repos — legacy dispatch path); otherwise always a report, and
    * a safe=false report carries the concrete violations the caller must fail
-   * the dispatch with (fail closed).
+   * the dispatch with (fail closed). A filesScope that is non-empty yet
+   * carries no absolute entry is named as a violation whenever the cwd
+   * fallback is what located the repo (V3-33), so the fallback is never
+   * silent.
    * @param ticket - the card being dispatched.
    * @param agent - the master session agent (its cwd is the fallback workspace repo).
    * @returns the preflight outcome, or null when preflight is disabled.
@@ -3029,6 +3034,11 @@ export class TaskboardService extends TypertRemoteService {
     if (Object.keys(this.resolved.preflightRepos).length === 0) return null
     const cwd = agent.session.header.cwd
     const filesScope = ticket.filesScope
+    const scopeEntries = parseFilesScope(filesScope)
+    // V3-33: only absolute entries locate a repo on their own; a scope that is
+    // non-empty yet carries no absolute entry is satisfied entirely by the cwd
+    // fallback below, which is named in the report instead of passing silently.
+    const locatedByCwdOnly = scopeEntries.length > 0 && !scopeEntries.some(entry => isAbsolute(entry))
     const located = this.locatePreflightRepo(filesScope, cwd)
     const inFlightScopes = await this.inFlightScopes(ticket)
     if (located === null) {
@@ -3036,7 +3046,7 @@ export class TaskboardService extends TypertRemoteService {
       const cwdLabel = typeof cwd === 'string' && cwd !== '' ? cwd : '(none)'
       // The miss is named side by side so the operator knows which declaration
       // to fix: an unlocatable filesScope, an unmapped cwd, or both.
-      const violation = parseFilesScope(filesScope).length === 0
+      const violation = scopeEntries.length === 0
         ? 'no repo mapping for ticket "' + ticket.id + '": the card declares no filesScope to locate its repo, and the master cwd "'
           + cwdLabel + '" is not inside any configured preflight repo root (fail closed)'
         : 'no repo mapping for ticket "' + ticket.id + '": neither the declared filesScope "'
@@ -3061,8 +3071,22 @@ export class TaskboardService extends TypertRemoteService {
         enforce: true,
       }
     }
+    const report = runPreflight(located.repoRoot, located.config, filesScope, inFlightScopes)
+    // V3-33: the cwd fallback landed on a mapped repo, but the card's own scope
+    // located nothing — the repo the worker is sent to was chosen by the master
+    // session's cwd, not by the card. That is a silent misassignment whenever
+    // the two disagree, so the report names it (fail loud; enforce:false still
+    // spawns the worker with the warning inlined into its prompt).
+    if (locatedByCwdOnly) {
+      report.violations.push(
+        'filesScope "' + filesScope + '" of ticket "' + ticket.id + '" declares only relative path(s) and no absolute entry, '
+        + 'so the repo was located by falling back to the master cwd "' + (typeof cwd === 'string' && cwd !== '' ? cwd : '(none)')
+        + '" instead of from the card; declare absolute filesScope paths so the card, not the dispatch cwd, chooses the repo',
+      )
+      report.safe = false
+    }
     return {
-      report: runPreflight(located.repoRoot, located.config, filesScope, inFlightScopes),
+      report,
       enforce: located.config.enforce !== false,
     }
   }
@@ -4976,7 +5000,7 @@ export class TaskboardService extends TypertRemoteService {
         },
         filesScope: {
           type: 'string' as const,
-          description: 'Declared file scope: the paths (files or directories) this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards.',
+          description: 'Declared file scope: the ABSOLUTE paths (files or directories, e.g. "C:/repo/packages/x/src") this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards; it also locates the card\'s repo, so a scope written only as relative paths makes the dispatch fall back to the master cwd (V3-33).',
         },
       },
       output: {
