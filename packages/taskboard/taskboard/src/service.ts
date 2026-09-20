@@ -4600,12 +4600,14 @@ export class TaskboardService extends TypertRemoteService {
         render: (_args, value: { id: string }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' updated' }],
       },
       execute: async (args: { ticketId: string; title?: string; description?: string; devNotes?: string; filesScope?: string }, exec) => {
-        const value = await this.updateTicket(TaskboardService.agentOf(exec), args.ticketId, {
-          title: args.title,
-          description: args.description,
-          devNotes: args.devNotes,
-          filesScope: args.filesScope,
-        })
+        // exactOptionalPropertyTypes: assemble the patch so an omitted field stays
+        // omitted instead of being passed as an explicit undefined
+        const patch: { title?: string; description?: string; devNotes?: string; filesScope?: string } = {}
+        if (args.title !== undefined) patch.title = args.title
+        if (args.description !== undefined) patch.description = args.description
+        if (args.devNotes !== undefined) patch.devNotes = args.devNotes
+        if (args.filesScope !== undefined) patch.filesScope = args.filesScope
+        const value = await this.updateTicket(TaskboardService.agentOf(exec), args.ticketId, patch)
         return { id: value.id, title: value.title, column: value.column }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Update taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),
