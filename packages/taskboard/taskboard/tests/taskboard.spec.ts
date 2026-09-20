@@ -129,6 +129,12 @@ function fakeSessionPersistence() {
       if (log === undefined) throw new Error('session "' + id + '" has no persisted log')
       return { meta: { id }, events: [...log] }
     }),
+    // The canonical durable-existence probe (V3-34): undefined when the session
+    // holds no stored record at all, a snapshot otherwise.
+    stat: vi.fn(async (id: string) => {
+      const log = stored.get(id)
+      return log === undefined ? undefined : { header: { id }, revision: 'rev', eventCount: log.length }
+    }),
   }
 }
 
@@ -1947,7 +1953,10 @@ describe('TaskboardService workflow', () => {
   it('appends masterHistory on claim and transfer for the hierarchy tree', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
-      const { service, devA, devB, unregisterDevB } = await harness()
+      const persistence = fakeSessionPersistence()
+      // The transferred master has a stored session record: the seat follows it.
+      persistence.stored.set('dev-agent-b', [])
+      const { service, devA, devB, unregisterDevB } = await harness({ sessionPersistence: persistence })
       const claimed = await service.claimMaster('default', devA)
       expect(claimed.masterHistory).toHaveLength(1)
       expect(claimed.masterHistory![0]).toMatchObject({ fromAgentId: null, toAgentId: devA.id, notes: '' })
@@ -1958,8 +1967,11 @@ describe('TaskboardService workflow', () => {
         fromAgentId: devA.id, toAgentId: devB.id, notes: 'handing over the board',
       })
       // A lost-holder preemption records the displaced master as the source:
-      // liveness — not a clock — takes the seat back (V3-25).
+      // only a session gone for good (out of the live registry *and* with no
+      // stored record) is lost — liveness, not a clock, takes the seat back
+      // (V3-25/V3-34).
       unregisterDevB()
+      persistence.stored.delete('dev-agent-b')
       const preempted = await service.claimMaster('default', devA)
       expect(preempted.masterHistory).toHaveLength(3)
       expect(preempted.masterHistory![2]).toMatchObject({ fromAgentId: devB.id, toAgentId: devA.id })
@@ -3505,11 +3517,12 @@ it('never reports a wall-clock master lease on a board row (V3-25)', async () =>
   }
 })
 
-it('releases the master seat when the holder session leaves the registry (V3-25)', async () => {
-  const { service, devA, unregisterMaster } = await harness()
+it('releases the master seat only when the holder session is gone from the registry and the store (V3-25/V3-34)', async () => {
+  // An empty session store: the holder session has no stored record at all.
+  const { service, devA, unregisterMaster } = await harness({ sessionPersistence: fakeSessionPersistence() })
   await service.claimMaster('default', devA)
-  // The holding session vanishes from the live agent registry (host restart):
-  // the same survival signal the worker lost path uses.
+  // The holding session leaves the live agent registry (host restart) and its
+  // record is gone too: only then is the seat actually lost.
   unregisterMaster()
   expect(await service.reconcileMasterSeats()).toBe(1)
   const row = (await service.listBoards(devA)).find(candidate => candidate.boardId === 'default')!
@@ -3531,6 +3544,73 @@ it('releases the master seat when the holder session leaves the registry (V3-25)
   expect(await service.reconcileMasterSeats()).toBe(0)
 })
 
+it('keeps the master seat while the unregistered holder session still has a stored record (V3-34)', async () => {
+  const persistence = fakeSessionPersistence()
+  // The holder session has a durable record in the session store.
+  persistence.stored.set('dev-agent-a', [])
+  const { service, devA, devB, unregisterMaster } = await harness({ sessionPersistence: persistence })
+  await service.claimMaster('default', devA)
+  // The host restarts (or idles the session out of the live registry) but the
+  // stored session log survives: seat ownership follows the session, so the
+  // seat is kept and the "master keeps dropping after a restart" fault is gone.
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(0)
+  let row = (await service.listBoards(devB)).find(candidate => candidate.boardId === 'default')!
+  expect(row.masterAgentId).toBe(devA.id)
+  // A rival master still hits the held seat, not a silent takeover.
+  await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+  row = (await service.listBoards(devB)).find(candidate => candidate.boardId === 'default')!
+  expect(row.masterAgentId).toBe(devA.id)
+  // Only deleting the stored session record proves the session is gone for
+  // good: now the pass releases the seat, appends one master-history row and
+  // lands one master-released notice.
+  persistence.stored.delete('dev-agent-a')
+  expect(await service.reconcileMasterSeats()).toBe(1)
+  row = (await service.listBoards(devB)).find(candidate => candidate.boardId === 'default')!
+  expect(row.masterAgentId).toBeNull()
+  const history = row.masterHistory ?? []
+  expect(history).toHaveLength(2)
+  expect(history[1]).toMatchObject({ fromAgentId: devA.id, toAgentId: '' })
+  expect(history[1]!.notes).toContain('seat released')
+  expect(history[1]!.notes).toContain('registry')
+  expect(row.notices!).toHaveLength(1)
+  expect(row.notices![0]).toMatchObject({ kind: 'master-released', ticketId: '' })
+  expect(row.notices![0]!.text).toContain('MASTER_SEAT_RELEASED')
+  expect(row.notices![0]!.text).toContain(devA.id)
+})
+
+it('fails closed and keeps the seat when the store cannot answer existence (V3-34)', async () => {
+  // A persistence seam without the existence probe cannot prove the session is
+  // gone; releasing on that uncertainty is exactly the reported fault.
+  const { service, devA, devB, unregisterMaster } = await harness({
+    sessionPersistence: { append: vi.fn(), inspect: vi.fn() } as never,
+  })
+  await service.claimMaster('default', devA)
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(0)
+  await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+})
+
+it('fails closed and keeps the seat when no session store is configured at all (V3-34)', async () => {
+  // No session-persistence seam: the existence question cannot be answered, so
+  // the seat is kept (registry absence alone is no longer proof of death).
+  const { service, devA, devB, unregisterMaster } = await harness()
+  await service.claimMaster('default', devA)
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(0)
+  await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+})
+
+it('fails closed and keeps the seat when the existence probe faults (V3-34)', async () => {
+  const persistence = fakeSessionPersistence()
+  persistence.stat.mockRejectedValue(new Error('storage exploded'))
+  const { service, devA, devB, unregisterMaster } = await harness({ sessionPersistence: persistence })
+  await service.claimMaster('default', devA)
+  unregisterMaster()
+  expect(await service.reconcileMasterSeats()).toBe(0)
+  await expect(service.claimMaster('default', devB)).rejects.toMatchObject({ code: 'TASKBOARD_MASTER_HELD' })
+})
+
 it('never releases a live master seat by elapsed time (V3-25)', async () => {
   vi.useFakeTimers({ toFake: ['Date'] })
   try {
@@ -3549,8 +3629,8 @@ it('never releases a live master seat by elapsed time (V3-25)', async () => {
   }
 })
 
-it('keeps a registered but silent master seat, releasing it only when the session leaves the registry (V3-32)', async () => {
-  const { ctx, service, devA, devB, unregisterMaster } = await harness()
+it('keeps a registered but silent master seat, releasing it only when the session is gone from registry and store (V3-32/V3-34)', async () => {
+  const { ctx, service, devA, devB, unregisterMaster } = await harness({ sessionPersistence: fakeSessionPersistence() })
   await service.claimMaster('default', devA)
   // Stand in a session under the holder id whose event log is silent well past
   // the former 15-minute arm: a registered session is alive, so the seat must
@@ -3579,7 +3659,7 @@ it('keeps a registered but silent master seat, releasing it only when the sessio
 })
 
 it('still hands the structured takeover snapshot to the successor after a liveness release (V3-25)', async () => {
-  const { ctx, service, devA, devB, unregisterMaster } = await harness()
+  const { ctx, service, devA, devB, unregisterMaster } = await harness({ sessionPersistence: fakeSessionPersistence() })
   await service.claimMaster('default', devA)
   const planned = await createTicket(service, 'planned card')
   const running = await createTicket(service, 'running card')

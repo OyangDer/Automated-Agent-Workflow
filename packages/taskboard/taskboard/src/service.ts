@@ -206,6 +206,12 @@ interface SessionInspectionLike {
 interface SessionPersistenceLike {
   append(id: SessionId, events: readonly unknown[]): Promise<void>
   inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspectionLike>
+  /**
+   * The backend's canonical durable-existence probe (V3-34): the stored-session
+   * snapshot, or undefined when the session holds no stored record at all.
+   * Optional because the (older) inbox-delivery seam never needed it.
+   */
+  stat?(id: SessionId, signal?: AbortSignal): Promise<unknown>
 }
 
 /** One durable agent-inbox mutation in the shape the session log stores. */
@@ -1654,20 +1660,38 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Judge one master seat's holder liveness (V3-25): true when the holding
-   * session is absent from the live agent registry (restart / hard death) —
-   * the worker "lost" survival signal reused verbatim. There is no clock
-   * here (V3-32): an idle but registered master still holds the seat, so
-   * time and silence alone never take it. Without a registry the judgment
-   * fails closed
-   * (the seat counts as held).
+   * Judge one master seat's holder liveness (V3-25, re-judged by V3-34): true
+   * only when the holding session is gone for good — absent from the live
+   * agent registry *and* holding no record in the session store. A session the
+   * host merely unloaded from its live registry (a host restart, idle
+   * eviction) still has its stored session log, so it keeps the seat and
+   * resumes its work on its next turn; only a session that was deleted or
+   * cleaned up loses the seat. Seat ownership follows the *session*, not the
+   * process and not a clock (V3-32 keeps the wall-clock arm deleted): an idle
+   * registered master still holds the seat however silent it is.
+   *
+   * The stored-record probe is the host's own session persistence — the
+   * canonical "does this session exist" query (stat/session-reference shape),
+   * never a clock, a poll, or a cache of our own. The judgment fails closed
+   * (the seat counts as held) without a registry, without a persistence seam
+   * able to answer the existence question, or when the probe itself faults —
+   * none of those can prove the record is gone.
    * @param sessionId - the seat holder's session id.
-   * @returns whether the holder session is gone.
+   * @returns whether the holder session is gone for good.
    */
-  private masterSeatLost(sessionId: string): boolean {
+  private async masterSeatLost(sessionId: string): Promise<boolean> {
     const registry = this.agentRegistry()
     if (registry === undefined) return false
-    return registry.get(sessionId) === undefined
+    // A registered session is alive, whatever the store says.
+    if (registry.get(sessionId) !== undefined) return false
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined || typeof persistence.stat !== 'function') return false
+    try {
+      return await persistence.stat(sessionId as SessionId) === undefined
+    } catch {
+      // A storage fault cannot prove the record is gone: fail closed.
+      return false
+    }
   }
 
   /**
@@ -2047,14 +2071,16 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * One master-seat liveness pass (V3-25, revised by V3-32): every board whose
-   * seat names a session that is not alive is released, reusing the worker
-   * "lost" survival signal. A master session absent from the live agent
-   * registry (restart / hard death) is always released immediately — there
-   * are no ghost seats, and that registry-absence judgment is the only one.
-   * A registered holder keeps the seat however long it stays silent: silence
-   * is not death, and a master that ends its turn after dispatching and waits
-   * for a notice must not be evicted for it.
+   * One master-seat liveness pass (V3-25, revised by V3-32 and V3-34): every
+   * board whose seat names a session that is gone for good is released. Seat
+   * ownership follows the session, not the process: a holder merely absent
+   * from the live agent registry (host restart, idle eviction) but still
+   * carrying a stored session record keeps the seat and is never released —
+   * the reported "master keeps dropping" fault. Only a holder that has left
+   * the registry *and* has no stored record (the session was deleted or
+   * cleaned up) is released. A registered holder keeps the seat however long
+   * it stays silent: silence is not death, and a master that ends its turn
+   * after dispatching and waits for a notice must not be evicted for it.
    *
    * A release changes seat ownership only: in-flight cards keep their workers
    * and reviewers untouched, and no card is ever re-dispatched by this pass.
@@ -2075,10 +2101,13 @@ export class TaskboardService extends TypertRemoteService {
     for (const [boardId, board] of table.entries()) {
       const holder = board.masterAgentId
       if (holder === null) continue
-      // Only registry absence releases a seat (V3-32): a registered holder is
-      // alive however silent it is, so no elapsed-time judgment runs here.
-      if (!this.masterSeatLost(holder)) continue
-      const reason = 'holder session absent from the agent registry'
+      // Only a session that is gone for good releases a seat (V3-34): the
+      // holder must be absent from the live registry *and* have no stored
+      // session record. A registered holder is alive however silent it is, and
+      // an unregistered one still holding its stored log is merely unloaded —
+      // neither is judged by elapsed time (V3-32).
+      if (!await this.masterSeatLost(holder)) continue
+      const reason = 'holder session absent from the agent registry and from the session store'
       if (await this.releaseLostMasterSeat(boardId, holder, reason)) released += 1
     }
     return released
@@ -2634,14 +2663,22 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Claim the master seat of one board. V3-25: the seat is no longer leased by
-   * a wall clock — a seat whose holder session is absent from the live agent
-   * registry (the worker "lost" survival signal: an unregistered session is
-   * gone, an idle one is still alive) is released here so the successor takes
-   * it immediately, and the release leaves a masterHistory row plus a durable
-   * board notice the claimant reads back from this claim. A board the caller
-   * cannot see is denied as not found (no existence leak), so the master seat
-   * of a foreign session-private board cannot be seized.
+   * Claim the master seat of one board. V3-25/V3-34: the seat is no longer
+   * leased by a wall clock and no longer follows the process either — only a
+   * holder session that is gone for good (absent from the live agent registry
+   * *and* holding no stored session record) is preempted here, so the
+   * successor takes a genuinely vacant seat immediately; a holder the host
+   * merely restarted or unloaded still owns it. A preemption leaves a
+   * masterHistory row plus a durable board notice the claimant reads back from
+   * this claim. A board the caller cannot see is denied as not found (no
+   * existence leak), so the master seat of a foreign session-private board
+   * cannot be seized.
+   *
+   * The liveness judgment runs before the (synchronous) board updater because
+   * the stored-record probe is asynchronous; the updater then re-checks that
+   * the judged holder is still the one on the row, and a seat that changed
+   * hands in between fails closed as held rather than preempted on stale
+   * evidence.
    * @param boardId - the board to claim.
    * @param agent - the claiming session agent.
    * @returns the board with its fresh master.
@@ -2650,14 +2687,19 @@ export class TaskboardService extends TypertRemoteService {
     await this.assertBoardAccessible(boardId, agent)
     await this.ensureMasterBoard(boardId, agent)
     const now = Date.now()
+    const incumbent = (await this.boards()).get(boardId)?.masterAgentId ?? null
+    const incumbentLost = incumbent !== null && incumbent !== agent.id
+      ? await this.masterSeatLost(incumbent)
+      : false
     let lostHolder: string | null = null
     const board = await this.mutateBoard(boardId, (current) => {
       if (current.masterAgentId !== null && current.masterAgentId !== agent.id) {
-        // No clock governs the seat: a holder that is still alive keeps it no
-        // matter how long it has been held; only a holder session that left
-        // the registry is lost and may be preempted. Without the registry the
-        // liveness cannot be judged, and the seat fails closed (held).
-        if (!this.masterSeatLost(current.masterAgentId)) {
+        // No clock governs the seat: a holder whose session still exists keeps
+        // it no matter how long it has been held. Only a holder that is gone
+        // from both the live registry and the session store is lost and may be
+        // preempted; an unjudgeable seat (or a row that changed since the
+        // judgment) fails closed as held.
+        if (current.masterAgentId !== incumbent || !incumbentLost) {
           throw new TaskboardError(
             'board "' + boardId + '" master seat is held by ' + current.masterAgentId,
             'TASKBOARD_MASTER_HELD',
@@ -2673,7 +2715,7 @@ export class TaskboardService extends TypertRemoteService {
         at: now,
         notes: lostHolder === null
           ? ''
-          : 'preempted a lost seat: holder session ' + lostHolder + ' is absent from the agent registry',
+          : 'preempted a lost seat: holder session ' + lostHolder + ' is absent from the agent registry and from the session store',
       }
       return {
         ...current,
@@ -2686,7 +2728,7 @@ export class TaskboardService extends TypertRemoteService {
     if (lostHolder === null) return board
     // Durable release trace for the successor: recorded on the board so the
     // claim result (and taskboard_notices) carries it back.
-    await this.recordMasterRelease(boardId, lostHolder, 'holder session absent from the agent registry')
+    await this.recordMasterRelease(boardId, lostHolder, 'holder session absent from the agent registry and from the session store')
     return (await this.boards()).get(boardId) ?? board
   }
 

@@ -206,9 +206,10 @@ export interface BoardView {
   masterClaimedAt: number | null
   /**
    * Retired V3-25 wall-clock lease expiry. The master seat has no time lease
-   * any more: it is held while the holder session is alive and released by
-   * liveness (V3-32: only the session leaving the agent registry releases it;
-   * silence alone never does) or handed over explicitly. The host now always
+   * any more: it follows the holder session and is released by liveness
+   * (V3-32/V3-34: only a session that has left the agent registry *and* holds
+   * no stored session record releases it; silence alone never does) or handed
+   * over explicitly. The host now always
    * reports null here; the field is kept on the wire so older clients keep
    * decoding a board row.
    */
