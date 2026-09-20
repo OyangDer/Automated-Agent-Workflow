@@ -49,7 +49,8 @@ taskboard:
   reconcileIntervalMs: 60000   # seat self-healing scan interval (0 disables the periodic scan)
   lostWorkerTimeoutMs: 600000  # idle-staleness: registered worker with no activity this long is judged lost (10 min)
   workerAutoRetryLimit: 2      # per-card automatic worker redispatch cap before the card is blocked
-  reviewerStaleTimeoutMs: 900000  # In testing seat without a verdict this long is released (15 min)
+  reviewerStaleTimeoutMs: 900000  # registered-but-idle In testing seat without a verdict this long is released (15 min)
+  reviewerAutoRetryLimit: 2    # per-card automatic reviewer re-review cap before the card is blocked
 ```
 
 思考强度采用 deepseek 档位词汇（`off` | `high` | `max`）；无法识别的值回退为缺省（由子会话模型的适配器默认决定）。reviewer 的模型/思考强度缺省时沿 worker 的对应配置。看板级覆盖由 master 通过 `taskboard_board_config` 写入（看板记录上的 `modelConfig` 字段）；若派发 provider 未声明 `effort` 子代理能力，则只带模型、省略思考强度，并在卡片历史记录一条 `model-effort-downgrade` 降级记录，而不是让派发失败。`masterModel`/`masterEffort` 仅为信息性配置：master 会话自身的模型与思考强度始终为准，这两个值会写进 master 系统提示词段落，作为新会话的建议预设。
@@ -70,7 +71,7 @@ master 与用户一起规划需求——每个达成一致的需求都会落成 
 看板会自动修复卡死或失联的席位，避免卡片无声悬挂：
 
 - **worker 存活判定**：启动扫描 + 周期扫描（`reconcileIntervalMs`）判定每一张 In progress/running 卡片。worker 会话不在 live agent 注册表中即判失联（重启/硬死亡）；已注册但空闲且超过 `lostWorkerTimeoutMs` 无会话活动则判卡死。失联 worker 会被自动重派——新 worker 从保留的工作树继续（卡片描述会附加"续做勿回滚"标注，新 worker 不会回滚）——每卡最多 `workerAutoRetryLimit` 次；超过上限卡片标 blocked 并通知 master；恢复动作都会写入卡片历史。
-- **reviewer 失联释放**：对 In testing 且已占审核席位但尚无结论的卡片同样扫描。reviewer 会话不在注册表即为幽灵席位，立即释放；已注册但空闲、审核超过 `reviewerStaleTimeoutMs` 无结论则判卡死并释放席位。有 live master 时自动重派新 reviewer；否则席位保持空缺供 `taskboard_claim_review` 认领。
+- **reviewer 存活与陈旧判定**：对 In testing 且已占审核席位但尚无结论的卡片同样扫描，并与 master 席位共用同一套会话存活判据（V3-43）：只有当持有者会话彻底消失——既不在 live agent 注册表、会话存储里也没有记录——才释放席位；report 模式 reviewer 本就是常驻会话存储（ready、非 live）的 durable 子会话，注册表缺席并不等于死亡。**已注册**但空闲、审核超过 `reviewerStaleTimeoutMs` 无结论则判卡死并释放席位。有 live master 时自动重派新 reviewer，每卡最多 `reviewerAutoRetryLimit` 次；超过上限则把卡片标 blocked、写明原因并通知 master，而不是无限重派。没有 live master 时席位保持空缺供 `taskboard_claim_review` 认领。
 - 恢复动作防重入（每次失联每卡只恢复一次），与 worker run 结算回调共存去重（二者只有一个生效），通知故障不会阻断恢复。
 
 <a id="model-experience"></a>

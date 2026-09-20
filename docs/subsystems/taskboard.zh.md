@@ -76,7 +76,7 @@ interface TaskboardChanged {
 
 [`TaskboardService`](../../packages/taskboard/taskboard/src/service.ts) 执行工作流转换（仅 master 领取归属、依赖门控、指定审核员权限、驳回返修）、通过存储域持久化每条记录、在工单进入 In testing 时经子代理接口派出审核子代理，并注入 `taskboard:workflow` 系统提示词段落，向每个会话传授仅 master 领卡的规则（worker/reviewer 通过 `taskboard_assign` / `taskboard_reassign` 获得卡片）与不得自审自卡的规则。
 
-席位自愈通道（`reconcileLostWorkers` + `reconcileStaleReviewers`，启动时与配置的周期扫描运行）闭合失联席位闭环：worker 会话不在 live agent 注册表立即判失联，已注册但空闲且超过 `lostWorkerTimeoutMs` 无活动判卡死，reviewer 席位超过 `reviewerStaleTimeoutMs` 仍无结论（或会话已消失）则释放。失联 worker 每卡最多自动重派 `workerAutoRetryLimit` 次——卡片描述会附加"续做勿回滚"标注，让新 worker 从保留的工作树继续——预算耗尽后卡片标 blocked 并通知 master。所有恢复动作防重入（每次失联每卡只恢复一次）、与 worker run 结算回调共存去重（二者只有一个生效）、写入卡片历史，且通知故障不会阻断恢复。
+席位自愈通道（`reconcileLostWorkers` + `reconcileStaleReviewers`，启动时与配置的周期扫描运行）闭合失联席位闭环：worker 会话不在 live agent 注册表立即判失联，已注册但空闲且超过 `lostWorkerTimeoutMs` 无活动判卡死，reviewer 席位超过 `reviewerStaleTimeoutMs` 仍无结论则按陈旧语义释放。reviewer 的存活判据不再是旧的"只看注册表"（V3-43）：两个席位共用同一套判据——只有当持有者会话彻底消失（既不在 live agent 注册表、会话存储里也没有记录）才释放——因为 report 模式 reviewer 本就是常驻会话存储、而非 live 注册表的 durable 子会话；把这个正常状态判成死亡正是 V3-42 的释放/重派循环（5 小时 324 次），如今该循环还由每卡 `reviewerAutoRetryLimit` 上限兜底，超过上限卡片标 blocked 并通知 master。失联 worker 每卡最多自动重派 `workerAutoRetryLimit` 次——卡片描述会附加"续做勿回滚"标注，让新 worker 从保留的工作树继续——预算耗尽后卡片标 blocked 并通知 master。所有恢复动作防重入（每次失联每卡只恢复一次）、与 worker run 结算回调共存去重（二者只有一个生效）、写入卡片历史，且通知故障不会阻断恢复。
 
 ## 席位与交接
 
@@ -195,17 +195,30 @@ async reconcileLostWorkers(): Promise<number>
 
 /**
  * One reviewer-staleness reconciliation pass: every In testing card that
- * still has a review seat but no reviewOutcome is checked against the live
- * agent registry and the review-start clock:
- * - a reviewer session absent from the registry is a ghost seat and is
- *   released immediately (no ghost seats, per the spec);
- * - a reviewer that is registered but idle — no running tool — with the
+ * still has a review seat but no reviewOutcome is judged by the *shared*
+ * session-liveness rule (V3-43, {@link sessionHoldsSeat} — the same judgment
+ * the master seat uses) plus the review-start clock:
+ * - the seat is lost only when the holder session is gone for good — absent
+ *   from the live agent registry *and* holding no stored session record.
+ *   Registry absence alone releases nothing: a report-mode reviewer is a
+ *   durable continuable child that normally lives in the session store
+ *   (ready) rather than the live registry, and the old registry-only reading
+ *   of that normal state as death was the V3-42 release/redispatch loop;
+ * - a reviewer that is *registered* but idle — no running tool — with the
  *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
- *   the seat is released.
+ *   the seat is released. Staleness never applies to a holder that is only
+ *   stored (there is no live session to judge idle).
  * On release the card history gets one 'review-release' row, the master is
  * notified, and a fresh reviewer is auto-redispatched when a live master
  * session exists to spawn from; otherwise the seat is left vacant so
  * taskboard_claim_review can take it.
+ *
+ * Loop brake (V3-43): the release/redispatch cycle is capped per card at
+ * reviewerAutoRetryLimit, mirroring the worker's workerAutoRetryLimit. Once
+ * the budget is spent the seat is still released, but instead of spawning
+ * yet another reviewer the card is blocked with the concrete reason and a
+ * master notice — so no future liveness fault can turn into an unbounded
+ * release/redispatch loop.
  *
  * Reentry-safe: the guarded mutate only releases a seat that still names
  * the same reviewer and is still In testing without an outcome, so a card

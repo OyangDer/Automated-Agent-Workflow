@@ -232,6 +232,8 @@ interface HarnessOptions {
   workerAutoRetryLimit?: number
   /** Reviewer-staleness timeout passed to the plugin (defaults to 900000). */
   reviewerStaleTimeoutMs?: number
+  /** Per-card reviewer re-review cap passed to the plugin (defaults to 2). */
+  reviewerAutoRetryLimit?: number
   /** When set, a fake session-persistence seam (append/inspect) is provided to the service. */
   sessionPersistence?: ReturnType<typeof fakeSessionPersistence>
   /**
@@ -363,6 +365,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     ...(options.lostWorkerTimeoutMs === undefined ? {} : { lostWorkerTimeoutMs: options.lostWorkerTimeoutMs }),
     ...(options.workerAutoRetryLimit === undefined ? {} : { workerAutoRetryLimit: options.workerAutoRetryLimit }),
     ...(options.reviewerStaleTimeoutMs === undefined ? {} : { reviewerStaleTimeoutMs: options.reviewerStaleTimeoutMs }),
+    ...(options.reviewerAutoRetryLimit === undefined ? {} : { reviewerAutoRetryLimit: options.reviewerAutoRetryLimit }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -1087,7 +1090,11 @@ describe('TaskboardService workflow', () => {
   })
 
   it('releases a ghost reviewer seat and auto-redispatches a fresh reviewer', async () => {
-    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness()
+    // V3-43: the seat is released only when the session is gone for good —
+    // absent from the registry AND with no stored record (an empty store here).
+    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness({
+      sessionPersistence: fakeSessionPersistence(),
+    })
     await service.claimMaster('default', devA)
     const followup = vi.spyOn(devA, 'followup')
     const card = await createTicket(service, 'ghost review card')
@@ -1095,7 +1102,7 @@ describe('TaskboardService workflow', () => {
     await service.assign(devA, card.id)
     await service.report(workerChild, card.id, 'implemented')
     expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
-    // The reviewer session vanishes: the seat is a ghost and must be released.
+    // The reviewer session vanishes from the registry and the store: released.
     unregisterReviewer()
     expect(await service.reconcileStaleReviewers()).toBe(1)
     const current = await service.viewTicket(card.id)
@@ -1108,7 +1115,9 @@ describe('TaskboardService workflow', () => {
   })
 
   it('leaves the seat vacant for claim_review when no live master exists to re-review', async () => {
-    const { service, devA, workerChild, unregisterReviewer, unregisterMaster } = await harness()
+    const { service, devA, workerChild, unregisterReviewer, unregisterMaster } = await harness({
+      sessionPersistence: fakeSessionPersistence(),
+    })
     await service.claimMaster('default', devA)
     const card = await createTicket(service, 'no master re-review card')
     await scheduleToNotStarted(service, devA, card)
@@ -1148,6 +1157,120 @@ describe('TaskboardService workflow', () => {
     expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
     // The fresh reviewer (same stub id) is re-attached by the auto-redispatch.
     expect(released.reviewer).not.toBeNull()
+  })
+
+  it('keeps a reviewer seat whose session left the registry but still holds a stored record (V3-43)', async () => {
+    // The V3-42 accident in one test: a report-mode reviewer is a durable
+    // continuable child, so sitting only in the session store (registry
+    // absent, "ready") is its NORMAL state. The old registry-only judgment
+    // read that as death, released the seat and respawned a reviewer on every
+    // reconcile tick — 324 cycles over 5 hours. Before the V3-43 fix this test
+    // is RED: reconcileStaleReviewers returns 1 and a review-release row lands.
+    const persistence = fakeSessionPersistence()
+    persistence.stored.set('reviewer-child-agent', [])
+    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness({ sessionPersistence: persistence })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'durable reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
+    // The reviewer session leaves the live registry (host restart or idle
+    // eviction), but its stored session log survives.
+    unregisterReviewer()
+    const noticesAfterReport = followup.mock.calls.length
+    expect(await service.reconcileStaleReviewers()).toBe(0)
+    let current = await service.viewTicket(card.id)
+    expect(current.reviewer?.agentId).toBe(reviewerChild.id)
+    expect(current.history.some(row => row.kind === 'review-release')).toBe(false)
+    // Repeated ticks keep the seat: no release, no respawn, no notice.
+    for (let pass = 0; pass < 4; pass += 1) {
+      expect(await service.reconcileStaleReviewers()).toBe(0)
+    }
+    current = await service.viewTicket(card.id)
+    expect(current.reviewer?.agentId).toBe(reviewerChild.id)
+    expect(current.reviewerRetries).toBe(0)
+    expect(followup.mock.calls.length).toBe(noticesAfterReport)
+  })
+
+  it('fails closed and keeps a registry-absent reviewer seat when no session store is configured (V3-43)', async () => {
+    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'storeless reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    // The existence question cannot be answered without a store seam, and
+    // uncertainty is never proof of death: the seat stays with its holder.
+    expect(await service.reconcileStaleReviewers()).toBe(0)
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
+  })
+
+  it('fails closed and keeps a registry-absent reviewer seat when the existence probe faults (V3-43)', async () => {
+    const persistence = fakeSessionPersistence()
+    persistence.stat.mockRejectedValue(new Error('storage exploded'))
+    const { service, devA, workerChild, reviewerChild, unregisterReviewer } = await harness({ sessionPersistence: persistence })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'faulty store reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    // A storage fault cannot prove the record is gone: fail closed as held.
+    expect(await service.reconcileStaleReviewers()).toBe(0)
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
+  })
+
+  it('stops auto-redispatching reviewers once the per-card cap is exhausted (V3-43)', async () => {
+    // An empty session store: every released seat is genuinely gone, so the
+    // reconcile keeps judging seat loss — the environment that turned the
+    // V3-42 liveness fault into an unbounded loop. The per-card cap is the
+    // brake: after reviewerAutoRetryLimit redispatches the card is blocked
+    // for the master instead of receiving yet another fresh reviewer.
+    const { service, devA, workerChild, unregisterReviewer } = await harness({
+      sessionPersistence: fakeSessionPersistence(),
+      reviewerAutoRetryLimit: 2,
+      noticeDedupeWindowMs: 0,
+    })
+    await service.claimMaster('default', devA)
+    const followup = vi.spyOn(devA, 'followup')
+    const card = await createTicket(service, 'reviewer budget card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    // The first two losses are auto-redispatched (the harness reseats the same
+    // reviewer stub id, which never rejoins the live registry).
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    let current = await service.viewTicket(card.id)
+    expect(current.reviewerRetries).toBe(1)
+    expect(current.reviewer).not.toBeNull()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    current = await service.viewTicket(card.id)
+    expect(current.reviewerRetries).toBe(2)
+    expect(current.reviewer).not.toBeNull()
+    // The third loss spends the budget: the seat is still released, but the
+    // card is blocked with the concrete reason and no fresh reviewer is
+    // spawned.
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    current = await service.viewTicket(card.id)
+    expect(current.reviewer).toBeNull()
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toContain('cap 2')
+    expect(textOf(followup.mock.calls.at(-1)![0] as { content: { type: string; text: string }[] })).toContain('cap 2')
+    // The brake holds: no seat is left to judge, so the loop cannot restart.
+    expect(await service.reconcileStaleReviewers()).toBe(0)
+    expect((await service.viewTicket(card.id)).status).toBe('blocked')
+    // The master's recovery path is intact: a deliberate re-review re-seats a
+    // reviewer, clears the block and starts a fresh per-card budget.
+    await service.requestReviewRemote(devA, { ticketId: card.id })
+    current = await service.viewTicket(card.id)
+    expect(current.reviewer).not.toBeNull()
+    expect(current.status).toBe('claimed')
+    expect(current.failure).toBeNull()
+    expect(current.reviewerRetries).toBe(0)
   })
 
   it('reconciles In testing ghost seats on restart alongside running workers', async () => {
@@ -1199,7 +1322,8 @@ describe('TaskboardService workflow', () => {
         },
       }, null, 2),
     )
-    const { service } = await harness({ root })
+    // An empty session store: the ghost reviewer has no stored record either.
+    const { service } = await harness({ root, sessionPersistence: fakeSessionPersistence() })
     // The startup pass releases the ghost review seat (no live reviewer) and
     // re-review is attempted through the live master.
     await vi.waitFor(async () => {

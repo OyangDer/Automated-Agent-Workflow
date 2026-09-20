@@ -107,6 +107,17 @@ export interface TicketView {
    * redispatched again.
    */
   autoRetries: number
+  /**
+   * Automatic reviewer redispatch attempts for this card (V3-43 loop brake):
+   * every time the reviewer-staleness reconciliation releases this card's seat
+   * and auto-redispatches a fresh reviewer, this counter increments. When it
+   * reaches the configured reviewerAutoRetryLimit the seat is still released
+   * but the card is blocked with the reason instead of getting yet another
+   * reviewer; a deliberate reseat (a fresh worker completion, a master
+   * request, a manual claim) resets it to 0. Absent on records written before
+   * the field existed and read back as 0.
+   */
+  reviewerRetries?: number | undefined
   createdAt: number
   updatedAt: number
   /** Sort key inside a column; lower sorts first. */

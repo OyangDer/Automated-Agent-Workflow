@@ -68,6 +68,10 @@ const ticketSchema = zod.object({
   workerSessionId: zod.string().optional(),
   failure: zod.object({ reason: zod.string(), at: zod.number() }).nullable().default(null),
   autoRetries: zod.number().int().min(0).default(0),
+  // V3-43: per-card automatic reviewer redispatch attempts (the reviewer
+  // analogue of autoRetries); absent on records written before the field
+  // existed and read back as 0.
+  reviewerRetries: zod.number().int().min(0).default(0),
   createdAt: zod.number(),
   updatedAt: zod.number(),
   position: zod.number(),
@@ -329,10 +333,25 @@ export interface Config {
    * How long an In testing card may sit with a reviewer seat and no
    * reviewOutcome before the reviewer-staleness reconciliation releases the
    * seat and auto-redispatches a fresh reviewer (0 disables reviewer
-   * staleness; a reviewer session absent from the registry is always
-   * released immediately). Defaults to 900000 (15 minutes).
+   * staleness). Staleness is narrower than liveness (V3-43): it only judges
+   * the idle-staleness arm — a *registered* reviewer that is not running and
+   * has no verdict past this timeout. Registry absence alone never releases
+   * the seat: the reviewer seat follows its holder session exactly like the
+   * master seat, so a report-mode reviewer that lives in the session store
+   * (ready, not live) keeps it. Defaults to 900000 (15 minutes).
    */
   reviewerStaleTimeoutMs?: number
+  /**
+   * Per-card automatic reviewer redispatch cap (V3-43): how many times the
+   * reviewer-staleness reconciliation may release one card's seat and
+   * auto-redispatch a fresh reviewer before giving up and blocking the card
+   * with a master notice naming the reason (0 disables reviewer
+   * auto-redispatch: the first judged seat loss blocks the card). Mirrors
+   * workerAutoRetryLimit and is the loop brake that keeps any future
+   * seat-liveness fault from becoming an unbounded release/redispatch loop.
+   * Defaults to 2.
+   */
+  reviewerAutoRetryLimit?: number
   /**
    * V3-20/V3-26: per-repo deterministic preflight contracts, keyed by
    * absolute repo root path. When non-empty, every assign/retry dispatch
@@ -366,6 +385,7 @@ export const Config: z<Config> = z.object({
   lostWorkerTimeoutMs: z.number().default(600000),
   workerAutoRetryLimit: z.number().default(2),
   reviewerStaleTimeoutMs: z.number().default(900000),
+  reviewerAutoRetryLimit: z.number().default(2),
   preflightRepos: z.dict(z.object({
     canonicalBranch: z.string(),
     canonicalCommit: z.string(),
@@ -529,6 +549,14 @@ function resolveReviewerStaleTimeout(value: number): number {
   return value
 }
 
+/** Validate one explicit per-card reviewer re-review cap (0 disables auto-redispatch). */
+function resolveReviewerAutoRetryLimit(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error('taskboard: reviewerAutoRetryLimit must be a non-negative safe integer')
+  }
+  return value
+}
+
 /** Column ids as a runtime set for cheap membership checks. */
 const COLUMN_SET: ReadonlySet<string> = new Set(TASKBOARD_COLUMNS)
 
@@ -607,6 +635,7 @@ export class TaskboardService extends TypertRemoteService {
     lostWorkerTimeoutMs: number
     workerAutoRetryLimit: number
     reviewerStaleTimeoutMs: number
+    reviewerAutoRetryLimit: number
     /** V3-20: normalized per-repo preflight contracts keyed by absolute repo root. */
     preflightRepos: Record<string, RepoPreflightConfig>
   }
@@ -673,6 +702,7 @@ export class TaskboardService extends TypertRemoteService {
       lostWorkerTimeoutMs: resolveLostWorkerTimeout(config.lostWorkerTimeoutMs ?? 600000),
       workerAutoRetryLimit: resolveWorkerAutoRetryLimit(config.workerAutoRetryLimit ?? 2),
       reviewerStaleTimeoutMs: resolveReviewerStaleTimeout(config.reviewerStaleTimeoutMs ?? 900000),
+      reviewerAutoRetryLimit: resolveReviewerAutoRetryLimit(config.reviewerAutoRetryLimit ?? 2),
       preflightRepos,
     }
     if (config.workerEffort !== undefined && this.resolved.workerEffort === undefined) {
@@ -1684,37 +1714,43 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
-   * Judge one master seat's holder liveness (V3-25, re-judged by V3-34): true
-   * only when the holding session is gone for good — absent from the live
-   * agent registry *and* holding no record in the session store. A session the
+   * Judge whether one session still holds its seat — the single liveness
+   * judgment shared by the master seat and the reviewer seat (V3-43): a seat
+   * is held while its holder session exists anywhere. (1) A session present in
+   * the live agent registry is alive, whatever the store says. (2) Otherwise
+   * the host's own session persistence is the authority — the canonical "does
+   * this session exist" query (stat/session-reference shape), never a clock, a
+   * poll, or a cache of our own — and only a definite `undefined` answer
+   * proves the record is gone, i.e. the session was deleted or cleaned up.
+   *
+   * Registry absence is therefore never a release on its own: a session the
    * host merely unloaded from its live registry (a host restart, idle
    * eviction) still has its stored session log, so it keeps the seat and
-   * resumes its work on its next turn; only a session that was deleted or
-   * cleaned up loses the seat. Seat ownership follows the *session*, not the
-   * process and not a clock (V3-32 keeps the wall-clock arm deleted): an idle
-   * registered master still holds the seat however silent it is.
+   * resumes its work on its next turn. That includes a report-mode reviewer,
+   * which is a durable continuable child normally sitting in the session store
+   * rather than the live registry — judging that normal state as death was the
+   * V3-42 release/redispatch loop. Seat ownership follows the *session*, not
+   * the process and not a clock (V3-32 keeps the wall-clock arm deleted): an
+   * idle registered holder still keeps the seat however silent it is.
    *
-   * The stored-record probe is the host's own session persistence — the
-   * canonical "does this session exist" query (stat/session-reference shape),
-   * never a clock, a poll, or a cache of our own. The judgment fails closed
-   * (the seat counts as held) without a registry, without a persistence seam
-   * able to answer the existence question, or when the probe itself faults —
-   * none of those can prove the record is gone.
+   * The judgment fails closed (the seat counts as held) without a registry,
+   * without a persistence seam able to answer the existence question, or when
+   * the probe itself faults — none of those can prove the record is gone.
    * @param sessionId - the seat holder's session id.
-   * @returns whether the holder session is gone for good.
+   * @returns whether the holder session still exists (true keeps the seat).
    */
-  private async masterSeatLost(sessionId: string): Promise<boolean> {
+  private async sessionHoldsSeat(sessionId: string): Promise<boolean> {
     const registry = this.agentRegistry()
-    if (registry === undefined) return false
+    if (registry === undefined) return true
     // A registered session is alive, whatever the store says.
-    if (registry.get(sessionId) !== undefined) return false
+    if (registry.get(sessionId) !== undefined) return true
     const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-    if (persistence === undefined || typeof persistence.stat !== 'function') return false
+    if (persistence === undefined || typeof persistence.stat !== 'function') return true
     try {
-      return await persistence.stat(sessionId as SessionId) === undefined
+      return await persistence.stat(sessionId as SessionId) !== undefined
     } catch {
       // A storage fault cannot prove the record is gone: fail closed.
-      return false
+      return true
     }
   }
 
@@ -2006,17 +2042,30 @@ export class TaskboardService extends TypertRemoteService {
 
   /**
    * One reviewer-staleness reconciliation pass: every In testing card that
-   * still has a review seat but no reviewOutcome is checked against the live
-   * agent registry and the review-start clock:
-   * - a reviewer session absent from the registry is a ghost seat and is
-   *   released immediately (no ghost seats, per the spec);
-   * - a reviewer that is registered but idle — no running tool — with the
+   * still has a review seat but no reviewOutcome is judged by the *shared*
+   * session-liveness rule (V3-43, {@link sessionHoldsSeat} — the same judgment
+   * the master seat uses) plus the review-start clock:
+   * - the seat is lost only when the holder session is gone for good — absent
+   *   from the live agent registry *and* holding no stored session record.
+   *   Registry absence alone releases nothing: a report-mode reviewer is a
+   *   durable continuable child that normally lives in the session store
+   *   (ready) rather than the live registry, and the old registry-only reading
+   *   of that normal state as death was the V3-42 release/redispatch loop;
+   * - a reviewer that is *registered* but idle — no running tool — with the
    *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
-   *   the seat is released.
+   *   the seat is released. Staleness never applies to a holder that is only
+   *   stored (there is no live session to judge idle).
    * On release the card history gets one 'review-release' row, the master is
    * notified, and a fresh reviewer is auto-redispatched when a live master
    * session exists to spawn from; otherwise the seat is left vacant so
    * taskboard_claim_review can take it.
+   *
+   * Loop brake (V3-43): the release/redispatch cycle is capped per card at
+   * reviewerAutoRetryLimit, mirroring the worker's workerAutoRetryLimit. Once
+   * the budget is spent the seat is still released, but instead of spawning
+   * yet another reviewer the card is blocked with the concrete reason and a
+   * master notice — so no future liveness fault can turn into an unbounded
+   * release/redispatch loop.
    *
    * Reentry-safe: the guarded mutate only releases a seat that still names
    * the same reviewer and is still In testing without an outcome, so a card
@@ -2033,15 +2082,40 @@ export class TaskboardService extends TypertRemoteService {
       if (ticket.reviewOutcome !== null) continue
       const seatedReviewer = ticket.reviewer
       const reviewerAgent = registry.get(seatedReviewer.agentId)
-      const ghost = reviewerAgent === undefined
-      const stale = !ghost && this.resolved.reviewerStaleTimeoutMs > 0
+      // V3-43: one liveness judgment for both seats. The seat is lost only
+      // when the holder session is gone for good (registry absent *and* no
+      // stored session record); a report-mode reviewer sitting in the store is
+      // held, not a ghost.
+      const seatLost = !await this.sessionHoldsSeat(seatedReviewer.agentId)
+      // Staleness stays narrower than liveness: only a *registered* holder can
+      // be judged stuck, and only by the idle-staleness arm.
+      const stale = !seatLost && reviewerAgent !== undefined
+        && this.resolved.reviewerStaleTimeoutMs > 0
         && reviewerAgent.status !== 'running'
         && Date.now() - TaskboardService.lastActivityOf(reviewerAgent) > this.resolved.reviewerStaleTimeoutMs
-      if (!ghost && !stale) continue
+      if (!seatLost && !stale) continue
+      // Loop brake (V3-43): mirror the worker's workerAutoRetryLimit. Once the
+      // per-card budget of automatic reviewer redispatches is spent the seat is
+      // still released, but the card is blocked for the master instead of
+      // receiving yet another fresh reviewer.
+      const cap = this.resolved.reviewerAutoRetryLimit
+      const used = ticket.reviewerRetries ?? 0
+      const exhausted = used >= cap
+      // A fresh reviewer needs a live master session as its parent; without
+      // one the released seat stays vacant for taskboard_claim_review.
+      const board = (await this.boards()).get(ticket.boardId)
+      const masterId = board?.masterAgentId
+      const master = masterId === undefined || masterId === null ? undefined : registry.get(masterId)
+      const redispatches = !exhausted && master !== undefined
+      const capReason = 'reviewer seat lost after ' + used + ' automatic re-review attempts (cap '
+        + cap + '); awaiting the master'
+      const releaseDetail = seatLost
+        ? 'review seat released: reviewer session lost'
+        : 'review seat released: reviewer stale'
       let marked = false
       let next: TicketView
       try {
-        next = await this.mutate(ticket.id, 'review-release', (current) => {
+        next = await this.mutate(ticket.id, exhausted ? 'fail' : 'review-release', (current) => {
           if (current.column !== 'in_testing' || current.reviewer === null) return current
           if (current.reviewer.agentId !== seatedReviewer.agentId) return current
           if (current.reviewOutcome !== null) return current
@@ -2050,10 +2124,14 @@ export class TaskboardService extends TypertRemoteService {
             {
               ...current,
               reviewer: null,
+              ...(redispatches ? { reviewerRetries: used + 1 } : {}),
+              ...(exhausted
+                ? { status: 'blocked' as TicketWorkerStatus, failure: { reason: capReason, at: Date.now() } }
+                : {}),
               updatedAt: Date.now(),
             },
-            'review-release',
-            ghost ? 'review seat released: reviewer session lost' : 'review seat released: reviewer stale',
+            exhausted ? 'fail' : 'review-release',
+            exhausted ? capReason : releaseDetail,
           )
         })
       } catch {
@@ -2062,20 +2140,36 @@ export class TaskboardService extends TypertRemoteService {
       }
       if (!marked) continue
       released += 1
-      // Auto-redispatch a fresh reviewer through a live master session, so
-      // the review continues without waiting for claim_review; when no master
-      // is live the seat stays vacant for taskboard_claim_review.
+      if (exhausted) {
+        await this.notifyMaster(next.boardId,
+          'Taskboard notice: ' + formatCompactEvent('REVIEWER_RELEASED', {
+            ticket: next.id,
+            title: next.title,
+            state: compactCardState(next),
+            scope: next.filesScope,
+            blocker: capReason,
+            anomaly: 'review seat released: reviewer ' + (seatLost ? 'session is gone' : 'was idle without a verdict for too long')
+              + '; automatic re-review budget exhausted (cap ' + cap + ') — the card is blocked awaiting the master'
+              + '; re-review from the board (request review) or taskboard_claim_review',
+          }),
+          NOTICE_KIND.reviewerReleased, next.id)
+        continue
+      }
+      // Auto-redispatch a fresh reviewer through the live master session, so
+      // the review continues without waiting for claim_review.
       const releasedTicket = next
-      const board = (await this.boards()).get(releasedTicket.boardId)
-      const masterId = board?.masterAgentId
-      const master = masterId === undefined || masterId === null ? undefined : registry.get(masterId)
       let reseated = false
       if (master !== undefined) {
         const spawn = await this.spawnReviewer(master, releasedTicket).catch(
           () => ({ spawned: false, reason: 'failed' as const, errorMessage: 'reconcile reviewer spawn threw' }) as ReviewSpawnResult,
         )
         if (spawn.spawned) {
-          const withReviewer = await this.attachReviewer(releasedTicket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started (auto after release)')
+          // resetRetries false: this redispatch is exactly what the per-card
+          // budget counts, so the release increment above must survive.
+          const withReviewer = await this.attachReviewer(
+            releasedTicket.id, spawn.reviewer,
+            'reviewer ' + spawn.reviewer.label + ' started (auto after release)', false,
+          )
           reseated = withReviewer.reviewer !== null
           this.trackReviewerRun(releasedTicket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
         }
@@ -2086,7 +2180,7 @@ export class TaskboardService extends TypertRemoteService {
           title: next.title,
           state: compactCardState(next),
           scope: next.filesScope,
-          anomaly: 'review seat released: reviewer ' + (ghost ? 'session is gone' : 'was idle without a verdict for too long')
+          anomaly: 'review seat released: reviewer ' + (seatLost ? 'session is gone' : 'was idle without a verdict for too long')
             + (reseated ? '; fresh reviewer auto-redispatched' : '; seat vacant — use taskboard_claim_review'),
         }),
         NOTICE_KIND.reviewerReleased, next.id)
@@ -2125,12 +2219,13 @@ export class TaskboardService extends TypertRemoteService {
     for (const [boardId, board] of table.entries()) {
       const holder = board.masterAgentId
       if (holder === null) continue
-      // Only a session that is gone for good releases a seat (V3-34): the
-      // holder must be absent from the live registry *and* have no stored
-      // session record. A registered holder is alive however silent it is, and
-      // an unregistered one still holding its stored log is merely unloaded —
-      // neither is judged by elapsed time (V3-32).
-      if (!await this.masterSeatLost(holder)) continue
+      // Only a session that is gone for good releases a seat (V3-34, via the
+      // shared V3-43 judgment): the holder must be absent from the live
+      // registry *and* have no stored session record. A registered holder is
+      // alive however silent it is, and an unregistered one still holding its
+      // stored log is merely unloaded — neither is judged by elapsed time
+      // (V3-32).
+      if (await this.sessionHoldsSeat(holder)) continue
       const reason = 'holder session absent from the agent registry and from the session store'
       if (await this.releaseLostMasterSeat(boardId, holder, reason)) released += 1
     }
@@ -2196,15 +2291,42 @@ export class TaskboardService extends TypertRemoteService {
     await this.notifyMaster(boardId, text, NOTICE_KIND.masterReleased, '')
   }
 
-  /** Attach the designated reviewer to an In testing ticket. */
+  /**
+   * Attach the designated reviewer to an In testing ticket.
+   * @param ticketId - the In testing card to seat.
+   * @param reviewer - the reviewer identity taking the seat.
+   * @param detail - the 'review-claim' history detail.
+   * @param resetRetries - V3-43: clear the card's automatic reviewer
+   *   redispatch budget (default true — a deliberate reseat starts a fresh
+   *   review round: a worker's completion/report, a master's request or a
+   *   manual claim). The reviewer-staleness reconciliation passes false so its
+   *   own release/redispatch budget keeps accumulating until the cap blocks
+   *   the card.
+   */
   private attachReviewer(
     ticketId: string,
     reviewer: TicketAssignee,
     detail: string,
+    resetRetries = true,
   ): Promise<TicketView> {
     const now = Date.now()
     return this.mutate(ticketId, 'review-claim', current => appendHistory(
-      { ...current, reviewer, updatedAt: now },
+      {
+        ...current,
+        reviewer,
+        ...(resetRetries
+          ? {
+            reviewerRetries: 0,
+            // A deliberate reseat also lifts the V3-43 cap block: a card
+            // blocked without a seat is waiting for exactly this, and it is
+            // under review again as soon as a reviewer holds the seat.
+            ...(current.column === 'in_testing' && current.status === 'blocked'
+              ? { status: 'claimed' as TicketWorkerStatus, failure: null }
+              : {}),
+          }
+          : {}),
+        updatedAt: now,
+      },
       'review-claim',
       detail,
       now,
@@ -2542,6 +2664,7 @@ export class TaskboardService extends TypertRemoteService {
       status: 'ready' as TicketWorkerStatus,
       failure: null,
       autoRetries: 0,
+      reviewerRetries: 0,
       createdAt: now,
       updatedAt: now,
       assignee: null,
@@ -2713,7 +2836,7 @@ export class TaskboardService extends TypertRemoteService {
     const now = Date.now()
     const incumbent = (await this.boards()).get(boardId)?.masterAgentId ?? null
     const incumbentLost = incumbent !== null && incumbent !== agent.id
-      ? await this.masterSeatLost(incumbent)
+      ? !await this.sessionHoldsSeat(incumbent)
       : false
     let lostHolder: string | null = null
     const board = await this.mutateBoard(boardId, (current) => {
@@ -3283,7 +3406,7 @@ export class TaskboardService extends TypertRemoteService {
         )
       }
       return appendHistory(
-        { ...current, column: 'in_testing', status: 'claimed', devNotes: notes, autoRetries: 0, updatedAt: Date.now() },
+        { ...current, column: 'in_testing', status: 'claimed', devNotes: notes, autoRetries: 0, reviewerRetries: 0, updatedAt: Date.now() },
         'report',
         'worker reported development done, waiting for review',
       )
@@ -3435,6 +3558,7 @@ export class TaskboardService extends TypertRemoteService {
           failure: null,
           reviewer: null,
           autoRetries: 0,
+          reviewerRetries: 0,
           updatedAt: Date.now(),
         }
         delete reset.workerAgentId
@@ -3458,7 +3582,7 @@ export class TaskboardService extends TypertRemoteService {
         )
       }
       return appendHistory(
-        { ...retried, status: 'running', failure: null, autoRetries: 0, updatedAt: Date.now() },
+        { ...retried, status: 'running', failure: null, autoRetries: 0, reviewerRetries: 0, updatedAt: Date.now() },
         'reassign',
         retried.status === 'paused'
           ? 're-dispatched by master (resumed from pause)'
@@ -3729,7 +3853,19 @@ export class TaskboardService extends TypertRemoteService {
       if (current.reviewer !== null) {
         throw new TaskboardError('ticket "' + current.id + '" already has a reviewer', 'TASKBOARD_REVIEWER_PRESENT')
       }
-      return appendHistory({ ...current, reviewer, updatedAt: Date.now() }, 'review-claim', 'review claimed by ' + label)
+      return appendHistory(
+        {
+          ...current,
+          reviewer,
+          reviewerRetries: 0,
+          // A manual claim on a V3-43 cap-blocked card lifts the block: the
+          // card is under review again as soon as a reviewer holds the seat.
+          ...(current.status === 'blocked' ? { status: 'claimed' as TicketWorkerStatus, failure: null } : {}),
+          updatedAt: Date.now(),
+        },
+        'review-claim',
+        'review claimed by ' + label,
+      )
     })
   }
 
@@ -3754,7 +3890,7 @@ export class TaskboardService extends TypertRemoteService {
         throw new TaskboardError('only the assignee may complete the ticket', 'TASKBOARD_NOT_OWNER')
       }
       return appendHistory(
-        { ...current, column: 'in_testing', devNotes: notes, autoRetries: 0, updatedAt: Date.now() },
+        { ...current, column: 'in_testing', devNotes: notes, autoRetries: 0, reviewerRetries: 0, updatedAt: Date.now() },
         'complete',
         'development done, waiting for review',
       )
@@ -3841,6 +3977,7 @@ export class TaskboardService extends TypertRemoteService {
           },
           reviewer: null,
           autoRetries: 0,
+          reviewerRetries: 0,
           updatedAt: Date.now(),
         },
         'reject',
@@ -3957,6 +4094,7 @@ export class TaskboardService extends TypertRemoteService {
           },
           reviewer: null,
           autoRetries: 0,
+          reviewerRetries: 0,
           updatedAt: Date.now(),
         },
         'reject',
