@@ -819,14 +819,14 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'Registry of independently owned top-level fields for official DeepSeek requests.',
     methods: [
       {
-        signature: 'register<K extends keyof DeepSeekLlmApiExtensionMap>( field: K, provider: DeepSeekLlmApiExtensionProvider<DeepSeekLlmApiExtensionMap[K]>, ): () => Promise<void>',
+        signature: 'register<K extends keyof DeepSeekLlmApiExtensionMap>( field: K, provider: DeepSeekLlmApiExtensionProvider<DeepSeekLlmApiExtensionMap[K]>, registration: DeepSeekLlmApiExtensionRegistration = {}, ): () => Promise<void>',
         description: 'Register the sole provider of one top-level request field. Registration is effect-scoped.',
-        parameters: [{ name: 'field', description: 'declaration-merged field owned by the provider.' }, { name: 'provider', description: 'request-time field preparation and optional acceptance behavior.' }],
+        parameters: [{ name: 'field', description: 'declaration-merged field owned by the provider.' }, { name: 'provider', description: 'request-time field preparation and optional acceptance behavior.' }, { name: 'registration', description: 'failure policy; `{ optional: true }` degrades a preparation failure to a warning.' }],
         returns: 'disposer that releases the field.',
       },
       {
         signature: 'async prepare(request: DeepSeekLlmApiExtensionRequest): Promise<PreparedDeepSeekLlmApiExtensions>',
-        description: 'Prepare every currently registered field from one immutable base request. Preparation failures reject before HTTP dispatch. Field values are cloned and frozen; providers retain no mutable alias to the outgoing request.',
+        description: 'Prepare every currently registered field from one immutable base request. A required field\'s preparation failure rejects before HTTP dispatch; an optional field\'s failure is logged and omitted while the remaining fields still go out. Field values are cloned and frozen; providers retain no mutable alias to the request.',
         parameters: [{ name: 'request', description: 'exact serialized request facts before extension fields.' }],
         returns: 'detached fields and their idempotent joint acceptance transaction.',
       },

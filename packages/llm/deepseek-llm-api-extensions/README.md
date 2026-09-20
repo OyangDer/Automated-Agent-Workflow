@@ -23,8 +23,8 @@ Provider-specific registry for additive top-level fields on official DeepSeek LL
 <a id="service"></a>
 ## Service
 
-- `register(field, provider)` reserves one field for the calling fiber. Duplicate or malformed names fail synchronously; disposing the registration releases it for a later provider.
-- `prepare(request)` snapshots the registered providers, prepares them concurrently, clones and freezes returned JSON values, and returns `{ fields, accept }`. A preparation failure rejects before HTTP dispatch; request cancellation stops awaiting providers even when one ignores its signal.
+- `register(field, provider, registration)` reserves one field for the calling fiber. Duplicate or malformed names fail synchronously; disposing the registration releases it for a later provider. The optional `registration` policy carries `optional: true`, which marks the field degradable instead of required.
+- `prepare(request)` snapshots the registered providers, prepares them concurrently, clones and freezes returned JSON values, and returns `{ fields, accept }`. A required preparation failure rejects before HTTP dispatch; an optional field's failure is logged with its cause and omitted while the remaining fields still go out. Request cancellation stops awaiting providers even when one ignores its signal.
 - `accept()` runs every captured post-2xx callback once. Concurrent calls join the same settlement, every callback settles before failures are reported, and several failures become one `AggregateError`.
 
 Each provider sees the exact serialized base body, the request `AbortSignal`, plus optional `sessionId` and auxiliary-call `purpose`. It must stop its own work promptly after cancellation and returns `undefined` when its field does not apply to that request. A prepared operation retains the providers it captured even if HMR removes their registrations before HTTP acceptance.

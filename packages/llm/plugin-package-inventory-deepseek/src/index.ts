@@ -57,9 +57,22 @@ function barePackageName(specifier: string): string | undefined {
   return first.startsWith('@') ? `${first}/${second}` : first
 }
 
+/** Render one thrown value as a single diagnostic line. */
+function describeThrown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /** Read one manifest identity, optionally treating an absent name as a loose-module marker. */
 function identityFromManifest(path: string, allowAnonymous: boolean): DeepSeekPluginPackageIdentity | undefined {
-  const manifest = JSON.parse(readFileSync(path, 'utf8')) as PackageManifest
+  let manifest: PackageManifest
+  try {
+    manifest = JSON.parse(readFileSync(path, 'utf8')) as PackageManifest
+  } catch (error: unknown) {
+    throw new Error(
+      `plugin-package-inventory-deepseek: cannot read package manifest ${JSON.stringify(path)}: ${describeThrown(error)}`,
+      { cause: error },
+    )
+  }
   if (allowAnonymous && manifest.name === undefined) return undefined
   if (typeof manifest.name !== 'string' || manifest.name.length === 0
     || typeof manifest.version !== 'string' || manifest.version.length === 0) {
@@ -114,7 +127,8 @@ class PackageIdentityResolver {
     if (packageName !== undefined) {
       manifest = barePackageManifest(packageName, anchors)
       if (manifest === undefined) {
-        throw new Error(`plugin-package-inventory-deepseek: cannot resolve active package ${JSON.stringify(packageName)}`)
+        throw new Error(`plugin-package-inventory-deepseek: cannot resolve active package ${JSON.stringify(packageName)}`
+          + ` from the Node package search paths anchored at ${JSON.stringify(anchors[0])}`)
       }
     } else if (!entry.options.name.startsWith('cordis:')) {
       const moduleUrl = isAbsolute(entry.options.name)
@@ -169,7 +183,17 @@ async function collectActivePluginPackages(
   }
   const unique = new Map<string, DeepSeekPluginPackageIdentity>()
   for (const activeEntry of entries) {
-    const identity = resolver.resolve(activeEntry)
+    let identity: DeepSeekPluginPackageIdentity | undefined
+    try {
+      identity = resolver.resolve(activeEntry)
+    } catch (error: unknown) {
+      // One unresolvable optional extension degrades to a visible warning: the rest of
+      // the inventory and the model request still go out, and a later install resumes
+      // injection because failures are never cached.
+      ctx.logger.warn(`plugin-package-inventory-deepseek: extension ${JSON.stringify(activeEntry.entry.options.name)}`
+        + ` is unavailable for this request: ${describeThrown(error)}`)
+      continue
+    }
     if (identity === undefined) continue
     unique.set(`${identity.name}\u0000${identity.version}`, identity)
   }
@@ -187,6 +211,8 @@ export function apply(ctx: Context, config: Config): void {
   if (config.enabled === false) return
   const hostBaseUrl = ctx.baseUrl ?? import.meta.url
   const resolver = new PackageIdentityResolver(hostBaseUrl)
+  // Diagnostic metadata only: an unexpected inventory failure degrades to a warning
+  // instead of failing every official DeepSeek request (see the per-entry fallback above).
   ctx.deepseekLlmApiExtensions.register('dsh_plugin_packages', {
     prepare: async (request) => {
       const value: DeepSeekPluginPackageInventoryExtension = {
@@ -195,5 +221,5 @@ export function apply(ctx: Context, config: Config): void {
       }
       return { value }
     },
-  })
+  }, { optional: true })
 }

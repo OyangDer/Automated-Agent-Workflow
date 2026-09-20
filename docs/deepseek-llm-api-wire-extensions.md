@@ -17,7 +17,7 @@ The adapter sends the additions to its resolved `baseURL`, including a configure
 
 Each body extension owns its `version` independently. A version applies only to the object that contains it; no compatibility or ordering relationship exists between versions of different fields. JSON member order is not part of the protocol.
 
-The [`DeepSeekLlmApiExtensionRegistry`](../packages/llm/deepseek-llm-api-extensions/README.md) reserves one provider per top-level extension name. Empty or whitespace-padded names, duplicate registrations, and collisions with the base DeepSeek request fail before HTTP dispatch.
+The [`DeepSeekLlmApiExtensionRegistry`](../packages/llm/deepseek-llm-api-extensions/README.md) reserves one provider per top-level extension name. Empty or whitespace-padded names, duplicate registrations, and collisions with the base DeepSeek request fail before HTTP dispatch. A provider registered as optional instead degrades its own preparation failure to a warning that names the field and the cause; that field is omitted for the request while the remaining fields still go out.
 
 ## Request headers
 
@@ -34,7 +34,7 @@ Credential failure happens before anonymous-user-id resolution, so an unauthoriz
 
 The adapter serializes the complete base body, including the exact `messages`, before it asks registered providers to prepare fields. A provider receives that immutable body, the request cancellation signal, and optional `sessionId` and auxiliary-call `purpose`. Returning `undefined` omits that provider's field for the request.
 
-Prepared JSON values are detached from provider-owned state, merged as top-level siblings of the base fields, and serialized in the same HTTP body. Preparation or collision failure prevents the request. A composition without the registry sends the unextended base body.
+Prepared JSON values are detached from provider-owned state, merged as top-level siblings of the base fields, and serialized in the same HTTP body. A required preparation failure or a field collision prevents the request; an optional provider's failure only omits its own field as described above. A composition without the registry sends the unextended base body.
 
 After the configured endpoint returns HTTP 2xx, the adapter runs the prepared `accept()` transaction before reading the SSE response body. Transport failures and non-2xx responses do not accept any contribution. An acceptance failure fails the model request even though the endpoint returned 2xx. Acceptance records endpoint-level HTTP success; it does not assert that an SSE stream completed or that the endpoint persisted an extension.
 
@@ -63,7 +63,7 @@ After the configured endpoint returns HTTP 2xx, the adapter runs the prepared `a
 | `packages[].name` | string | Exact non-empty npm package name from the owning manifest |
 | `packages[].version` | string | Exact non-empty package version from the same manifest |
 
-Every request re-reads active non-group Loader entries from the host tree and, when available for the request Session, its standing agent-preset tree. Relative and absolute modules use their nearest owning manifest; bare package entries follow the Loader resolution base that activated them. A named manifest without a non-empty version fails request preparation.
+Every request re-reads active non-group Loader entries from the host tree and, when available for the request Session, its standing agent-preset tree. Relative and absolute modules use their nearest owning manifest; bare package entries follow the Loader resolution base that activated them. A named manifest without a non-empty version, an unreadable manifest, or a bare package the Node package search paths cannot find makes only that package unavailable: it is left out of `packages`, and a warning names the entry and the failed resolution basis. The remaining packages and the model request proceed unchanged, and the next request after the package becomes resolvable includes it again.
 
 The sender deduplicates exact `(name, version)` pairs and sorts first by `name`, then by `version`, with a locale-independent text comparison. Simultaneously active versions of one package remain separate entries. Receivers must not collapse the array by package name or infer package activation from array order.
 

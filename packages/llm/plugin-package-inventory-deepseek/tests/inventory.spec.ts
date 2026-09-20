@@ -94,12 +94,35 @@ describe('DeepSeek plugin package inventory', () => {
     })
   })
 
-  it('fails request preparation for an active package with malformed identity metadata', async () => {
+  it('warns and omits an active package with malformed identity metadata', async () => {
     const { ctx, root } = await harness()
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
     const bad = await packagePlugin(root, 'bad', { name: 'bad' })
+    const good = await packagePlugin(root, 'good', { name: 'good', version: '1.0.0' })
     await ctx.loader.create({ name: bad })
-    await expect(ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL }))
-      .rejects.toThrow(/must declare non-empty name and version/)
+    await ctx.loader.create({ name: good })
+
+    const prepared = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL })
+    expect(prepared.fields.dsh_plugin_packages?.packages).toEqual([{ name: 'good', version: '1.0.0' }])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('must declare non-empty name and version')
+    expect(warnings[0]).toContain('bad/plugin.mjs')
+  })
+
+  it('warns and omits an active package whose manifest cannot be parsed', async () => {
+    const { ctx, root } = await harness()
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
+    await mkdir(join(root, 'broken'), { recursive: true })
+    await writeFile(join(root, 'broken/package.json'), '{ not json\n')
+    await writeFile(join(root, 'broken/plugin.mjs'), 'export default () => {}\n')
+    await ctx.loader.create({ name: './broken/plugin.mjs' })
+
+    const prepared = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL })
+    expect(prepared.fields.dsh_plugin_packages).toEqual({ version: 1, packages: [] })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('cannot read package manifest')
   })
 
   it('omits a loose ESM module whose nearest manifest only marks the module type', async () => {
@@ -158,15 +181,40 @@ describe('DeepSeek plugin package inventory', () => {
     ])
   })
 
-  it('fails when a Loader-resolved bare entry has no package manifest', async () => {
+  it('warns and omits a Loader-resolved bare entry with no package manifest', async () => {
     const { ctx } = await harness()
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
     ctx.loader.internal = {
       version: 'v2',
       import: async () => ({ default: () => {} }),
     } as unknown as NonNullable<typeof ctx.loader.internal>
     await ctx.loader.create({ name: 'missing-package' })
-    await expect(ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL }))
-      .rejects.toThrow(/cannot resolve active package/)
+
+    const prepared = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL })
+    expect(prepared.fields.dsh_plugin_packages).toEqual({ version: 1, packages: [] })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('missing-package')
+    expect(warnings[0]).toContain('cannot resolve active package')
+  })
+
+  it('resumes injecting an unresolvable package as soon as its manifest appears', async () => {
+    const { ctx, root } = await harness()
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
+    ctx.loader.internal = {
+      version: 'v2',
+      import: async () => ({ default: () => {} }),
+    } as unknown as NonNullable<typeof ctx.loader.internal>
+    await ctx.loader.create({ name: 'late-package' })
+
+    const before = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL })
+    expect(before.fields.dsh_plugin_packages?.packages).toEqual([])
+
+    await packagePlugin(root, 'node_modules/late-package', { name: 'late-package', version: '1.0.0' })
+    const after = await ctx.deepseekLlmApiExtensions.prepare({ body: { messages: [] }, signal: SIGNAL })
+    expect(after.fields.dsh_plugin_packages?.packages).toEqual([{ name: 'late-package', version: '1.0.0' }])
+    expect(warnings).toHaveLength(1)
   })
 
   it('supports a direct embedding whose context has no base URL', async () => {

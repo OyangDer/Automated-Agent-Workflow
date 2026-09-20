@@ -46,7 +46,14 @@ afterEach(async () => {
 })
 
 async function loadComposition(
-  options: { withDynamic: boolean; baseURL: string; reuseRoot?: string; enableSessionLog?: boolean },
+  options: {
+    withDynamic: boolean
+    baseURL: string
+    reuseRoot?: string
+    enableSessionLog?: boolean
+    /** Bare package the composition activates with no resolvable manifest, as V3-35's half-decoupled optional plugin. */
+    unresolvablePackage?: string
+  },
 ): Promise<{ ctx: Context; settingsPath: string; credentialsPath: string }> {
   // A reused root is the restart case: the same harness home, its documents
   // exactly as the previous process left them.
@@ -77,6 +84,12 @@ async function loadComposition(
       : [],
     '- id: plugin-package-inventory-deepseek',
     "  name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'",
+    ...options.unresolvablePackage === undefined
+      ? []
+      : [
+        '- id: unresolvable-optional-plugin',
+        `  name: '${options.unresolvablePackage}'`,
+      ],
     ...options.withDynamic
       ? [
         '- id: settings',
@@ -114,9 +127,15 @@ async function loadComposition(
     ['@deepseek-ai/dsh-credentials-local', LocalCredentialProvider],
     ['@deepseek-ai/dsh-llm-deepseek', LlmDeepSeek],
   ])
+  if (options.unresolvablePackage !== undefined) {
+    // The activation path succeeds, exactly as the real Loader did in V3-35,
+    // while Node package resolution has nothing to find for this name.
+    modules.set(options.unresolvablePackage, { default: () => {} })
+  }
   // The custom importer bypasses Node resolution; mirror the package manifests
   // a deployed cordis.yml has beside its declared dependencies.
-  await Promise.all([...modules.keys()].map(async (packageName) => {
+  const mirroredPackages = [...modules.keys()].filter(packageName => packageName !== options.unresolvablePackage)
+  await Promise.all(mirroredPackages.map(async (packageName) => {
     const packageDir = join(root!, 'node_modules', ...packageName.split('/'))
     await mkdir(packageDir, { recursive: true })
     await writeFile(join(packageDir, 'package.json'), `${JSON.stringify({
@@ -158,6 +177,35 @@ describe('llm-deepseek real dynamic composition', () => {
     ]))
     expect(request.dsh_plugin_packages.version).toBe(1)
     expect(SessionLogDeepSeek.acceptedThrough(session)).toBe(-1)
+  })
+
+  it('degrades one unresolvable optional plugin manifest to a warning and still sends the request', async () => {
+    // V3-35: the Loader still activates this plugin (the composition's importer map),
+    // while Node package resolution inside the inventory cannot find its manifest.
+    // That mismatch used to fail every model request before HTTP dispatch.
+    vi.stubEnv('DEEPSEEK_API_KEY', 'entry-key')
+    const server = await mockServer([{ kind: 'sse', events: textEvents }])
+    const { ctx } = await loadComposition({
+      withDynamic: false,
+      baseURL: server.url,
+      unresolvablePackage: '@example-ai/dsh-optional-plugin',
+    })
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
+    const session = ctx.sessions.create(SessionId('degraded-inventory'))
+    session.append('turn/start', { turn: 1 })
+
+    await assemble(ctx, { model: 'deepseek-v4-flash', messages: [], sessionId: session.id })
+
+    expect(server.requests).toHaveLength(1)
+    const request = server.requests[0] as { dsh_plugin_packages: { packages: Array<{ name: string }> } }
+    const names = request.dsh_plugin_packages.packages.map(entry => entry.name)
+    expect(names).toContain('@deepseek-ai/dsh-llm-deepseek')
+    expect(names).toContain('@deepseek-ai/dsh-session-log-deepseek')
+    expect(names).not.toContain('@example-ai/dsh-optional-plugin')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('@example-ai/dsh-optional-plugin')
+    expect(warnings[0]).toContain('cannot resolve active package')
   })
 
   it('sends the canonical session suffix when the Loader composition explicitly enables upload', async () => {

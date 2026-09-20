@@ -865,14 +865,16 @@ Registry of independently owned top-level fields for official DeepSeek requests.
  * Register the sole provider of one top-level request field. Registration is effect-scoped.
  * @param field - declaration-merged field owned by the provider.
  * @param provider - request-time field preparation and optional acceptance behavior.
+ * @param registration - failure policy; `{ optional: true }` degrades a preparation failure to a warning.
  * @returns disposer that releases the field.
  */
-register<K extends keyof DeepSeekLlmApiExtensionMap>( field: K, provider: DeepSeekLlmApiExtensionProvider<DeepSeekLlmApiExtensionMap[K]>, ): () => Promise<void>
+register<K extends keyof DeepSeekLlmApiExtensionMap>( field: K, provider: DeepSeekLlmApiExtensionProvider<DeepSeekLlmApiExtensionMap[K]>, registration: DeepSeekLlmApiExtensionRegistration = {}, ): () => Promise<void>
 
 /**
  * Prepare every currently registered field from one immutable base request.
- * Preparation failures reject before HTTP dispatch. Field values are cloned and frozen;
- * providers retain no mutable alias to the outgoing request.
+ * A required field's preparation failure rejects before HTTP dispatch; an optional
+ * field's failure is logged and omitted while the remaining fields still go out.
+ * Field values are cloned and frozen; providers retain no mutable alias to the request.
  * @param request - exact serialized request facts before extension fields.
  * @returns detached fields and their idempotent joint acceptance transaction.
  */

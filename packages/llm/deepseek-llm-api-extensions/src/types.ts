@@ -35,6 +35,19 @@ export interface PreparedDeepSeekLlmApiExtension<T extends DeepSeekLlmApiJson> {
   accept?(): void | Promise<void>
 }
 
+/**
+ * Registration policy for one extension field.
+ * Omitted policy keeps the field required: preparation failure rejects the request.
+ */
+export interface DeepSeekLlmApiExtensionRegistration {
+  /**
+   * Whether this field is optional, so a preparation failure degrades to a warning.
+   * An optional failure omits only this field for the request while the remaining
+   * fields and the HTTP request proceed; every later request retries preparation.
+   */
+  readonly optional?: boolean
+}
+
 /** Provider registered under one key of {@link DeepSeekLlmApiExtensionMap}. */
 export interface DeepSeekLlmApiExtensionProvider<T extends DeepSeekLlmApiJson> {
   /**

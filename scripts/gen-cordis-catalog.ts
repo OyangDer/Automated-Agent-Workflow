@@ -279,6 +279,7 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
   DirectoryRegistrationHandle: 'llm-streaming.md',
   DeepSeekLlmApiExtensionMap: 'llm-streaming.md',
   DeepSeekLlmApiExtensionProvider: 'llm-streaming.md',
+  DeepSeekLlmApiExtensionRegistration: 'llm-streaming.md',
   DeepSeekLlmApiExtensionRequest: 'llm-streaming.md',
   LlmCallConfig: 'llm-streaming.md',
   LlmModelContext: 'llm-streaming.md',

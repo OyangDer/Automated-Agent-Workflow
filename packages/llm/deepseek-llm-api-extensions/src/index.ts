@@ -8,6 +8,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import type {
   DeepSeekLlmApiExtensionMap,
   DeepSeekLlmApiExtensionProvider,
+  DeepSeekLlmApiExtensionRegistration,
   DeepSeekLlmApiExtensionRequest,
   DeepSeekLlmApiJson,
   PreparedDeepSeekLlmApiExtensions,
@@ -26,6 +27,18 @@ interface ErasedProvider {
     | { readonly value: DeepSeekLlmApiJson; accept?(): void | Promise<void> }
     | undefined
     | Promise<{ readonly value: DeepSeekLlmApiJson; accept?(): void | Promise<void> } | undefined>
+}
+
+/** One registered field together with the failure policy fixed at registration. */
+interface RegisteredProvider {
+  readonly provider: ErasedProvider
+  /** Whether a preparation failure degrades to a warning instead of failing the request. */
+  readonly optional: boolean
+}
+
+/** Render one thrown value as a single diagnostic line. */
+function describeThrown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** Recursively freeze a fresh structured clone. */
@@ -64,7 +77,7 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 
 /** Registry of independently owned top-level fields for official DeepSeek requests. */
 export class DeepSeekLlmApiExtensionRegistry extends Service {
-  private readonly providers = new Map<string, ErasedProvider>()
+  private readonly providers = new Map<string, RegisteredProvider>()
 
   constructor(ctx: Context) {
     super(ctx, 'deepseekLlmApiExtensions')
@@ -74,23 +87,28 @@ export class DeepSeekLlmApiExtensionRegistry extends Service {
    * Register the sole provider of one top-level request field. Registration is effect-scoped.
    * @param field - declaration-merged field owned by the provider.
    * @param provider - request-time field preparation and optional acceptance behavior.
+   * @param registration - failure policy; `{ optional: true }` degrades a preparation failure to a warning.
    * @returns disposer that releases the field.
    */
   register<K extends keyof DeepSeekLlmApiExtensionMap>(
     field: K,
     provider: DeepSeekLlmApiExtensionProvider<DeepSeekLlmApiExtensionMap[K]>,
+    registration: DeepSeekLlmApiExtensionRegistration = {},
   ): () => Promise<void> {
     const fieldName = field as string
     if (fieldName.length === 0 || fieldName.trim() !== fieldName) {
       throw new Error('deepseek-llm-api-extensions: field must be a non-blank trimmed string')
     }
     const providers = this.providers
-    const erased = provider as ErasedProvider
+    const registered: RegisteredProvider = {
+      provider,
+      optional: registration.optional === true,
+    }
     const dispose = this.ctx.effect(() => {
       if (providers.has(fieldName)) {
         throw new Error(`deepseek-llm-api-extensions: field ${JSON.stringify(fieldName)} is already registered`)
       }
-      providers.set(fieldName, erased)
+      providers.set(fieldName, registered)
       return () => {
         providers.delete(fieldName)
       }
@@ -100,18 +118,29 @@ export class DeepSeekLlmApiExtensionRegistry extends Service {
 
   /**
    * Prepare every currently registered field from one immutable base request.
-   * Preparation failures reject before HTTP dispatch. Field values are cloned and frozen;
-   * providers retain no mutable alias to the outgoing request.
+   * A required field's preparation failure rejects before HTTP dispatch; an optional
+   * field's failure is logged and omitted while the remaining fields still go out.
+   * Field values are cloned and frozen; providers retain no mutable alias to the request.
    * @param request - exact serialized request facts before extension fields.
    * @returns detached fields and their idempotent joint acceptance transaction.
    */
   async prepare(request: DeepSeekLlmApiExtensionRequest): Promise<PreparedDeepSeekLlmApiExtensions> {
     request.signal.throwIfAborted()
     const entries = [...this.providers.entries()]
-    const prepared = await abortable(Promise.all(entries.map(async ([field, provider]) => ({
-      field,
-      result: await provider.prepare(request),
-    }))), request.signal)
+    const prepared = await abortable(Promise.all(entries.map(async ([field, registered]) => {
+      try {
+        return { field, result: await registered.provider.prepare(request) }
+      } catch (error: unknown) {
+        if (!registered.optional) throw error
+        // Cancellation ends the request; it is never a degraded optional field.
+        request.signal.throwIfAborted()
+        this.ctx.logger.warn(
+          `deepseek-llm-api-extensions: optional field ${JSON.stringify(field)}`
+          + ` is unavailable for this request: ${describeThrown(error)}`,
+        )
+        return { field, result: undefined }
+      }
+    })), request.signal)
     const fields: Record<string, DeepSeekLlmApiJson> = Object.create(null) as Record<string, DeepSeekLlmApiJson>
     const callbacks: Array<() => void | Promise<void>> = []
     for (const { field, result } of prepared) {
