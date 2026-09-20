@@ -80,7 +80,7 @@ interface TaskboardChanged {
 
 ## 席位与交接
 
-每个看板有一个 master 席位（用 `taskboard_claim_master` 认领，受租期约束）。master 负责派单（`taskboard_assign` —— 仅限顶层会话 Agent，子代理一律拒绝）、重新派发被阻塞的卡片，并裁决 report 模式审核。`taskboard_handover` 将席位交接产品化：生成结构化交接笔记（各卡状态、每个进行中 worker 的身份、In testing 审核席位、待办摘要与 master 历史），写入看板 `handoverNotes` 并释放席位。后继者通过 `taskboard_claim_master` 认领时，其返回结果携带这些笔记，新会话无需轮询即可继续派单。看板行还上报 `masterExpiresAt`（认领时间加配置租期），供浏览器横幅标记租期将尽。
+每个看板有一个 master 席位（用 `taskboard_claim_master` 认领）。席位跟随持有者会话，而非任何时钟：注册在 live agent 注册表中的会话无论静默多久都持有席位；宿主重启或空闲卸载后，只要会话存储里仍有该 session 的记录，持有者就仍持有 —— 只有查存面**确定返回 `undefined`**（记录确实已不存在）才释放席位，并记 1 行 master-history 与 1 条 `master-released` 通知。注册表或持久化缝缺失、探测本身抛错，一律保留席位（fail closed）。`reconcileMasterSeats` 按配置的周期（`reconcileIntervalMs`，默认 60s）对每个看板的席位重新判定，且每个 pass 都重新探测会话存储、不缓存结论 —— 这是周期性复判，不是租约到期 —— `masterExpiresAt` 恒为 null。master 负责派单（`taskboard_assign` —— 仅限顶层会话 Agent，子代理一律拒绝）、重新派发被阻塞的卡片，并裁决 report 模式审核。`taskboard_handover` 将席位交接产品化：生成结构化交接笔记（各卡状态、每个进行中 worker 的身份、In testing 审核席位、待办摘要与 master 历史），写入看板 `handoverNotes` 并释放席位；`taskboard_release_master` 是另一条显式转移路径。后继者通过 `taskboard_claim_master` 认领时，其返回结果携带这些笔记，新会话无需轮询即可继续派单。
 
 ## master 收件箱通知
 

@@ -58,7 +58,7 @@
 | [sidebar-right.md](sidebar-right.zh.md) | 右侧 Sidebar：资源地址与导航地址、tab 类型注册与路由、`ctx.sidebarRight` 导航服务、pane-tab slot 与 owner props、资源模型及 Workspace Files 服务 |
 | [conversation.md](conversation.zh.md) | target-neutral Session event 组装：Context identity、Location data、replay 路径、view builder 与 target 自有 render node |
 | [session-projection.md](session-projection.zh.md) | 投影 seam：`SessionProjectionMap`、纯函数 `ProjectionDefinition` 单元、`ProjectionSnapshot` 的一致切面、变更馈送 |
-| [taskboard.md](taskboard.zh.md) | 五列工单域：`TaskboardService`、带租约与交接笔记的 master 席位、`taskboard_*` 工具及转发的 `taskboard/changed` 事件 |
+| [taskboard.md](taskboard.zh.md) | 五列工单域：`TaskboardService`、按会话存活性而非时钟持有的 master 席位与交接笔记、`taskboard_*` 工具及转发的 `taskboard/changed` 事件 |
 | [session-telemetry.md](session-telemetry.zh.md) | 对外会话上报能力 seam：`SessionTelemetryRecord`/`SessionTelemetrySeverity`、`SessionTelemetrySink` 约定和 `session-telemetry/record` 脱敏 waterfall |
 
 > 这些页面上的类型声明及其 JSDoc 与源码等价，并由 `pnpm run verify-type-equiv` 检查漂移（见 [development.md](../development.zh.md#documenting-types-verbatim-ts-type-equiv)）。普通块保留完整声明；`public-api` 块保留去除实现体的公开 class 声明。Cordis 服务与事件使用每页生成的 **Cordis API** 小节。
