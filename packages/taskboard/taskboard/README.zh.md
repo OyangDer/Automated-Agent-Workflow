@@ -1,6 +1,6 @@
 ---
 description: "持久化五列 Taskboard 工作流域、面向模型的工具、worker 派发与 reviewer 生命周期。"
-kind: "package-reference"
+kind: "package-bundle"
 ---
 
 # @deepseek-ai/dsh-taskboard

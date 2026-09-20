@@ -88,14 +88,46 @@ When a worker reports (`taskboard_report`), fails (`taskboard_fail`), or termina
 
 ## Installation and mounting
 
-The `@deepseek-ai/dsh-web-app` bundle does not mount this plugin. Each plugin package carries its own patch — the manifest declares `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` and that patch inserts one row — so installing the package is what mounts it. The host layer carries `taskboard`; the browser tab arrives with `@deepseek-ai/dsh-client-ui-taskboard`.
+The `@deepseek-ai/dsh-web-app` bundle does not mount this plugin. Each plugin package carries its own patch — the manifest declares the `dsh.bundle.patch` field as `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`, and that patch inserts one row — so installing the package is what mounts it. The host layer carries `taskboard`; the browser tab arrives with `@deepseek-ai/dsh-client-ui-taskboard`.
+
+### Package-declared mounting (recommended)
 
 ```sh
-dsh plugin --profile web add @deepseek-ai/dsh-taskboard
-dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
+dsh plugin --profile <name> add @deepseek-ai/dsh-taskboard @deepseek-ai/dsh-client-ui-taskboard
 ```
 
-`dsh plugin add` installs the package and, because the installed manifest declares `dsh.bundle`, appends it to the profile's `dsh.profile.bundles`, so the package's patch applies as one further layer; no profile-side `insert` is needed on that path. A profile that declares the package by hand instead (a `link:` or version dependency written straight into its `package.json`) never has `bundles` reconciled, so it must either run the command or mount the row in its own `cordis.patch.yml` — mounting one id both ways inserts the row twice. A profile with neither package boots an ordinary Web surface: no board tab and no `taskboard` Remote namespace.
+`dsh plugin add` installs the package and, because the installed manifest declares `dsh.bundle`, appends it to the profile's `dsh.profile.bundles`, so the package's patch applies as one further layer; no profile-side `insert` is needed on that path. Use this form for every new deployment — the profile then carries no taskboard mounting text of its own.
+
+### Hand-written mounting (the active profile on this machine)
+
+A profile can instead declare the packages by hand: a `link:` or version dependency written straight into its own `package.json` never has `bundles` reconciled, so the rows must be mounted in the profile's own `cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'
+```
+
+This machine's active profile (`$DSH_HOME/profiles/web/`) is in exactly that state:
+
+- `package.json` — three local dependencies: `"@deepseek-ai/dsh-taskboard": "link:<checkout>/packages/taskboard/taskboard"`, `"@deepseek-ai/dsh-client-ui-taskboard": "link:<checkout>/packages/client/ui-taskboard"`, and the unrelated machine-local `dsh-whale-widget`. `dsh.profile.bundles` lists only `@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app`, and `dsh-whale-widget` — neither taskboard package is a bundle layer, because the `insert` block below is what mounts them.
+- `cordis.patch.yml` — the `insert` block above, followed by a second `- id: taskboard` entry whose `config` carries this deployment's `preflightRepos`.
+
+Both rows were written by hand when the board was decoupled from the web-app bundle (V3-27).
+
+### Never mix the two forms
+
+Mounting one id both ways inserts the row twice, so the same plugin is mounted twice. The trap is live: running any `dsh plugin add` — `update`, or installing one unrelated plugin — in a hand-written profile reconciles the whole dependency list, so the two `link:` dependencies join `dsh.profile.bundles` while the explicit `insert` block stays, leaving both forms active at once. Switch forms within one change: drop the `insert` rows once the `bundles` entries land, or keep the rows and never run `dsh plugin add` on that profile.
+
+### Migration order and smoke testing
+
+Whichever direction the switch runs, it takes more than one edit, and the intermediate state is worse than a missing tab: while the composition root no longer mounts the row but the profile does not declare the package yet, the Loader and the request-extension contributor resolve the tree against different bases, so request-extension preparation throws `REQUEST_EXTENSION` and every model request fails. Land the profile-side declaration first — the `package.json` dependency plus the `insert` rows, or one `dsh plugin add` — verify it, and only then remove the old bundle mount or restart the host. Smoke-test in a throwaway `$DSH_HOME` profile, never on the active one: a custom profile defaults to `patchReload: live`, so saving a half-migrated `cordis.patch.yml` recomposes the live plugin tree on the spot.
+
+### Acceptance check
+
+With neither package installed, `dsh web` boots an ordinary Web surface: no board tab and no `taskboard` Remote namespace. With both installed, the tab renders and the `/api/taskboard/*` Remote endpoints answer.
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 

@@ -1,6 +1,6 @@
 ---
 description: "The Web Taskboard tab, live five-column projection, master-seat banner, and user-facing ticket controls."
-kind: "package-reference"
+kind: "package-bundle"
 ---
 
 # @deepseek-ai/dsh-client-ui-taskboard

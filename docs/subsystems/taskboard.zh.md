@@ -88,14 +88,46 @@ interface TaskboardChanged {
 
 ## 安装与挂载
 
-`@deepseek-ai/dsh-web-app` bundle 不再挂载本插件。每个插件包自带补丁 —— manifest 声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，该补丁插入一行 —— 因此安装插件包就是挂载它。宿主层提供 `taskboard`，浏览器页签由 `@deepseek-ai/dsh-client-ui-taskboard` 带来。
+`@deepseek-ai/dsh-web-app` bundle 不再挂载本插件。每个插件包自带补丁 —— manifest 通过 `dsh.bundle.patch` 字段声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，该补丁插入一行 —— 因此安装插件包就是挂载它。宿主层提供 `taskboard`，浏览器页签由 `@deepseek-ai/dsh-client-ui-taskboard` 带来。
+
+### 包自带挂载（推荐）
 
 ```sh
-dsh plugin --profile web add @deepseek-ai/dsh-taskboard
-dsh plugin --profile web add @deepseek-ai/dsh-client-ui-taskboard
+dsh plugin --profile <name> add @deepseek-ai/dsh-taskboard @deepseek-ai/dsh-client-ui-taskboard
 ```
 
-`dsh plugin add` 会安装该包，并因已安装的 manifest 声明了 `dsh.bundle` 而把它追加进 profile 的 `dsh.profile.bundles`，于是该包的补丁作为又一层生效；这条路径不需要 profile 侧再写 `insert`。若 profile 改为手写声明该包（把 `link:` 或版本依赖直接写进自己的 `package.json`），其 `bundles` 不会被 reconcile，此时必须要么跑一次该命令、要么在自己的 `cordis.patch.yml` 里挂载该行 —— 同一个 id 两种方式都插会重复插入。两个包都不装的 profile 启动的就是普通 Web 界面：没有看板页签，也没有 `taskboard` Remote 命名空间。
+`dsh plugin add` 会安装该包，并因已安装的 manifest 声明了 `dsh.bundle` 而把它追加进 profile 的 `dsh.profile.bundles`，于是该包的补丁作为又一层生效；这条路径不需要 profile 侧再写 `insert`。新部署一律采用这一形态 —— profile 里不再有任何 taskboard 专属的挂载文本。
+
+### 手写挂载（本机活动 profile）
+
+profile 也可以改为手写声明这两个包：把 `link:` 或版本依赖直接写进自己的 `package.json`，其 `bundles` 不会被 reconcile，此时必须把这两行挂载在自己的 `cordis.patch.yml` 里：
+
+```yaml
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'
+```
+
+本机活动 profile（`$DSH_HOME/profiles/web/`）正是这一形态：
+
+- `package.json` —— 三个本地依赖：`"@deepseek-ai/dsh-taskboard": "link:<checkout>/packages/taskboard/taskboard"`、`"@deepseek-ai/dsh-client-ui-taskboard": "link:<checkout>/packages/client/ui-taskboard"`，以及与本卡无关的本机 `dsh-whale-widget`；而 `dsh.profile.bundles` 只列了 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app`、`dsh-whale-widget` —— 两个 taskboard 包都不在 bundle 层里，它们靠下面的 `insert` 块挂载。
+- `cordis.patch.yml` —— 上面那个 `insert` 块，随后是一个 `- id: taskboard` 条目，其 `config` 承载本部署的 `preflightRepos`。
+
+这两行是看板从 web-app bundle 解耦（V3-27）时手写补上的。
+
+### 两种形态切勿混用
+
+同一个 id 两种方式都挂会插入两次 —— 同一个插件被挂两次。这个坑是活的：在手写 profile 上跑任何一次 `dsh plugin add`（`update`，或只是装一个无关插件）都会 reconcile 整份依赖表，于是那两个 `link:` 依赖进入 `dsh.profile.bundles`，而显式 `insert` 块仍在原地，两种形态同时生效。切换形态必须落在同一次改动里：`bundles` 条目落地后就删掉 `insert` 行，或者保留 `insert` 行并且永远不要在该 profile 上跑 `dsh plugin add`。
+
+### 迁移顺序与冒烟
+
+无论往哪个方向切，都不是一次编辑能完成的，而且中间态比「少一个页签」更糟：当组合根已经不再挂载该行、profile 却还没声明该包时，Loader 与 request-extension 贡献方的解析基准不同，扩展准备会抛 `REQUEST_EXTENSION`，所有模型请求都会失败。正确顺序是先把 profile 侧落好 —— `package.json` 依赖加 `insert` 行，或跑一次 `dsh plugin add` —— 验证通过后再移除旧的 bundle 挂载或重启宿主。冒烟只放在临时 `$DSH_HOME` 的干净 profile 上，绝不要用活动 profile：自定义 profile 默认 `patchReload: live`，存下一个半成品 `cordis.patch.yml` 会当场重组在线插件树。
+
+### 验收口径
+
+两个包都不装时，`dsh web` 启动的是普通 Web 界面：没有看板页签，也没有 `taskboard` Remote 命名空间。两个包都装好后，页签渲染出来，`/api/taskboard/*` Remote 端点可用。
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 

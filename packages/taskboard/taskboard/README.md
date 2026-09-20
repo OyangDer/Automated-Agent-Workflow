@@ -1,6 +1,6 @@
 ---
 description: "The durable five-column Taskboard domain, model-facing workflow tools, worker dispatch, and reviewer lifecycle."
-kind: "package-reference"
+kind: "package-bundle"
 ---
 
 # @deepseek-ai/dsh-taskboard

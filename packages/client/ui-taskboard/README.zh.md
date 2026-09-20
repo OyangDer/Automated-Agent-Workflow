@@ -1,6 +1,6 @@
 ---
 description: "Web 工单看板页签、实时五列投影、master 席位横幅与面向用户的工单控件。"
-kind: "package-reference"
+kind: "package-bundle"
 ---
 
 # @deepseek-ai/dsh-client-ui-taskboard
