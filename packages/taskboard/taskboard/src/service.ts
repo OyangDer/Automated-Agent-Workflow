@@ -563,6 +563,24 @@ function resolveRequiredText(value: string, subject: string): string {
   return text
 }
 
+/** Longest field value echoed verbatim into a metadata-correction history row. */
+const HISTORY_VALUE_LIMIT = 160
+
+/** Collapse one field value to a single bounded line for a history summary. */
+function historyFieldValue(value: string): string {
+  const flat = value.replace(/\s+/g, ' ').trim()
+  return flat.length <= HISTORY_VALUE_LIMIT ? flat : flat.slice(0, HISTORY_VALUE_LIMIT) + '...'
+}
+
+/**
+ * Render one field's old -> new history summary (V3-40): the field name plus
+ * both JSON-quoted, single-line, length-bounded values, so a correction is
+ * auditable without a long description flooding the bounded history.
+ */
+function historyFieldChange(field: string, before: string, after: string): string {
+  return field + ' ' + JSON.stringify(historyFieldValue(before)) + ' -> ' + JSON.stringify(historyFieldValue(after))
+}
+
 /**
  * The taskboard service (ctx.taskboard): storage-backed tickets and boards,
  * the master seat, workflow transitions, the browser Remote surface, and the
@@ -1064,11 +1082,16 @@ export class TaskboardService extends TypertRemoteService {
     return ticket.boardId
   }
 
-  /** Require the caller to be the current master of the ticket's board. */
-  private async assertMasterOfTicket(ticket: TicketView, agent: Agent): Promise<void> {
+  /** Whether the caller currently holds the master seat of the ticket's board. */
+  private async isMasterOfTicket(ticket: TicketView, agent: Agent): Promise<boolean> {
     const table = await this.boards()
     const board = table.get(ticket.boardId)
-    if (board === undefined || board.masterAgentId !== agent.id) {
+    return board !== undefined && board.masterAgentId === agent.id
+  }
+
+  /** Require the caller to be the current master of the ticket's board. */
+  private async assertMasterOfTicket(ticket: TicketView, agent: Agent): Promise<void> {
+    if (!(await this.isMasterOfTicket(ticket, agent))) {
       throw new TaskboardError(
         'only the master of board "' + ticket.boardId + '" may perform this action',
         'TASKBOARD_NOT_MASTER',
@@ -3922,6 +3945,68 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Route one model-facing card edit (taskboard_update). The master of the
+   * ticket's board may correct planning metadata on ANY card of that board
+   * (Backlog through In testing, including cards already dispatched to someone
+   * else) — title, description, filesScope and devNotes — and every such call
+   * appends one history row naming the master and each changed field's old ->
+   * new summary; a call that changes nothing records that too, so a master
+   * correction is never silent. Every other caller keeps the pre-V3-40
+   * assignee-only rule unchanged (TASKBOARD_NOT_OWNER), and only the master may
+   * widen a card's filesScope (TASKBOARD_NOT_MASTER), so the worker-side
+   * ownership semantics are untouched.
+   * @param agent - the calling session agent.
+   * @param ticketId - the card to edit.
+   * @param edit - replacement fields; omitted fields stay unchanged.
+   * @returns the updated ticket.
+   */
+  private async updateTicket(
+    agent: Agent,
+    ticketId: string,
+    edit: { title?: string; description?: string; devNotes?: string; filesScope?: string },
+  ): Promise<TicketView> {
+    const table = await this.tickets()
+    const current = table.get(ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    if (!(await this.isMasterOfTicket(current, agent))) {
+      // The worker side is untouched: a caller that is neither the assignee
+      // nor the board master is refused exactly as before. The filesScope gate
+      // comes first so a non-master asking for the master-only correction hears
+      // that reason (TASKBOARD_NOT_MASTER) rather than the ownership one.
+      if (edit.filesScope !== undefined) {
+        throw new TaskboardError(
+          'only the master of board "' + current.boardId + '" may correct the ticket filesScope',
+          'TASKBOARD_NOT_MASTER',
+        )
+      }
+      if (current.assignee === null || current.assignee.agentId !== agent.id) {
+        throw new TaskboardError('only the assignee may update the ticket', 'TASKBOARD_NOT_OWNER')
+      }
+      return this.updateOwn(agent, ticketId, edit.title, edit.description, edit.devNotes)
+    }
+    return this.mutate(ticketId, 'edit', (ticket) => {
+      const title = typeof edit.title === 'string' && edit.title.trim() !== '' ? edit.title.trim() : ticket.title
+      const description = typeof edit.description === 'string' ? edit.description : ticket.description
+      const devNotes = typeof edit.devNotes === 'string' ? edit.devNotes : ticket.devNotes
+      const filesScope = typeof edit.filesScope === 'string' ? edit.filesScope : ticket.filesScope
+      const changes = [
+        ...(title === ticket.title ? [] : [historyFieldChange('title', ticket.title, title)]),
+        ...(description === ticket.description ? [] : [historyFieldChange('description', ticket.description, description)]),
+        ...(devNotes === ticket.devNotes ? [] : [historyFieldChange('devNotes', ticket.devNotes, devNotes)]),
+        ...(filesScope === ticket.filesScope ? [] : [historyFieldChange('filesScope', ticket.filesScope, filesScope)]),
+      ]
+      return appendHistory(
+        { ...ticket, title, description, devNotes, filesScope, updatedAt: Date.now() },
+        'edit',
+        'metadata corrected by master ' + agentLabel(agent) + ': '
+          + (changes.length === 0 ? 'no field changed' : changes.join('; ')),
+      )
+    })
+  }
+
+  /**
    * Edit own-ticket content through the model-facing surface.
    * @param agent - the owning developer agent.
    * @param ticketId - the owned ticket.
@@ -4495,12 +4580,13 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_update',
-      description: 'Update a taskboard ticket this agent owns: title, description, and/or devNotes. Omitted fields stay unchanged.',
+      description: 'Update a taskboard ticket. An assignee edits its own card (title, description, devNotes); the master of the card\'s board may additionally correct planning metadata on ANY card of that board — title, description, filesScope and devNotes — including cards already dispatched to someone else, so a planning typo in a frozen filesScope is fixable in place (V3-40). Omitted fields stay unchanged. Every master correction appends one history row naming the master and each changed field\'s old -> new summary; a correction that changes nothing is recorded too, never silently. Worker-side ownership is unchanged: an agent that is neither the assignee nor the board master is refused with TASKBOARD_NOT_OWNER, and only the master may change filesScope (a non-master, including the assignee, gets TASKBOARD_NOT_MASTER).',
       parameters: {
-        ticketId: { type: 'string' as const, required: true, description: 'The ticket this agent owns.' },
+        ticketId: { type: 'string' as const, required: true, description: 'The ticket to update.' },
         title: { type: 'string' as const, description: 'Replacement title.' },
         description: { type: 'string' as const, description: 'Replacement description.' },
         devNotes: { type: 'string' as const, description: 'Replacement completion notes.' },
+        filesScope: { type: 'string' as const, description: 'Replacement declared file scope (master only; "" clears it).' },
       },
       output: {
         schema: {
@@ -4513,8 +4599,13 @@ export class TaskboardService extends TypertRemoteService {
         },
         render: (_args, value: { id: string }) => [{ type: 'text' as const, text: 'ticket ' + value.id + ' updated' }],
       },
-      execute: async (args: { ticketId: string; title?: string; description?: string; devNotes?: string }, exec) => {
-        const value = await this.updateOwn(TaskboardService.agentOf(exec), args.ticketId, args.title, args.description, args.devNotes)
+      execute: async (args: { ticketId: string; title?: string; description?: string; devNotes?: string; filesScope?: string }, exec) => {
+        const value = await this.updateTicket(TaskboardService.agentOf(exec), args.ticketId, {
+          title: args.title,
+          description: args.description,
+          devNotes: args.devNotes,
+          filesScope: args.filesScope,
+        })
         return { id: value.id, title: value.title, column: value.column }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Update taskboard ticket', kind: 'other' as const, rawInput: args.ticketId }),

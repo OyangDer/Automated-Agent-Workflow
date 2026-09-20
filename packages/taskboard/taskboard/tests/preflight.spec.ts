@@ -22,6 +22,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import type { SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import TaskboardService from '@deepseek-ai/dsh-taskboard'
 import type { TicketView } from '@deepseek-ai/dsh-taskboard'
@@ -808,6 +809,46 @@ describe('service dispatch preflight (V3-20)', { timeout: GIT_TEST_TIMEOUT_MS },
     expect(prompt).toContain('SAFE')
     // The raw facts travel with the ticket's own scope, not just a flag.
     expect(prompt).toContain('declared file scope: ' + scope)
+  })
+
+  it('resolves the dispatch repo from a master-corrected filesScope (V3-40)', async () => {
+    const wrongRepo = await createRepo()
+    const rightRepo = await createRepo()
+    // A distinct commit so the two repos' HEADs can never collide.
+    await writeFile(join(rightRepo, 'right.txt'), 'right\n')
+    git(rightRepo, ['add', '.'])
+    git(rightRepo, ['commit', '-m', 'right-only'])
+    const rightHead = git(rightRepo, ['rev-parse', 'HEAD'])
+    const wrongHead = git(wrongRepo, ['rev-parse', 'HEAD'])
+    const { ctx, service, subagentsStart } = await harness({
+      preflightRepos: {
+        [wrongRepo]: { canonicalBranch: 'main' },
+        [rightRepo]: { canonicalBranch: 'main' },
+      },
+    })
+    const dev = masterAgent('dev-agent-a', wrongRepo)
+    ctx.agents.register(dev)
+    await service.claimMaster('default', dev)
+    // Planned against the wrong repo; the declaration is frozen at create time.
+    const ticket = await createNotStarted(service, dev, 'scope typo card', join(wrongRepo, 'src', 'a.ts'))
+    const rightScope = join(rightRepo, 'src', 'b.ts')
+    const corrected = await ctx.tools.execute({
+      callId: ToolCallId('tool-preflight-scope-fix'),
+      name: 'taskboard_update',
+      arguments: { ticketId: ticket.id, filesScope: rightScope },
+      agent: dev,
+      signal: new AbortController().signal,
+    })
+    expect(corrected.isError).toBe(false)
+    const result = await service.assign(dev, ticket.id)
+    expect(result.worker).toBe('spawned')
+    const call = subagentsStart.mock.calls[0] as [string, SubagentStartRequest]
+    const prompt = (call[1].prompt as { type: string; text: string }[])[0]!.text
+    // Dispatch preflight located the repo from the corrected card, not the
+    // master cwd (the wrong repo) and not the created scope.
+    expect(prompt).toContain('declared file scope: ' + rightScope)
+    expect(prompt).toContain('HEAD: ' + rightHead)
+    expect(prompt).not.toContain(wrongHead)
   })
 
   it('fails closed when the master cwd maps to no configured repo', async () => {

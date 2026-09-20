@@ -1786,7 +1786,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_update`
 
-Update a taskboard ticket this agent owns: title, description, and/or devNotes. Omitted fields stay unchanged.
+Update a taskboard ticket. An assignee edits its own card (title, description, devNotes); the master of the card's board may additionally correct planning metadata on ANY card of that board — title, description, filesScope and devNotes — including cards already dispatched to someone else, so a planning typo in a frozen filesScope is fixable in place (V3-40). Omitted fields stay unchanged. Every master correction appends one history row naming the master and each changed field's old -> new summary; a correction that changes nothing is recorded too, never silently. Worker-side ownership is unchanged: an agent that is neither the assignee nor the board master is refused with TASKBOARD_NOT_OWNER, and only the master may change filesScope (a non-master, including the assignee, gets TASKBOARD_NOT_MASTER).
 
 ```json
 {
@@ -1794,7 +1794,7 @@ Update a taskboard ticket this agent owns: title, description, and/or devNotes. 
   "properties": {
     "ticketId": {
       "type": "string",
-      "description": "The ticket this agent owns."
+      "description": "The ticket to update."
     },
     "title": {
       "type": "string",
@@ -1807,6 +1807,10 @@ Update a taskboard ticket this agent owns: title, description, and/or devNotes. 
     "devNotes": {
       "type": "string",
       "description": "Replacement completion notes."
+    },
+    "filesScope": {
+      "type": "string",
+      "description": "Replacement declared file scope (master only; \"\" clears it)."
     }
   },
   "required": [

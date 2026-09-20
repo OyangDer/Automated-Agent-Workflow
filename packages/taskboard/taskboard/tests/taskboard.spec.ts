@@ -35,6 +35,7 @@ import {
   reviewerDepthFromDescription, reviewerFactsFromPreflight,
 } from '../src/capsule.ts'
 import type { ReviewerGitFacts } from '../src/capsule.ts'
+import { parseFilesScope, scopeConflicts } from '../src/preflight.ts'
 import type { PreflightReport } from '../src/types.ts'
 
 /** Build a registry-compatible agent around one concrete session. */
@@ -2310,6 +2311,130 @@ describe('TaskboardService workflow', () => {
     expect(view.isError).toBe(false)
     const viewValue = (view as { value: { filesScope: string } }).value
     expect(viewValue.filesScope).toBe('packages/client/ui-taskboard/src')
+  })
+
+  it('lets the master correct a frozen filesScope and description, with a history row (V3-40)', async () => {
+    const { ctx, service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    // The V3-40 scenario: filesScope is planning input and was frozen at create
+    // time, but the real fix point lives outside the declaration written then.
+    const card = await service.createAsMaster(devA, {
+      title: 'narrow scope', description: 'planning text', priority: 'normal', dependsOn: [],
+      filesScope: 'packages/extensions/src',
+    })
+    const corrected = await ctx.tools.execute({
+      callId: ToolCallId('tool-correct-card'),
+      name: 'taskboard_update',
+      arguments: {
+        ticketId: card.id,
+        filesScope: 'packages/llm/llm-deepseek/src',
+        description: 'planning text (corrected)',
+      },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(corrected.isError).toBe(false)
+    // taskboard_view carries the corrected metadata on the untouched Backlog card.
+    const view = await service.viewTicket(card.id)
+    expect(view.column).toBe('backlog')
+    expect(view.filesScope).toBe('packages/llm/llm-deepseek/src')
+    expect(view.description).toBe('planning text (corrected)')
+    // Never silent: one history row names the master and the old -> new value
+    // of every changed field.
+    const row = view.history[view.history.length - 1]!
+    expect(row.kind).toBe('edit')
+    expect(row.detail).toContain('metadata corrected by master')
+    expect(row.detail).toContain(devA.id.slice(0, 8))
+    expect(row.detail).toContain('filesScope "packages/extensions/src" -> "packages/llm/llm-deepseek/src"')
+    expect(row.detail).toContain('description "planning text" -> "planning text (corrected)"')
+    // The corrected scope is exactly what the dispatch-time scope resolution
+    // consumes (parse + cross-card conflict check), so a later dispatch reads B.
+    expect(parseFilesScope(view.filesScope)).toEqual(['packages/llm/llm-deepseek/src'])
+    expect(scopeConflicts(view.filesScope, [
+      { ticketId: 'in-flight-card', filesScope: 'packages/llm/llm-deepseek/src/parser.ts' },
+    ])).toHaveLength(1)
+    expect(scopeConflicts(view.filesScope, [
+      { ticketId: 'in-flight-card', filesScope: 'packages/extensions/src' },
+    ])).toHaveLength(0)
+  })
+
+  it('keeps the worker ownership rule and the master-only filesScope gate (V3-40)', async () => {
+    const { ctx, service, devA, devB } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await service.createAsMaster(devA, {
+      title: 'owned elsewhere', description: 'original', priority: 'normal', dependsOn: [],
+      filesScope: 'src/a.ts',
+    })
+    // devB is neither the master nor the assignee: the pre-V3-40 refusal stands.
+    const denied = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-denied'),
+      name: 'taskboard_update',
+      arguments: { ticketId: card.id, description: 'hijacked' },
+      agent: devB,
+      signal: new AbortController().signal,
+    })
+    expect(denied.isError).toBe(true)
+    expect((denied as { error: { message: string } }).error.message).toContain('only the assignee may update the ticket')
+    // Asking for the master-only filesScope correction hears the master reason.
+    const deniedScope = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-denied-scope'),
+      name: 'taskboard_update',
+      arguments: { ticketId: card.id, filesScope: 'src/b.ts' },
+      agent: devB,
+      signal: new AbortController().signal,
+    })
+    expect(deniedScope.isError).toBe(true)
+    expect((deniedScope as { error: { message: string } }).error.message).toContain('only the master of board')
+    const untouched = await service.viewTicket(card.id)
+    expect(untouched.description).toBe('original')
+    expect(untouched.filesScope).toBe('src/a.ts')
+    expect(untouched.history.some(entry => entry.detail.includes('metadata corrected by master'))).toBe(false)
+    // Dispatch records the dispatching session as the card's assignee, so the
+    // assignee path is exercised after the seat moves on: devA stays the
+    // assignee of a card it dispatched while devB becomes the board master.
+    const assigned = await service.createAsMaster(devA, {
+      title: 'assigned card', description: 'own text', priority: 'normal', dependsOn: [],
+    })
+    await scheduleToNotStarted(service, devA, assigned)
+    await service.assign(devA, assigned.id)
+    await service.transferMaster('default', devA, devB.id, 'seat moved for the V3-40 test')
+    // The seatless assignee keeps the pre-V3-40 content path through the tool…
+    const own = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-assignee'),
+      name: 'taskboard_update',
+      arguments: { ticketId: assigned.id, description: 'assignee text' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(own.isError).toBe(false)
+    expect((await service.viewTicket(assigned.id)).description).toBe('assignee text')
+    // …but it is no longer the master, so it cannot widen its own scope.
+    const ownScope = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-assignee-scope'),
+      name: 'taskboard_update',
+      arguments: { ticketId: assigned.id, filesScope: 'src/widened.ts' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(ownScope.isError).toBe(true)
+    expect((ownScope as { error: { message: string } }).error.message).toContain('only the master of board')
+    expect((await service.viewTicket(assigned.id)).filesScope).toBe('')
+    // The new master corrects the scope in place even though the card is
+    // already In progress and assigned to someone else: a cardinal scope typo
+    // no longer forces a new card.
+    const dispatchedFix = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-dispatched'),
+      name: 'taskboard_update',
+      arguments: { ticketId: assigned.id, filesScope: 'src/corrected.ts' },
+      agent: devB,
+      signal: new AbortController().signal,
+    })
+    expect(dispatchedFix.isError).toBe(false)
+    const dispatchedView = await service.viewTicket(assigned.id)
+    expect(dispatchedView.column).toBe('in_progress')
+    expect(dispatchedView.filesScope).toBe('src/corrected.ts')
+    expect(dispatchedView.history[dispatchedView.history.length - 1]!.detail)
+      .toContain('filesScope "" -> "src/corrected.ts"')
   })
 
   it('injects the session branch and filesScope into the spawned worker prompt', async () => {
