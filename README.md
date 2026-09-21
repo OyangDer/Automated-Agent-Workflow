@@ -13,8 +13,10 @@ Both are required: the tab reads the Remote surface the host package mounts.
 
 ## Install
 
-Ask your DSH to install the plugin, or run the command directly. Pick one spec
-form; the tarball form is the one this repository ships today.
+Ask your DSH to install the plugin, or run the command directly. All three spec
+forms below install the same two packages; the tarball form is the one that
+needs no registry publication and no repository access, so it is the verified
+path today.
 
 **Local tarball** (from a clone of this repository):
 
@@ -23,8 +25,11 @@ dsh plugin --profile web add ./releases/dsh-taskboard-0.1.5-alpha.1.tgz
 dsh plugin --profile web add ./releases/dsh-client-ui-taskboard-0.1.5-alpha.1.tgz
 ```
 
-**Git** (installs straight from this repository; the `#path:/` fragment selects
-the package inside it):
+**Git** — this installs straight from a checkout. pnpm accepts a `#<committish>` or a
+`#path:/<subdir>` fragment but never both, and it resolves the `path:` form against
+the repository's **default branch**. So this form resolves only when the branch
+carrying this tree is that repository's default branch — otherwise point the
+spec at a local clone whose `HEAD` carries it:
 
 ```sh
 dsh plugin --profile web add "git+https://github.com/OyangDer/Automated-Agent-Workflow.git#path:/packages/dsh-taskboard"
