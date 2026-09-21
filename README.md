@@ -51,6 +51,7 @@ packages/dsh-taskboard/                `@deepseek-ai/dsh-taskboard@0.1.5-alpha.1
 packages/dsh-client-ui-taskboard/   `@deepseek-ai/dsh-client-ui-taskboard@0.1.5-alpha.1`
 releases/                         deterministic tarballs for GitHub Releases
 SHA256SUMS                        integrity ledger for every file below
+.gitattributes                    disables checkout text conversion, so a clone matches the tarball
 ```
 
 Each `packages/` directory is a complete, installable package: the built
