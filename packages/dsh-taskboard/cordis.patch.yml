@@ -1,0 +1,8 @@
+# The Taskboard host layer, carried by the plugin package so the durable board
+# domain, the agent-facing claim/complete/review tools, reviewer automation, and
+# the browser Remote surface mount only where this package is installed.
+# Activate with: dsh plugin --profile <name> add @deepseek-ai/dsh-taskboard
+
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
