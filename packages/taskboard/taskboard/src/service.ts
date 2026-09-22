@@ -3795,6 +3795,19 @@ export class TaskboardService extends TypertRemoteService {
   @Remote('archiveBoard')
   async archiveBoardRemote(agent: Agent, request: ArchiveBoardRequest): Promise<BoardView> {
     await this.assertBoardAccessible(request.boardId, agent)
+    // V6-4: a stage ends by starting the next one. Archiving the CURRENT stage
+    // directly would leave the chain without a current stage, so defaulted
+    // reads and writes would silently fall back to the legacy board while the
+    // user believes they are still working on a live stage — refuse it here
+    // and name the way forward instead.
+    const activeStage = await this.activeBoardId(agent)
+    if (request.boardId === activeStage) {
+      throw new TaskboardError(
+        'stage "' + request.boardId + '" is the current stage: start the next stage'
+          + ' (taskboard_stage_new) instead of archiving it',
+        'TASKBOARD_INVALID_INPUT',
+      )
+    }
     return this.mutateBoard(request.boardId, current => ({ ...current, archivedAt: Date.now() }))
   }
 
@@ -5575,6 +5588,9 @@ export class TaskboardService extends TypertRemoteService {
    * @param detail - "compact" (default) returns the compact row; "full" also
    * carries description, devNotes and the pending review report (V3-21 card
    * read layering: compact by default, full when an anomaly needs it).
+   * @param boardId - the stage to scope the read to, or null for every stage
+   * (V6-4 callers pass the caller's current stage, so a list never mixes
+   * stages unless one is named).
    * @returns the matching rows in position order.
    */
   async listRows(

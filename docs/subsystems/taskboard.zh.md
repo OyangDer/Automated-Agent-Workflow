@@ -157,6 +157,52 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 async drainQueue(boardId: string): Promise<number>
 
 /**
+ * V6-4: the stage list — one development stage per board, oldest first, each
+ * with its card census per column, its stage name and whether it is the
+ * current stage or an ended (archived, read-only) one. The legacy "default"
+ * board shows up as stage 1 so its history is never lost.
+ * @param agent - the calling session agent; its session and workspace scope the list.
+ * @returns the visible stages with their card counts.
+ */
+@Remote('listStages') async listStages(agent: Agent): Promise<StageView[]>
+
+/**
+ * V6-4: start the next development stage — a brand-new EMPTY board that
+ * becomes current. The stage being succeeded is archived (history stays
+ * fully readable, further commands against it are refused), while the team
+ * is carried forward: roster members with their 履历, the headcount and
+ * model overrides, and the master seat, so nobody has to rebuild the team.
+ * @param agent - the calling session agent.
+ * @param request - the stage name and the stage being succeeded.
+ * @returns the new stage with its (empty) census.
+ */
+@Remote('createStage') async createStageRemote(agent: Agent, request: CreateStageRequest): Promise<StageView>
+
+/**
+ * V6-4: make one stage current. Switching to an ENDED stage re-activates it
+ * — the explicit "switch back" (D) that re-opens that stage for edits; its
+ * cards, Done column and history are untouched by the switch itself, so
+ * switching back always shows the stage as it ended.
+ * @param agent - the calling session agent.
+ * @param request - the stage to make current.
+ * @returns the now-current stage with its census.
+ */
+@Remote('switchStage') async switchStageRemote(agent: Agent, request: SwitchStageRequest): Promise<StageView>
+
+/**
+ * V6-4 G/H/I: migrate an explicit batch of cards to another stage in one
+ * operation. Every card keeps its column (Done included), devNotes, review
+ * outcome, history, dependencies and worker/reviewer identity; the receipt
+ * names exactly which cards moved and where from. A card may not be left
+ * behind by a dependency it still waits for (C), and an ended stage refuses
+ * to receive cards.
+ * @param agent - the calling session agent.
+ * @param request - the card ids and the target stage.
+ * @returns the migration receipt.
+ */
+@Remote('migrateTickets') async migrateTicketsRemote(agent: Agent, request: MigrateTicketsRequest): Promise<MigrateTicketsResult>
+
+/**
  * Report one reviewer verdict from a continuable reviewer session (V3-28).
  * A durable reviewer child cannot carry an outputSchema — structured output
  * is a one-shot-only subagent capability — so instead of the
@@ -643,9 +689,12 @@ async updateOwn( agent: Agent, ticketId: string, title: string | undefined, desc
  * @param detail - "compact" (default) returns the compact row; "full" also
  * carries description, devNotes and the pending review report (V3-21 card
  * read layering: compact by default, full when an anomaly needs it).
+ * @param boardId - the stage to scope the read to, or null for every stage
+ * (V6-4 callers pass the caller's current stage, so a list never mixes
+ * stages unless one is named).
  * @returns the matching rows in position order.
  */
-async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: 'compact' | 'full' = 'compact', ): Promise<TicketRow[]>
+async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: 'compact' | 'full' = 'compact', boardId: string | null = null, ): Promise<TicketRow[]>
 
 /**
  * One full ticket for the model.
