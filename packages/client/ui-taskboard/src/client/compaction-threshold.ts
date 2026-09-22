@@ -43,6 +43,11 @@ export interface CompactionCeilingState {
   overridden: boolean
   /** Whether the Host document accepts writes. */
   writable: boolean
+  /**
+   * Which transport answered: `memory` means the page is not a local
+   * connection, so the Host serves no writable settings document at all.
+   */
+  mode: 'host' | 'memory'
 }
 
 /** The ceiling row's face, built once per plugin and shared by every session tab. */
@@ -79,6 +84,7 @@ function project(snapshot: SettingsScopeSnapshot<CompactionCeilingSection>): Com
     base: ratioOf(snapshot.base),
     overridden: ratioOf(snapshot.user) !== undefined,
     writable: snapshot.writable,
+    mode: snapshot.mode,
   }
 }
 

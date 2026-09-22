@@ -5,7 +5,10 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import FileSettingsProvider from '@deepseek-ai/dsh-settings-file'
-import { COMPACTION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-compaction-basic/src/settings.ts'
+import {
+  COMPACTION_SETTINGS_NAMESPACE,
+  COMPACTION_THRESHOLD_SCHEMA,
+} from '@deepseek-ai/dsh-compaction-basic/src/settings.ts'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
@@ -2242,6 +2245,35 @@ describe('the user-owned automatic compaction ceiling', () => {
     })
     expect(await compactIfNeeded(compact, conversation(2, 'x'.repeat(600)))).toBeNull()
     expect(log).toEqual(['compaction threshold set to 0.85 of the routed context window'])
+  })
+
+  it('fires pressure compaction at a ceiling the host plane registered before any engine', async () => {
+    const ctx = createContext(1_000)
+    await ctx.plugin(MemorySettings)
+    // The deployment shape V6-7 repaired: the taskboard's node half registers
+    // the section at host boot with no composition entry, so the preset engine
+    // mounts afterwards, finds the namespace claimed, and follows it.
+    ctx.settings.register(SETTINGS_NS, COMPACTION_THRESHOLD_SCHEMA)
+    expect(ctx.settings.get(SETTINGS_NS)).toEqual({})
+
+    const compact = service({ auto: false, thresholdRatio: 0.5, retainTokens: 50 }, ctx)
+    await registered(ctx)
+    const log: string[] = []
+    ctx.logger.info = ((message: string) => void log.push(message)) as typeof ctx.logger.info
+
+    const measured = ctx.tokenMeter.measure(conversation(2, 'x'.repeat(600))).totalTokens
+    expect(measured).toBeGreaterThan(300)
+    expect(measured).toBeLessThan(850)
+
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.3 })
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.3)
+    })
+    expect(await compactIfNeeded(compact, conversation(2, 'x'.repeat(600)))).not.toBeNull()
+    expect(log).toEqual([
+      'compaction threshold set to 0.3 of the routed context window',
+      `compaction threshold crossed: ${measured} estimated tokens >= 300 (ratio 0.3 x 1000 window)`,
+    ])
   })
 
   it('drives every engine on the shared section, keeping one a preset cannot run', async () => {

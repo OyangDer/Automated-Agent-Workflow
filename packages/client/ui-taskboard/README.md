@@ -14,6 +14,7 @@ The Taskboard kanban tab: a five-column conversation view (Backlog, Not started,
 ## Table of Contents
 
 - [Master seat banner](#master-seat-banner)
+- [Auto-compaction ceiling row](#auto-compaction-ceiling-row)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
 - [Model and effort selectors](#model-and-effort-selectors)
@@ -24,6 +25,14 @@ The Taskboard kanban tab: a five-column conversation view (Backlog, Not started,
 ## Master seat banner
 
 The board header shows the master-seat status: the holder (short id, with a warning when the lease is about to expire), a lapsed lease (shown as expired and preemptable, with the takeover affordance restored), or the vacant state with a one-click "copy takeover script" button. Pasting that script into a fresh session tells the new agent to claim the seat with `taskboard_claim_master` and continue from the handover notes the claim result carries.
+
+<a id="auto-compaction-ceiling-row"></a>
+
+## Auto-compaction ceiling row
+
+The header carries the automatic-compaction ceiling (V6-2): four presets, a percent input, the value in force, and the reset back to the composition value. It reads and writes `compaction-basic`'s settings namespace through `ctx.settingsScope`, so the stored value is what every mounted compaction engine compacts under, and it survives a host restart with the rest of the settings document. A served section that carries no choice yet reads as **inherited from the session preset**: the composition value is a per-preset fact (the shipped web presets set their own `thresholdRatio`), so the document cannot name it.
+
+The web profile composes `compaction-basic` per agent preset, and the `dsh-web-app` bundle disables the base bundle's host-plane mount, so no preset engine is mounted when the browser reads the settings document — a read that happens once per connection. This package's node half therefore registers the section at boot (`src/index.ts`), which is what makes the row usable on a freshly booted host; no profile change is involved. An artifact older than that registration leaves the row on its actionable unavailable line, and putting the row to work then means refreshing this package's artifact and restarting the host (`scripts/refresh-taskboard-plugin.md`).
 
 <a id="model-experience"></a>
 ## Model Experience
@@ -47,6 +56,7 @@ Independent. This browser package does not modify request prefixes or append mod
 <a id="known-limitations-and-deferred-work"></a>
 
 - **Model selectors are host/tool-only** — the browser does not yet expose the board-level worker and reviewer model or effort overrides.
+- **The host-plane ceiling section checks bounds, not a composition** — with the section registered at boot, a write is validated against the schema's 0.01–1 bounds; the composition-specific check (a ceiling below what a preset retains) happens inside each engine, which refuses such a value, keeps its last good ceiling, and logs the refusal while the row shows the stored one.
 
 <a id="model-and-effort-selectors"></a>
 ### Model and effort selectors (V3-5, TODO)

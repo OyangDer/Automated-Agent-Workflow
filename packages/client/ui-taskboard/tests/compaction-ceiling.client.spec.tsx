@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import { CompactionCeilingRow, ceilingPercent } from '../src/client/CompactionCeilingRow.tsx'
+import { COMPACTION_CEILING_FIELD, COMPACTION_CEILING_NS } from '../src/client/compaction-threshold.ts'
 import type {
   CompactionCeilingFace, CompactionCeilingState,
 } from '../src/client/compaction-threshold.ts'
@@ -29,7 +30,7 @@ function harness(initial: Partial<CompactionCeilingState> = {}): {
   publish: (next: Partial<CompactionCeilingState>) => void
 } {
   let state: CompactionCeilingState = {
-    status: 'ready', ratio: 0.3, base: 0.3, overridden: false, writable: true, ...initial,
+    status: 'ready', ratio: 0.3, base: 0.3, overridden: false, writable: true, mode: 'host', ...initial,
   }
   const calls: Call[] = []
   const listeners = new Set<() => void>()
@@ -113,6 +114,41 @@ describe('CompactionCeilingRow', () => {
     for (const button of screen.getAllByRole('button')) {
       expect(button).toHaveProperty('disabled', true)
     }
+  })
+
+  it('reads a served section with no choice as inherited, with no composition number', () => {
+    const { face } = harness({ status: 'ready', ratio: undefined, base: undefined, overridden: false })
+    render(createElement(CompactionCeilingRow, { ceiling: face, t }))
+
+    expect(screen.getByTestId('taskboard-compaction-value').textContent).toBe('跟随会话预设')
+    expect(screen.getByTestId('taskboard-compaction').textContent).not.toContain('当前')
+  })
+
+  it('explains a missing Host section and points at the enabling step', () => {
+    const { face } = harness({ status: 'unavailable', ratio: undefined, base: undefined, writable: false })
+    render(createElement(CompactionCeilingRow, { ceiling: face, t }))
+
+    expect(screen.getByTestId('taskboard-compaction-help').textContent)
+      .toContain('scripts/refresh-taskboard-plugin.md')
+  })
+
+  it('explains a non-local page instead of the plugin step', () => {
+    const { face } = harness({
+      status: 'unavailable', ratio: undefined, base: undefined, writable: false, mode: 'memory',
+    })
+    render(createElement(CompactionCeilingRow, { ceiling: face, t }))
+
+    const help = screen.getByTestId('taskboard-compaction-help').textContent ?? ''
+    expect(help).toContain('本机浏览器')
+    expect(help).not.toContain('refresh-taskboard-plugin')
+  })
+
+  it('binds the namespace and field the host half registers', () => {
+    // The three spellings of this contract — this half, the node half that
+    // registers the section, and `compaction-basic` that owns it — are pinned
+    // here and in `ceiling-section.client.spec.ts`, so drift fails loudly.
+    expect(COMPACTION_CEILING_NS).toBe('compaction-basic')
+    expect(COMPACTION_CEILING_FIELD).toBe('thresholdRatio')
   })
 
   it('formats ratios as trimmed percents', () => {

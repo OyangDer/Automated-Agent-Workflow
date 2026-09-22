@@ -114,7 +114,14 @@ export const zh = {
   'ceiling.invalid': '请输入 1–100 之间的百分比',
   'ceiling.failed': '设置保存失败',
   'ceiling.loading': '读取中…',
+  'ceiling.inherited': '跟随会话预设',
   'ceiling.unavailable': '当前部署未提供该设置',
+  'ceiling.helpHost':
+    '宿主没有注册该设置段：请确认宿主已挂载设置服务（settings-file），并已安装含本修复的 ui-taskboard 插件。'
+    + '刷新插件后重启宿主即可生效，步骤见 scripts/refresh-taskboard-plugin.md。',
+  'ceiling.helpLocal':
+    '当前页面不是本机直连（127.0.0.1 或 localhost），宿主设置不可写。'
+    + '请在本机浏览器打开宿主地址后重试。',
   'error.generic': '操作失败，请重试。',
 } satisfies Record<string, string>
 
@@ -235,6 +242,14 @@ export const en = {
   'ceiling.invalid': 'Enter a percentage between 1 and 100',
   'ceiling.failed': 'Saving the setting failed',
   'ceiling.loading': 'Loading…',
+  'ceiling.inherited': 'Inherited from the session preset',
   'ceiling.unavailable': 'This deployment serves no such setting',
+  'ceiling.helpHost':
+    'The Host registers no such section: confirm it mounts a settings provider (settings-file) and carries this fix'
+    + ' in the ui-taskboard plugin. Refreshing the plugin and restarting the Host applies it — see'
+    + ' scripts/refresh-taskboard-plugin.md.',
+  'ceiling.helpLocal':
+    'This page is not a local connection (127.0.0.1 or localhost), so the Host settings document is not writable.'
+    + ' Open the Host address in a browser on this machine and retry.',
   'error.generic': 'The operation failed. Try again.',
 } satisfies Record<TaskboardKey, string>

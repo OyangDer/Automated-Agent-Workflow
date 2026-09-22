@@ -3,6 +3,11 @@
  * input, the value in force and the composition fallback a reset returns to.
  * The row renders the `compaction-basic` settings section, so what it shows is
  * the ceiling the Host's engines actually compact under.
+ *
+ * V6-7: a served section that carries no choice yet reads as INHERITED, because
+ * the composition value is a per-preset fact the document cannot name; and an
+ * unavailable section reports what to do about it rather than only that it is
+ * missing.
  */
 import { useCallback, useState, useSyncExternalStore } from 'react'
 import type { TaskboardT } from './TicketCard.tsx'
@@ -62,6 +67,24 @@ export function CompactionCeilingRow({ ceiling, t }: CompactionCeilingRowProps) 
     apply(percent / 100)
   }
 
+  /** The readout: the choice in force, the inherited note, or the refusal reason. */
+  const readout = ((): string => {
+    if (state.status === 'unavailable') return t('ceiling.unavailable')
+    if (state.status === 'loading') return t('ceiling.loading')
+    if (state.ratio === undefined) return t('ceiling.inherited')
+    const current = t('ceiling.current').replace('{percent}', ceilingPercent(state.ratio))
+    return state.overridden ? `${current} · ${t('ceiling.overridden')}` : current
+  })()
+
+  /**
+   * Actionable guidance behind an unavailable readout: a page without a
+   * writable Host document, or a Host that serves no ceiling section (V6-7 —
+   * in the web profile that section comes from this plugin's own node half).
+   */
+  const guidance = state.status === 'unavailable'
+    ? t(state.mode === 'memory' ? 'ceiling.helpLocal' : 'ceiling.helpHost')
+    : undefined
+
   return (
     <div className={css.ceiling} data-testid="taskboard-compaction">
       <span className={css.ceilingTitle}>{t('ceiling.title')}</span>
@@ -92,12 +115,10 @@ export function CompactionCeilingRow({ ceiling, t }: CompactionCeilingRowProps) 
       <button type="button" className={css.ceilingAction} disabled={disabled} onClick={submitDraft}>
         {t('ceiling.apply')}
       </button>
-      <span className={css.ceilingValue} data-testid="taskboard-compaction-value">
-        {state.status === 'ready' && state.ratio !== undefined
-          ? t('ceiling.current').replace('{percent}', ceilingPercent(state.ratio))
-          : t(state.status === 'unavailable' ? 'ceiling.unavailable' : 'ceiling.loading')}
-        {state.overridden ? ' · ' + t('ceiling.overridden') : ''}
-      </span>
+      <span className={css.ceilingValue} data-testid="taskboard-compaction-value">{readout}</span>
+      {guidance !== undefined && (
+        <span className={css.ceilingHelp} data-testid="taskboard-compaction-help">{guidance}</span>
+      )}
       {state.base !== undefined && (
         <span className={css.ceilingValue}>
           {t('ceiling.base').replace('{percent}', ceilingPercent(state.base))}

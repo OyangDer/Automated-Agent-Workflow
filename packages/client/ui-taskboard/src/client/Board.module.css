@@ -85,6 +85,14 @@
   color: var(--dsw-alias-state-error-primary);
 }
 
+/* V6-7: the actionable line under an unavailable ceiling readout. Full width,
+   so it reads as an explanation rather than another control label. */
+.ceilingHelp {
+  flex-basis: 100%;
+  color: var(--dsw-alias-text-2);
+  line-height: 1.5;
+}
+
 /* V6-1: the fixed roster strip — who is on the team, who is free, and the
    short work summary the master matches against. Read-only. */
 .roster {
