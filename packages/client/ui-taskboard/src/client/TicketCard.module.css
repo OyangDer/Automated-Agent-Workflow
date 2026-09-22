@@ -123,3 +123,20 @@
   color: var(--dsw-alias-label-tertiary);
   background: var(--dsw-alias-bg-module-secondary);
 }
+
+/* V6-1: a queued card is visibly waiting, never silently stalled. */
+.badgeQueued {
+  color: var(--dsw-alias-state-warn-label);
+  background: var(--dsw-alias-state-warn-tertiary);
+}
+
+.cardQueue {
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--dsw-alias-state-warn-label);
+  margin: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}

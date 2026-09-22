@@ -33,22 +33,27 @@ import type {
   SubagentStartRequest, SubagentRun,
 } from '@deepseek-ai/dsh-subagent'
 import {
-  TASKBOARD_COLUMNS, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
+  TASKBOARD_COLUMNS, TASKBOARD_MEMBER_ROLES, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
 import type {
   ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardSnapshot, BoardView, ColumnId,
-  CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry,
-  MoveTicketRequest, PreflightReport, Priority, RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest,
-  TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure, TicketType, TicketView,
-  TicketWorkerStatus,
+  CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MemberRecord, MemberRole,
+  MemberView, MoveTicketRequest, PreflightReport, Priority, RemoveTicketRequest, RemoveTicketResult,
+  RequestReviewRequest, TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure, TicketQueue,
+  TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
+import {
+  foldMemberHistory, matchMember, memberIndex, memberTag, partnerMemberId,
+  queueReason, renderMemberSummary, reviewerMemberId, workerMemberId,
+} from './roster.ts'
 import {
   isInsidePath, normalizePath, parseFilesScope, preflightPromptSection, runPreflight,
   type RepoPreflightConfig,
 } from './preflight.ts'
 import {
   agentLabel, appendHistory, appendNotice, buildContinuationPrompt, buildHandoverNotes,
-  buildHandoverSnapshot, buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
+  buildHandoverSnapshot, buildMemberDispatchPrompt, buildMemberReviewPrompt,
+  buildReviewPrompt, buildReviewReportPrompt, buildWorkerPrompt,
   compactCardState, DISPATCH_TURN_END, formatCompactEvent, formatHandoverSnapshotText,
   formatTicketRowLine, MASTER_SECTION, masterModelNote, reviewerLabel, TaskboardError, WORKFLOW_SECTION,
 } from './domain.ts'
@@ -106,8 +111,40 @@ const ticketSchema = zod.object({
   devNotes: zod.string(),
   targetBranch: zod.string().default(''),
   filesScope: zod.string().default(''),
+  // V6-1: the fixed roster pair owning this card. Optional so pre-roster
+  // records keep loading; a card without them is dispatched legacily.
+  workerMemberId: zod.string().optional(),
+  reviewerMemberId: zod.string().optional(),
+  // V6-1: the visible wait state; null (the default) while the card is not
+  // waiting for a free member.
+  queue: zod.union([
+    zod.object({
+      reason: zod.string(),
+      enqueuedAt: zod.number(),
+      position: zod.number().int().min(1),
+    }),
+    zod.null(),
+  ]).default(null),
   dependsOn: zod.array(zod.string()),
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
+})
+
+/**
+ * The stored roster-member shape (V6-1); validated at the durable boundary.
+ * The record is identity + 履历 + summary; load ('idle'/'busy') is derived from
+ * the cards, never stored, so it can never drift from the board.
+ */
+const memberSchema = zod.object({
+  id: zod.string().min(1),
+  boardId: zod.string().min(1),
+  role: zod.enum(TASKBOARD_MEMBER_ROLES),
+  partnerId: zod.string(),
+  sessionId: zod.string().default(''),
+  summary: zod.string().default(''),
+  modules: zod.array(zod.string()).default([]),
+  recentTickets: zod.array(zod.string()).default([]),
+  createdAt: zod.number(),
+  updatedAt: zod.number(),
 })
 
 /** The stored board record shape; validated at the durable boundary. */
@@ -177,6 +214,9 @@ const REVIEW_VERDICTS: readonly string[] = ['approve', 'reject']
 
 const NOTICE_KIND = {
   reviewVerdict: 'review-verdict',
+  workerQueued: 'worker-queued',
+  workerPending: 'worker-pending',
+  workerDequeued: 'worker-dequeued',
   workerDone: 'worker-done',
   workerFailed: 'worker-failed',
   workerTerminated: 'worker-terminated',
@@ -267,6 +307,9 @@ const TASKBOARD_DOMAIN = defineDomain({
   tables: {
     tickets: domainTable<string, TicketView>(ticketSchema),
     boards: domainTable<string, BoardView>(boardSchema),
+    // V6-1: the board-scoped roster; keys are "<boardId>::<memberId>" because
+    // member ids ("W1") are per board and the table is global.
+    members: domainTable<string, MemberRecord>(memberSchema),
   },
 })
 
@@ -353,6 +396,22 @@ export interface Config {
    */
   reviewerAutoRetryLimit?: number
   /**
+   * V6-1 fixed headcount: the maximum number of WORKER roster members one
+   * board may create. A card whose dispatch finds no idle member while the
+   * roster is already at this cap is QUEUED (visible on the card, first-come
+   * first-served) instead of spawning yet another agent. The default is
+   * deliberately conservative (2): one card per pair, so two pairs cover a
+   * normal phase step without the unbounded fan-out of an uncapped board.
+   */
+  workerCapacity?: number
+  /**
+   * V6-1 fixed headcount: the maximum number of REVIEWER roster members one
+   * board may create. Pairing is structural (W<n> <-> R<n>), so the usable
+   * pair count is min(workerCapacity, reviewerCapacity); with both defaults at
+   * 2 a board runs at most two pairs, each owning one card until Done.
+   */
+  reviewerCapacity?: number
+  /**
    * V3-20/V3-26: per-repo deterministic preflight contracts, keyed by
    * absolute repo root path. When non-empty, every assign/retry dispatch
    * resolves the card's repo from its declared filesScope first and falls
@@ -386,6 +445,8 @@ export const Config: z<Config> = z.object({
   workerAutoRetryLimit: z.number().default(2),
   reviewerStaleTimeoutMs: z.number().default(900000),
   reviewerAutoRetryLimit: z.number().default(2),
+  workerCapacity: z.number().default(2),
+  reviewerCapacity: z.number().default(2),
   preflightRepos: z.dict(z.object({
     canonicalBranch: z.string(),
     canonicalCommit: z.string(),
@@ -433,7 +494,8 @@ export interface CompleteTicketResult {
 /** Tool payload: the card plus what happened to the worker spawn. */
 export interface AssignTicketResult {
   ticket: TicketView
-  worker: 'spawned' | 'unavailable' | 'failed'
+  /** V6-1: 'continued' = an idle member's session was woken; 'queued' = no member was free inside the cap. */
+  worker: 'spawned' | 'continued' | 'queued' | 'unavailable' | 'failed'
   workerAgentId: string | null
 }
 
@@ -443,7 +505,7 @@ export interface AssignTicketResult {
  */
 export interface ReassignTicketResult {
   ticket: TicketView
-  worker: 'spawned' | 'continued' | 'unavailable' | 'failed' | null
+  worker: 'spawned' | 'continued' | 'queued' | 'unavailable' | 'failed' | null
   workerAgentId: string | null
 }
 
@@ -476,6 +538,12 @@ export interface TicketRow {
   type: TicketType
   status: TicketWorkerStatus
   workerAgentId: string | null
+  /** V6-1: the worker roster member owning the card ("W1"), or null. */
+  workerMemberId: string | null
+  /** V6-1: the reviewer roster member holding the seat ("R1"), or null. */
+  reviewerMemberId: string | null
+  /** V6-1: the visible wait state when the card is queued; null otherwise. */
+  queue: TicketQueue | null
   failure: TicketFailure | null
   position: number
   assignee: TicketAssignee | null
@@ -553,6 +621,18 @@ function resolveReviewerStaleTimeout(value: number): number {
 function resolveReviewerAutoRetryLimit(value: number): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error('taskboard: reviewerAutoRetryLimit must be a non-negative safe integer')
+  }
+  return value
+}
+
+/**
+ * Validate one explicit roster headcount cap (V6-1). At least one member must
+ * be allowed — a zero cap would make every dispatch queue forever, which is
+ * not a configuration this board can honour — so the minimum is 1.
+ */
+function resolveCapacity(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('taskboard: workerCapacity/reviewerCapacity must be a positive safe integer')
   }
   return value
 }
@@ -636,6 +716,12 @@ export class TaskboardService extends TypertRemoteService {
     workerAutoRetryLimit: number
     reviewerStaleTimeoutMs: number
     reviewerAutoRetryLimit: number
+    /** V6-1: max worker roster members per board. */
+    workerCapacity: number
+    /** V6-1: max reviewer roster members per board. */
+    reviewerCapacity: number
+    /** V6-1: the usable pair count, min(workerCapacity, reviewerCapacity). */
+    pairCapacity: number
     /** V3-20: normalized per-repo preflight contracts keyed by absolute repo root. */
     preflightRepos: Record<string, RepoPreflightConfig>
   }
@@ -703,6 +789,12 @@ export class TaskboardService extends TypertRemoteService {
       workerAutoRetryLimit: resolveWorkerAutoRetryLimit(config.workerAutoRetryLimit ?? 2),
       reviewerStaleTimeoutMs: resolveReviewerStaleTimeout(config.reviewerStaleTimeoutMs ?? 900000),
       reviewerAutoRetryLimit: resolveReviewerAutoRetryLimit(config.reviewerAutoRetryLimit ?? 2),
+      workerCapacity: resolveCapacity(config.workerCapacity ?? 2),
+      reviewerCapacity: resolveCapacity(config.reviewerCapacity ?? 2),
+      pairCapacity: Math.min(
+        resolveCapacity(config.workerCapacity ?? 2),
+        resolveCapacity(config.reviewerCapacity ?? 2),
+      ),
       preflightRepos,
     }
     if (config.workerEffort !== undefined && this.resolved.workerEffort === undefined) {
@@ -748,6 +840,9 @@ export class TaskboardService extends TypertRemoteService {
             await this.reconcileLostWorkers()
             await this.reconcileStaleReviewers()
             await this.reconcileMasterSeats()
+            // V6-1: last, so a member freed by the passes above takes the next
+            // queued card in the same tick (first-come-first-served).
+            await this.reconcileQueues()
           } catch {
             // A recovery fault must never take the scanner down; the next
             // tick retries.
@@ -816,6 +911,482 @@ export class TaskboardService extends TypertRemoteService {
       reviewerModel: override?.reviewerModel ?? this.resolved.reviewerModel,
       reviewerEffort: resolveEffort(override?.reviewerEffort) ?? this.resolved.reviewerEffort,
     }
+  }
+
+  // ------------------------------------------------------------------
+  // V6-1 fixed-headcount roster, matching dispatch and fixed pairs
+  // ------------------------------------------------------------------
+
+  /** Resolve the opened roster (members) table. */
+  private async members(): Promise<KvTable<string, MemberRecord>> {
+    return (await this.domain).table('members')
+  }
+
+  /** The durable key of one board-scoped member (member ids are per board). */
+  private static memberKey(boardId: string, memberId: string): string {
+    return boardId + '::' + memberId
+  }
+
+  /** Every stored card of one board. */
+  private async boardTickets(boardId: string): Promise<TicketView[]> {
+    const table = await this.tickets()
+    const rows: TicketView[] = []
+    for (const [, ticket] of table.entries()) {
+      if (ticket.boardId === boardId) rows.push(ticket)
+    }
+    return rows
+  }
+
+  /**
+   * Derived load of one board: member id -> the card the member holds.
+   * A member holds a card until the card reaches Done (user decision C: one
+   * pair owns one card to close, so a rework never interrupts another card).
+   * A blocked or queued card holds nobody — its run is over and it waits for
+   * the master, so the member is free for the next card instead of being
+   * pinned by a dead session.
+   */
+  private static heldCards(tickets: readonly TicketView[]): Map<string, string> {
+    const held = new Map<string, string>()
+    for (const ticket of tickets) {
+      if (ticket.column === 'in_progress' && (ticket.status === 'running' || ticket.status === 'paused')) {
+        if (ticket.workerMemberId !== undefined) held.set(ticket.workerMemberId, ticket.id)
+      } else if (ticket.column === 'in_testing' && ticket.status !== 'blocked') {
+        if (ticket.workerMemberId !== undefined) held.set(ticket.workerMemberId, ticket.id)
+        if (ticket.reviewerMemberId !== undefined) held.set(ticket.reviewerMemberId, ticket.id)
+      }
+    }
+    return held
+  }
+
+  /** One board's roster records, ordered by role then pair index. */
+  private async boardMembers(boardId: string): Promise<MemberRecord[]> {
+    const table = await this.members()
+    const rows: MemberRecord[] = []
+    for (const [, member] of table.entries()) {
+      if (member.boardId === boardId) rows.push(member)
+    }
+    return rows.sort((a, b) => {
+      if (a.role !== b.role) return a.role === 'worker' ? -1 : 1
+      return memberIndex(a.id) - memberIndex(b.id)
+    })
+  }
+
+  /**
+   * The board's roster as the wire serves it: every member with its short
+   * work summary, derived load and held card. This is the ONLY member data
+   * the master ever reads (user decision A) — never a member's full context.
+   */
+  private async rosterOf(boardId: string): Promise<{
+    members: MemberRecord[]
+    views: MemberView[]
+    held: Map<string, string>
+    tickets: TicketView[]
+  }> {
+    const tickets = await this.boardTickets(boardId)
+    const held = TaskboardService.heldCards(tickets)
+    const members = await this.boardMembers(boardId)
+    const titles = new Map(tickets.map(ticket => [ticket.id, ticket.title]))
+    const views = members.map((member) => {
+      const heldTicketId = held.get(member.id) ?? null
+      return {
+        ...member,
+        summary: renderMemberSummary(
+          member.modules,
+          member.recentTickets.map(id => titles.get(id) ?? id),
+          heldTicketId,
+        ),
+        status: heldTicketId === null ? 'idle' as const : 'busy' as const,
+        currentTicketId: heldTicketId,
+      }
+    })
+    return { members, views, held, tickets }
+  }
+
+  /**
+   * Create the roster slot for one (role, index) when it does not exist yet.
+   * This is the ONLY place a member is ever created, and every caller gates it
+   * on the configured cap — a board never grows past its headcount.
+   */
+  private async ensureMember(boardId: string, role: MemberRole, index: number): Promise<MemberRecord> {
+    const id = role === 'worker' ? workerMemberId(index) : reviewerMemberId(index)
+    const table = await this.members()
+    const key = TaskboardService.memberKey(boardId, id)
+    const existing = table.get(key)
+    if (existing !== undefined) return existing
+    const now = Date.now()
+    const record: MemberRecord = {
+      id,
+      boardId,
+      role,
+      partnerId: partnerMemberId(id),
+      sessionId: '',
+      summary: renderMemberSummary([], [], null),
+      modules: [],
+      recentTickets: [],
+      createdAt: now,
+      updatedAt: now,
+    }
+    await table.put(key, record)
+    return record
+  }
+
+  /**
+   * Bind one session to a member. Session rotation (wake refused, session gone
+   * for good) changes the member's session id only — the member count and the
+   * member's identity are untouched (成员 ≠ 会话).
+   */
+  private async bindMemberSession(boardId: string, memberId: string, sessionId: string): Promise<void> {
+    const table = await this.members()
+    const key = TaskboardService.memberKey(boardId, memberId)
+    if (table.get(key) === undefined) return
+    await table.update(key, current => ({ ...current, sessionId, updatedAt: Date.now() }))
+  }
+
+  /**
+   * Recompute and persist one member's short summary (optionally folding a
+   * card the member just finished into its 履历). The summary is durable
+   * server-side data (requirement d) so a later office view reads it without
+   * the master ever loading a member's context.
+   */
+  private async refreshMemberSummary(boardId: string, memberId: string, folded?: TicketView): Promise<void> {
+    const table = await this.members()
+    const key = TaskboardService.memberKey(boardId, memberId)
+    const current = table.get(key)
+    if (current === undefined) return
+    const tickets = await this.boardTickets(boardId)
+    const held = TaskboardService.heldCards(tickets)
+    const withHistory = folded === undefined ? current : foldMemberHistory(current, folded, Date.now())
+    const titles = new Map(tickets.map(ticket => [ticket.id, ticket.title]))
+    const summary = renderMemberSummary(
+      withHistory.modules,
+      withHistory.recentTickets.map(id => titles.get(id) ?? id),
+      held.get(memberId) ?? null,
+    )
+    await table.put(key, { ...withHistory, summary, updatedAt: Date.now() })
+  }
+
+  /** Fold one finished card into both members of its pair and refresh them. */
+  private async settlePairHistory(ticket: TicketView): Promise<void> {
+    for (const memberId of [ticket.workerMemberId, ticket.reviewerMemberId]) {
+      if (memberId === undefined) continue
+      await this.refreshMemberSummary(ticket.boardId, memberId, ticket).catch(() => {})
+    }
+  }
+
+  /** The board's live master agent, or undefined when the seat is empty/dead. */
+  private async liveMaster(boardId: string): Promise<Agent | undefined> {
+    const registry = this.agentRegistry()
+    if (registry === undefined) return undefined
+    const board = (await this.boards()).get(boardId)
+    const masterId = board?.masterAgentId
+    if (masterId === undefined || masterId === null) return undefined
+    return registry.get(masterId)
+  }
+
+  /** The board's queued cards, first-come-first-served by enqueue time. */
+  private static queuedOrder(tickets: readonly TicketView[]): TicketView[] {
+    const queued: { ticket: TicketView; queue: TicketQueue }[] = []
+    for (const ticket of tickets) {
+      const queue = ticket.queue
+      if (queue === null || queue === undefined || ticket.status !== 'queued') continue
+      queued.push({ ticket, queue })
+    }
+    return queued
+      .sort((a, b) => (a.queue.enqueuedAt - b.queue.enqueuedAt) || (a.ticket.position - b.ticket.position))
+      .map(entry => entry.ticket)
+  }
+
+  /**
+   * Reserve the WORKER member for one card (the whole matching policy, user
+   * decision A): the card's own member on a rework, else the idle member
+   * familiar with the card's modules, else the lowest-index idle member; and
+   * only when every member is busy at the cap does the card wait in the
+   * visible queue. The cap is the fixed pair count — a card can never create
+   * a member beyond it.
+   */
+  private async reserveWorkerMember(ticket: TicketView): Promise<{ member: MemberRecord } | { queued: string }> {
+    const boardId = ticket.boardId
+    const tickets = await this.boardTickets(boardId)
+    const held = TaskboardService.heldCards(tickets)
+    const records = (await this.boardMembers(boardId)).filter(member => member.role === 'worker')
+    const cap = this.resolved.pairCapacity
+    const idle = records.filter(member => !held.has(member.id))
+    const chosen = matchMember(idle, ticket, ticket.workerMemberId)
+    if (chosen !== null) return { member: chosen }
+    if (records.length < cap) {
+      const used = new Set(records.map(member => memberIndex(member.id)))
+      let index = 0
+      while (index < cap && used.has(index)) index += 1
+      if (index < cap) return { member: await this.ensureMember(boardId, 'worker', index) }
+    }
+    const busy = records
+      .filter(member => held.has(member.id))
+      .map(member => memberTag(member.id) + '=' + String(held.get(member.id)))
+    const position = TaskboardService.queuedOrder(tickets).filter(queued => queued.id !== ticket.id).length + 1
+    return { queued: queueReason('worker', cap, busy, position) }
+  }
+
+  /**
+   * Reserve the REVIEWER member holding one card's seat: the fixed partner of
+   * the card's worker member (user decision B — the same reviewer re-reviews
+   * the same card, keeping its own defects memory and its own independent
+   * judgement), else any idle reviewer inside the cap, else the visible queue.
+   */
+  private async reserveReviewerMember(
+    ticket: TicketView, workerMemberId: string | undefined,
+  ): Promise<{ member: MemberRecord } | { queued: string }> {
+    const boardId = ticket.boardId
+    const tickets = await this.boardTickets(boardId)
+    const held = TaskboardService.heldCards(tickets)
+    const records = (await this.boardMembers(boardId)).filter(member => member.role === 'reviewer')
+    const cap = this.resolved.pairCapacity
+    const preferredIndex = workerMemberId === undefined ? 0 : memberIndex(workerMemberId)
+    const preferred = records.find(member => member.id === reviewerMemberId(preferredIndex))
+    if (preferred !== undefined) {
+      const heldBy = held.get(preferred.id)
+      if (heldBy === undefined || heldBy === ticket.id) return { member: preferred }
+    }
+    // Only a reviewer whose partner worker is free (or holds exactly this
+    // card) may take the seat — the fixed pair stays the unit of work.
+    const idle = records.filter((member) => {
+      if (held.has(member.id)) return false
+      const partnerHeld = held.get(partnerMemberId(member.id))
+      return partnerHeld === undefined || partnerHeld === ticket.id
+    })
+    if (idle.length > 0) {
+      const chosen = idle.find(member => memberIndex(member.id) === preferredIndex) ?? idle[0]
+      if (chosen !== undefined) return { member: chosen }
+    }
+    if (records.length < cap && preferredIndex < cap) {
+      return { member: await this.ensureMember(boardId, 'reviewer', preferredIndex) }
+    }
+    const busy = records
+      .filter(member => held.has(member.id))
+      .map(member => memberTag(member.id) + '=' + String(held.get(member.id)))
+    const position = TaskboardService.queuedOrder(tickets).filter(queued => queued.id !== ticket.id).length + 1
+    return { queued: queueReason('reviewer', cap, busy, position) }
+  }
+
+  /**
+   * Park one card in the visible queue: it keeps its column, flips to status
+   * "queued" and carries the reason plus its FIFO position, so a waiting card
+   * is readable instead of silently standing still (the V3-30 lesson), and
+   * FIFO order is what keeps it from starving.
+   */
+  private async enqueueCard(ticket: TicketView, reason: string, role: MemberRole = 'worker'): Promise<TicketView> {
+    const position = TaskboardService.queuedOrder(await this.boardTickets(ticket.boardId))
+      .filter(queued => queued.id !== ticket.id).length + 1
+    const queued = await this.mutate(ticket.id, 'assign', current => appendHistory(
+      { ...current, status: 'queued', queue: { reason, enqueuedAt: Date.now(), position }, updatedAt: Date.now() },
+      'queued',
+      'queued: ' + reason,
+    ))
+    await this.notifyMaster(queued.boardId,
+      'Taskboard notice: ' + formatCompactEvent(role === 'worker' ? 'WORKER_QUEUED' : 'REVIEWER_QUEUED', {
+        ticket: queued.id,
+        title: queued.title,
+        state: compactCardState(queued),
+        scope: queued.filesScope,
+        blocker: reason,
+        anomaly: 'no idle member inside the configured headcount; the card waits first-come-first-served',
+      }),
+      NOTICE_KIND.workerQueued, queued.id)
+    return queued
+  }
+
+  /**
+   * Re-number one board's queued cards in first-come-first-served order. Only
+   * rows whose stored position actually moved are written, so the common case
+   * costs no mutation and no change event.
+   */
+  private async repositionQueue(boardId: string): Promise<void> {
+    const tickets = await this.boardTickets(boardId)
+    for (const [index, ticket] of TaskboardService.queuedOrder(tickets).entries()) {
+      const position = index + 1
+      const queue = ticket.queue
+      if (queue === null || queue === undefined || queue.position === position) continue
+      await this.mutate(ticket.id, 'edit', current => ({
+        ...current,
+        queue: current.queue === null || current.queue === undefined ? null : { ...current.queue, position },
+        updatedAt: Date.now(),
+      })).catch(() => null)
+    }
+  }
+
+  /**
+   * Dispatch one card to one already-reserved member (the shared body of
+   * assign, reassign-retry and the queue drain): the card moves In progress
+   * under the member, the repo preflight runs before any spawn, the member's
+   * existing session is woken when it has one, and a refused wake rotates the
+   * member's session instead of adding a member.
+   */
+  private async startCardWithMember(
+    master: Agent,
+    ticket: TicketView,
+    member: MemberRecord,
+    operation: TaskboardOperation,
+    detail: string,
+    workerLabel?: string,
+  ): Promise<AssignTicketResult> {
+    const running = await this.mutate(ticket.id, operation, current => appendHistory(
+      {
+        ...current,
+        column: 'in_progress',
+        status: 'running',
+        assignee: { agentId: master.id, label: agentLabel(master) },
+        workerMemberId: member.id,
+        queue: null,
+        failure: null,
+        autoRetries: 0,
+        reviewerRetries: 0,
+        updatedAt: Date.now(),
+      },
+      operation,
+      detail,
+    ))
+    const preflight = await this.preflightDispatch(running, master)
+    if (preflight !== null && preflight.enforce && !preflight.report.safe) {
+      const blocked = await this.blockPreflight(running, preflight.report)
+      return { ticket: blocked, worker: 'failed', workerAgentId: null }
+    }
+    const dispatch = await this.dispatchToMember(master, running, member, workerLabel, preflight === null ? undefined : preflight.report)
+    if (!dispatch.ok) {
+      const failureReason = dispatch.reason === 'failed' && dispatch.errorMessage !== undefined
+        ? 'worker dispatch failed: ' + dispatch.errorMessage
+        : 'worker dispatch ' + dispatch.reason
+      const blocked = await this.mutate(ticket.id, 'fail', current => ({
+        ...current,
+        status: 'blocked',
+        failure: { reason: failureReason, at: Date.now() },
+        updatedAt: Date.now(),
+      })).catch(() => running)
+      return { ticket: blocked, worker: dispatch.reason, workerAgentId: null }
+    }
+    const withWorker = await this.mutate(ticket.id, operation, current => ({
+      ...current,
+      workerAgentId: dispatch.sessionId,
+      workerSessionId: dispatch.sessionId,
+      updatedAt: Date.now(),
+    }))
+    await this.bindMemberSession(ticket.boardId, member.id, dispatch.sessionId)
+    // Attach termination reclamation only after the worker identity is
+    // durable, so an already-settled run cannot misread the card.
+    if (dispatch.run !== undefined && dispatch.controller !== undefined) {
+      this.trackWorkerRun(ticket.id, dispatch.sessionId, dispatch.run, dispatch.controller)
+    }
+    await this.refreshMemberSummary(ticket.boardId, member.id)
+    return {
+      ticket: withWorker,
+      worker: dispatch.continued ? 'continued' : 'spawned',
+      workerAgentId: dispatch.sessionId,
+    }
+  }
+
+  /**
+   * Hand one card to one member's session: wake the member's recorded session
+   * (continue — it already holds the exploration context) when it has one and
+   * the seam can resume it, otherwise spawn a fresh session for the SAME
+   * member. A refused wake is a session rotation, never a new member.
+   */
+  private async dispatchToMember(
+    master: Agent,
+    ticket: TicketView,
+    member: MemberRecord,
+    workerLabel?: string,
+    preflight?: PreflightReport,
+  ): Promise<
+    | { ok: true; sessionId: string; continued: boolean; run: SubagentRun | undefined; controller: AbortController | undefined }
+    | { ok: false; reason: 'unavailable' | 'failed'; errorMessage?: string }
+  > {
+    if (member.sessionId !== '') {
+      const woken = await this.wakeMember(master, member, ticket)
+      if (woken.woken) {
+        return { ok: true, sessionId: member.sessionId, continued: true, run: undefined, controller: undefined }
+      }
+      this.ctx.logger.warn('taskboard: member ' + member.id + ' session ' + member.sessionId
+        + ' cannot be resumed for ticket ' + ticket.id + ' (' + woken.detail + '); rotating the member\'s session')
+    }
+    const spawn = await this.spawnWorker(master, ticket, workerLabel ?? ticket.title, preflight)
+    if (!spawn.ok) return spawn
+    return { ok: true, sessionId: spawn.sessionId, continued: false, run: spawn.run, controller: spawn.controller }
+  }
+
+  /**
+   * Wake one member's recorded session with the new-card prompt. The prompt is
+   * compiled from the card, so the woken session gets the fresh ticket (its
+   * previous card is closed) without the master ever touching its context.
+   */
+  private async wakeMember(
+    master: Agent, member: MemberRecord, ticket: TicketView,
+  ): Promise<{ woken: true } | { woken: false; detail: string }> {
+    const subagents = this.ctx.get('subagents')
+    if (subagents === undefined) return { woken: false, detail: 'the subagent seam is unavailable' }
+    if (typeof subagents.sendMessage !== 'function') {
+      return { woken: false, detail: 'the subagent seam exposes no continuable sendMessage' }
+    }
+    if (member.sessionId === '') return { woken: false, detail: 'the member has no bound session yet' }
+    const content: ContentBlock[] = [{
+      type: 'text',
+      text: buildMemberDispatchPrompt(ticket, member.id, master.session.header.cwd, master.id),
+    }]
+    try {
+      await subagents.sendMessage(master, member.sessionId as SessionId, content, {
+        signal: new AbortController().signal,
+      })
+    } catch (error) {
+      return { woken: false, detail: error instanceof Error ? error.message : String(error) }
+    }
+    return { woken: true }
+  }
+
+  /**
+   * Drain one board's queue, first-come-first-served (requirement: 不饿死).
+   * Runs whenever a member frees up (a card reaches Done, a card is returned
+   * to Not started) and from the periodic reconciliation, so a queued card
+   * moves on its own as soon as a member is free — but only while a live
+   * master session exists to parent the wake/spawn; otherwise the card stays
+   * visibly queued instead of disappearing.
+   * @returns how many queued cards this pass dispatched.
+   */
+  async drainQueue(boardId: string): Promise<number> {
+    // Re-number first: a card that left the queue by any other path (a move, a
+    // return to Not started) must not leave the remaining cards showing stale
+    // positions — the position is what makes the wait legible.
+    await this.repositionQueue(boardId)
+    const master = await this.liveMaster(boardId)
+    if (master === undefined) return 0
+    let dispatched = 0
+    // Bounded by the pair cap: each pass can start at most one card per slot.
+    for (let guard = 0; guard <= this.resolved.pairCapacity; guard += 1) {
+      const tickets = await this.boardTickets(boardId)
+      const next = TaskboardService.queuedOrder(tickets)[0]
+      if (next === undefined) break
+      if (next.column === 'in_testing') {
+        const seat = await this.reserveReviewerMember(next, next.workerMemberId)
+        if ('queued' in seat) break
+        await this.seatReviewer(master, next, seat.member).catch(() => null)
+        dispatched += 1
+        continue
+      }
+      const reservation = await this.reserveWorkerMember(next)
+      if ('queued' in reservation) break
+      const started = await this.startCardWithMember(
+        master, next, reservation.member, 'reassign', 'dispatched from the queue to ' + memberTag(reservation.member.id),
+      )
+      await this.repositionQueue(boardId)
+      if (started.worker === 'failed' || started.ticket.status === 'queued') break
+      await this.notifyMaster(started.ticket.boardId,
+        'Taskboard notice: ' + formatCompactEvent('WORKER_DEQUEUED', {
+          ticket: started.ticket.id,
+          title: started.ticket.title,
+          state: compactCardState(started.ticket),
+          scope: started.ticket.filesScope,
+          anomaly: 'left the queue: member ' + reservation.member.id + ' became free and took the card (first-come-first-served)',
+        }),
+        NOTICE_KIND.workerDequeued, started.ticket.id)
+      dispatched += 1
+    }
+    return dispatched
   }
 
   /**
@@ -1296,6 +1867,81 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Wake one reviewer member's existing session with the re-review prompt. The
+   * reviewer keeps its own accumulated review context and its own verdict; the
+   * prompt carries the fresh card state and the previous rejection items but
+   * never the worker's reasoning (user decision B).
+   */
+  private async wakeReviewer(
+    parent: Agent, member: MemberRecord, ticket: TicketView, feedback: string,
+  ): Promise<{ woken: true } | { woken: false; detail: string }> {
+    const subagents = this.ctx.get('subagents')
+    if (subagents === undefined) return { woken: false, detail: 'the subagent seam is unavailable' }
+    if (typeof subagents.sendMessage !== 'function') {
+      return { woken: false, detail: 'the subagent seam exposes no continuable sendMessage' }
+    }
+    if (member.sessionId === '') return { woken: false, detail: 'the member has no bound session yet' }
+    const content: ContentBlock[] = [{
+      type: 'text',
+      text: buildMemberReviewPrompt(ticket, member.id, feedback),
+    }]
+    try {
+      await subagents.sendMessage(parent, member.sessionId as SessionId, content, {
+        signal: new AbortController().signal,
+      })
+    } catch (error) {
+      return { woken: false, detail: error instanceof Error ? error.message : String(error) }
+    }
+    return { woken: true }
+  }
+
+  /**
+   * Seat one reserved reviewer member on an In testing card (V6-1 fixed
+   * pairing): wake the member's existing session when it has one — it already
+   * holds its review history for this card and for this worker — otherwise
+   * spawn a session and bind it to the member. Either way the seat records
+   * the member id, so the next rework returns to the same reviewer.
+   * @returns the seat outcome; a refusal carries the spawn failure reason.
+   */
+  private async seatReviewer(
+    parent: Agent, ticket: TicketView, member: MemberRecord,
+  ): Promise<
+    | { ok: true; ticket: TicketView; reviewerAgentId: string }
+    | { ok: false; reason: 'unavailable' | 'failed'; errorMessage?: string }
+  > {
+    if (member.sessionId !== '') {
+      const feedback = ticket.lastReview?.outcome === 'rejected' ? ticket.lastReview.feedback : ''
+      const woken = await this.wakeReviewer(parent, member, ticket, feedback)
+      if (woken.woken) {
+        const seated = await this.attachReviewer(
+          ticket.id,
+          { agentId: member.sessionId, label: reviewerLabel(member.sessionId) },
+          'reviewer ' + memberTag(member.id) + ' re-seated on its existing session',
+          true,
+          member.id,
+        )
+        await this.refreshMemberSummary(ticket.boardId, member.id)
+        return { ok: true, ticket: seated, reviewerAgentId: member.sessionId }
+      }
+      this.ctx.logger.warn('taskboard: reviewer member ' + member.id + ' session ' + member.sessionId
+        + ' cannot be resumed for ticket ' + ticket.id + ' (' + woken.detail + '); rotating the member\'s session')
+    }
+    const spawn = await this.spawnReviewer(parent, ticket)
+    if (!spawn.spawned) {
+      return spawn.reason === 'failed'
+        ? { ok: false, reason: 'failed', errorMessage: spawn.errorMessage }
+        : { ok: false, reason: 'unavailable' }
+    }
+    const withReviewer = await this.attachReviewer(
+      ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started', true, member.id,
+    )
+    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
+    await this.bindMemberSession(ticket.boardId, member.id, spawn.reviewer.agentId)
+    await this.refreshMemberSummary(ticket.boardId, member.id)
+    return { ok: true, ticket: withReviewer, reviewerAgentId: spawn.reviewer.agentId }
+  }
+
+  /**
    * Spawn the reviewer child for one ticket through the subagent seam. In
    * "report" mode the child only inspects and returns a structured verdict
    * ({ verdict, summary, problems }) — it is denied the card-mutating review
@@ -1511,7 +2157,15 @@ export class TaskboardService extends TypertRemoteService {
   private async followupWorker(master: Agent, ticket: TicketView, feedback: string): Promise<'sent' | 'unavailable' | 'none'> {
     if (ticket.workerSessionId === undefined) return 'none'
     const worker = this.ctx.agents.get(ticket.workerSessionId as SessionId)
-    if (worker === undefined) return 'unavailable'
+    if (worker === undefined) {
+      // V6-1: the original worker's roster session is durable, so 返修 returns
+      // to the original member even when its live handle is gone (a host
+      // restart, an unloaded child). Only a refused wake is 'unavailable'.
+      const woken = await this.wakeWorker(
+        master, ticket, 'the reviewer rejected this card — rework it per the feedback and report again',
+      )
+      return woken.woken ? 'sent' : 'unavailable'
+    }
     try {
       const content: ContentBlock[] = [{
         type: 'text',
@@ -1810,15 +2464,17 @@ export class TaskboardService extends TypertRemoteService {
    * Reentry-safe: the guarded mutate re-checks column/status/worker identity
    * atomically, so a card another path already recovered is returned
    * untouched and exactly one recovery ever lands per loss.
-   * V3-28: before spending a fresh spawn the recovery tries to WAKE the
-   * durable worker session (see {@link wakeWorker}). A successful wake keeps
-   * the card running with the same worker session — its context and working
-   * tree survive — and only a refusal falls through to the re-spawn below.
-   * @returns 'continued' | 'redispatched' | 'blocked' | 'skipped'
+   * V6-1 (fixed headcount): recovery NEVER adds a member. It wakes the
+   * durable worker session (see {@link wakeWorker}); when the wake is refused
+   * the card is parked as 待处理 (blocked with a readable reason naming the
+   * member) for the master to decide — the roster headcount is unchanged, and
+   * the member's session is rotated later by a deliberate
+   * taskboard_reassign action "retry".
+   * @returns 'continued' | 'pending' | 'blocked' | 'skipped'
    */
   private async recoverLostWorker(
     ticket: TicketView, reason: string,
-  ): Promise<'continued' | 'redispatched' | 'blocked' | 'skipped'> {
+  ): Promise<'continued' | 'pending' | 'blocked' | 'skipped'> {
     const registry = (this.ctx as { agents?: { get(id: string): Agent | undefined } }).agents
     if (registry === undefined || typeof registry.get !== 'function') return 'skipped'
     const sessionId = ticket.workerSessionId ?? ticket.workerAgentId
@@ -1886,62 +2542,57 @@ export class TaskboardService extends TypertRemoteService {
         NOTICE_KIND.workerContinued, woken.id)
       return 'continued'
     }
-    // No continuation state (a worker dispatched before V3-28, or a provider
-    // that cannot resume) and a failed wake both land here: the historic
-    // fresh re-spawn on the preserved working tree.
-    const spawn = await this.spawnWorker(master, ticket, 'auto-redispatch ' + attempt + ' ' + ticket.title)
-    if (!spawn.ok) {
-      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
-        ? 'auto-redispatch spawn failed: ' + spawn.errorMessage
-        : 'auto-redispatch spawn ' + spawn.reason
-      return this.blockLostWorker(ticket, reason, failureReason)
-    }
-    // Guarded attach: only the card that still names THIS worker session and
-    // is still running accepts the replacement; a card another path already
-    // recovered (settlement won first, or the reconcile beat us) is skipped.
-    let applied = false
+    // The wake was refused. V6-1: this is the end of automatic recovery —
+    // no replacement session and certainly no new member is created. The card
+    // is parked as 待处理 with a reason that names the member and the way out,
+    // so the master decides (and the headcount stays exactly as it was).
+    return this.parkLostWorker(ticket, reason, 'worker session could not be restored ('
+      + wake.detail + '); member ' + String(ticket.workerMemberId ?? '(none)')
+      + ' keeps its identity and its session is rotated only by a deliberate taskboard_reassign action "retry"')
+  }
+
+  /**
+   * Park one lost-worker card as 待处理 (V6-1 requirement 7): the card keeps
+   * its member, the headcount is unchanged, and the master is told the exact
+   * reason plus the manual way out. Reentry-safe exactly like
+   * {@link blockLostWorker}: only a card that still names the same worker
+   * session and is still running is parked.
+   */
+  private async parkLostWorker(ticket: TicketView, reason: string, detail: string): Promise<'pending' | 'skipped'> {
+    let parked = false
     let next: TicketView
     try {
-      next = await this.mutate(ticket.id, 'reassign', (current) => {
+      next = await this.mutate(ticket.id, 'fail', (current) => {
         if (current.column !== 'in_progress' || current.status !== 'running') return current
         const currentSession = current.workerSessionId ?? current.workerAgentId
-        if (currentSession !== sessionId) return current
-        applied = true
+        if (currentSession !== (ticket.workerSessionId ?? ticket.workerAgentId)) return current
+        parked = true
         return appendHistory(
           {
             ...current,
-            status: 'running',
-            failure: null,
-            autoRetries: attempt,
-            workerAgentId: spawn.sessionId,
-            workerSessionId: spawn.sessionId,
-            description: current.description.trim() === ''
-              ? '[auto-redispatch #' + attempt + '] 续做勿回滚：previous worker lost; continue from the preserved working tree.'
-              : current.description + '\n\n[auto-redispatch #' + attempt + '] 续做勿回滚：previous worker lost; continue from the preserved working tree.',
+            status: 'blocked',
+            failure: { reason: '待处理：' + detail, at: Date.now() },
             updatedAt: Date.now(),
           },
-          'reassign',
-          'auto-redispatched after ' + reason,
+          'fail',
+          '待处理 (pending): ' + detail,
         )
       })
     } catch {
-      // The card vanished mid-recovery; the fresh worker is orphaned but the
-      // card is gone, so nothing to recover.
       return 'skipped'
     }
-    if (!applied) return 'skipped'
-    // Attach termination reclamation only after the new identity is durable.
-    this.trackWorkerRun(ticket.id, spawn.sessionId, spawn.run, spawn.controller)
+    if (!parked) return 'skipped'
     await this.notifyMaster(next.boardId,
-      'Taskboard notice: ' + formatCompactEvent('WORKER_REDISPATCHED', {
+      'Taskboard notice: ' + formatCompactEvent('WORKER_PENDING', {
         ticket: next.id,
         title: next.title,
         state: compactCardState(next),
         scope: next.filesScope,
-        anomaly: `lost (${reason}); auto-redispatched (attempt ${attempt} of ${this.resolved.workerAutoRetryLimit}); working tree preserved — the new worker continues without rolling back; wake refused (${wake.detail})`,
-      }),
-      NOTICE_KIND.workerRedispatched, next.id)
-    return 'redispatched'
+        blocker: detail,
+        anomaly: 'lost (' + reason + '); the same session was tried first and refused — the card is 待处理 and the roster headcount is unchanged (no member was added)',
+      }) + ' Resume with taskboard_reassign action "retry" to rotate that member\'s session.',
+      NOTICE_KIND.workerPending, next.id)
+    return 'pending'
   }
 
   /**
@@ -2016,7 +2667,7 @@ export class TaskboardService extends TypertRemoteService {
    * column/status/worker identity atomically on the committed record, so a
    * card the settlement callback already recovered (or whose worker came
    * back) is returned untouched — exactly one recovery ever lands per card.
-   * @returns how many cards this pass recovered (redispatched or blocked).
+   * @returns how many cards this pass recovered (continued, parked 待处理, or blocked).
    */
   async reconcileLostWorkers(): Promise<number> {
     // The registry is the liveness authority; without it the pass cannot
@@ -2038,6 +2689,33 @@ export class TaskboardService extends TypertRemoteService {
       if (outcome !== 'skipped') recovered += 1
     }
     return recovered
+  }
+
+  /**
+   * V6-1: one queue-drain pass over every board — the safety net that keeps a
+   * queued card from waiting forever when a member freed up without a card
+   * event firing in this process (another session closed a card, a restart
+   * landed, ...). FIFO order is preserved by {@link drainQueue}; a board with
+   * no queued card costs one map lookup.
+   * @returns how many queued cards this pass dispatched.
+   */
+  async reconcileQueues(): Promise<number> {
+    const boards = await this.boards()
+    const boardIds = new Set<string>()
+    for (const [boardId] of boards.entries()) boardIds.add(boardId)
+    const table = await this.tickets()
+    let queued = 0
+    for (const [, ticket] of table.entries()) {
+      if (ticket.queue === null || ticket.queue === undefined) continue
+      queued += 1
+      boardIds.add(ticket.boardId)
+    }
+    if (queued === 0) return 0
+    let drained = 0
+    for (const boardId of boardIds) {
+      drained += await this.drainQueue(boardId).catch(() => 0)
+    }
+    return drained
   }
 
   /**
@@ -2166,11 +2844,17 @@ export class TaskboardService extends TypertRemoteService {
         if (spawn.spawned) {
           // resetRetries false: this redispatch is exactly what the per-card
           // budget counts, so the release increment above must survive.
+          // V6-1: the seat stays with the card's roster member (when it has
+          // one), so a reseat rotates a session, never the headcount.
           const withReviewer = await this.attachReviewer(
             releasedTicket.id, spawn.reviewer,
             'reviewer ' + spawn.reviewer.label + ' started (auto after release)', false,
+            releasedTicket.reviewerMemberId,
           )
           reseated = withReviewer.reviewer !== null
+          if (releasedTicket.reviewerMemberId !== undefined) {
+            await this.bindMemberSession(releasedTicket.boardId, releasedTicket.reviewerMemberId, spawn.reviewer.agentId)
+          }
           this.trackReviewerRun(releasedTicket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
         }
       }
@@ -2308,12 +2992,17 @@ export class TaskboardService extends TypertRemoteService {
     reviewer: TicketAssignee,
     detail: string,
     resetRetries = true,
+    memberId?: string,
   ): Promise<TicketView> {
     const now = Date.now()
     return this.mutate(ticketId, 'review-claim', current => appendHistory(
       {
         ...current,
         reviewer,
+        // V6-1: the seat belongs to a roster member (the fixed partner of the
+        // card's worker), and seating it lifts any visible queue waiting.
+        ...(memberId === undefined ? {} : { reviewerMemberId: memberId }),
+        ...(current.status === 'queued' ? { status: 'claimed' as TicketWorkerStatus, queue: null } : {}),
         ...(resetRetries
           ? {
             reviewerRetries: 0,
@@ -2369,17 +3058,33 @@ export class TaskboardService extends TypertRemoteService {
     TaskboardService.boardContextOf(request.boardId, current)
     const sourceColumn = current.column
     const position = this.positionBetween(table, request.column, request.beforeTicketId, request.afterTicketId)
-    const ticket = await this.mutate(request.ticketId, 'move', moved => appendHistory(
-      {
+    // V6-1: a deliberate move is the user's (or master's) explicit state
+    // change, so it lifts any visible queue; leaving the pair-owned state
+    // releases the card's members, which frees them for the next card.
+    const releasesRoster = request.column === 'backlog' || request.column === 'not_started'
+    const ticket = await this.mutate(request.ticketId, 'move', (moved) => {
+      const next: TicketView = {
         ...moved,
         column: request.column,
+        // A queued card that is moved by hand loses its queue marker, so its
+        // status must land on a column-appropriate value instead of a stale
+        // "queued" with no queue behind it.
+        status: moved.status === 'queued'
+          ? (request.column === 'backlog' || request.column === 'not_started'
+            ? 'ready'
+            : request.column === 'in_progress' ? 'running' : 'claimed')
+          : moved.status,
         position,
         reviewer: request.column === 'in_testing' ? moved.reviewer : null,
+        queue: null,
         updatedAt: Date.now(),
-      },
-      'move',
-      'moved to ' + request.column,
-    ))
+      }
+      if (releasesRoster) {
+        delete next.workerMemberId
+        delete next.reviewerMemberId
+      }
+      return appendHistory(next, 'move', 'moved to ' + request.column)
+    })
     // The user scheduling a card into Not started is the board's "start this"
     // signal: wake the master so it adjudicates whether to dispatch (every
     // dependency Done → taskboard_assign) or explains
@@ -2391,15 +3096,17 @@ export class TaskboardService extends TypertRemoteService {
       await this.notifyUserScheduled(ticket)
     }
     if (request.column === 'in_testing' && ticket.reviewer === null) {
-      const spawn = await this.spawnReviewer(agent, ticket)
-      if (spawn.spawned) {
-        const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-        this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
-        return withReviewer
-      }
-      if (spawn.reason === 'failed') {
-        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
-      }
+      // V6-1: the fixed partner of the card's worker member takes the seat.
+      const seat = await this.seatReviewerForCard(agent, ticket)
+      if (seat.review === 'spawned' || seat.ticket.queue !== null) return seat.ticket
+    }
+    if (request.column === 'done') {
+      // The card closed by hand still credits the pair's 履历 and frees the
+      // member for the next queued card.
+      await this.settlePairHistory(ticket)
+      void this.drainQueue(ticket.boardId).catch(() => 0)
+    } else if (releasesRoster) {
+      void this.drainQueue(ticket.boardId).catch(() => 0)
     }
     return ticket
   }
@@ -2472,7 +3179,17 @@ export class TaskboardService extends TypertRemoteService {
       const columnOrder = TASKBOARD_COLUMNS.indexOf(a.column) - TASKBOARD_COLUMNS.indexOf(b.column)
       return columnOrder !== 0 ? columnOrder : a.position - b.position
     })
-    return { boardId: board, name: boardRow.name, tickets, notices: boardRow.notices ?? [] }
+    // V6-1: the roster rides the snapshot (member ids, short summaries,
+    // derived load and held card) — the server-side data the office view
+    // renders, with no member context on the wire.
+    const roster = await this.rosterOf(board)
+    return {
+      boardId: board,
+      name: boardRow.name,
+      tickets,
+      notices: boardRow.notices ?? [],
+      members: roster.views,
+    }
   }
 
   private openTable: KvTable<string, TicketView> | null = null
@@ -2793,20 +3510,20 @@ export class TaskboardService extends TypertRemoteService {
     if (current.column !== 'in_testing') {
       throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
     }
-    const spawn = await this.spawnReviewer(agent, current)
-    if (!spawn.spawned) {
-      if (spawn.reason === 'failed') {
-        await this.recordReviewerSpawnFailure(current.id, spawn.errorMessage).catch(() => {})
-        throw new TaskboardError(
-          'no reviewer backend is available to assign: ' + spawn.errorMessage,
-          'TASKBOARD_INVALID_TRANSITION',
-        )
-      }
-      throw new TaskboardError('no reviewer backend is available to assign', 'TASKBOARD_INVALID_TRANSITION')
+    const reservation = await this.reserveReviewerMember(current, current.reviewerMemberId ?? current.workerMemberId)
+    if ('queued' in reservation) {
+      return await this.enqueueCard(current, reservation.queued, 'reviewer')
     }
-    const withReviewer = await this.attachReviewer(current.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(current.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
-    return withReviewer
+    const seat = await this.seatReviewer(agent, current, reservation.member)
+    if (seat.ok) return seat.ticket
+    if (seat.reason === 'failed') {
+      await this.recordReviewerSpawnFailure(current.id, seat.errorMessage ?? 'unknown reviewer spawn fault').catch(() => {})
+      throw new TaskboardError(
+        'no reviewer backend is available to assign: ' + String(seat.errorMessage ?? 'unknown reviewer spawn fault'),
+        'TASKBOARD_INVALID_TRANSITION',
+      )
+    }
+    throw new TaskboardError('no reviewer backend is available to assign', 'TASKBOARD_INVALID_TRANSITION')
   }
 
   /**
@@ -3317,62 +4034,38 @@ export class TaskboardService extends TypertRemoteService {
       throw new TaskboardError('ticket "' + ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
     }
     await this.assertMasterOfTicket(current, agent)
-    const running = await this.mutate(ticketId, 'assign', (ticket) => {
-      if (ticket.column !== 'not_started' && ticket.column !== 'backlog') {
-        throw new TaskboardError(
-          'ticket "' + ticket.id + '" is in "' + ticket.column + '" (assign requires Not started or Backlog)',
-          'TASKBOARD_INVALID_TRANSITION',
-        )
-      }
-      return appendHistory(
-        {
-          ...ticket,
-          column: 'in_progress',
-          status: 'running',
-          assignee: { agentId: agent.id, label: agentLabel(agent) },
-          failure: null,
-          autoRetries: 0,
-          updatedAt: Date.now(),
-        },
-        'assign',
-        'assigned to a worker by master ' + agentLabel(agent),
+    if (current.column !== 'not_started' && current.column !== 'backlog') {
+      throw new TaskboardError(
+        'ticket "' + current.id + '" is in "' + current.column + '" (assign requires Not started or Backlog)',
+        'TASKBOARD_INVALID_TRANSITION',
       )
-    })
-    // V3-20: deterministic repo/worktree preflight before any worker spawn.
-    // A violated repo fails the dispatch closed — the card is blocked with
-    // the concrete violations and no worker is ever spawned.
-    const preflight = await this.preflightDispatch(running, agent)
-    // facts-only mode (enforce: false) still surfaces the facts in the worker
-    // prompt but never blocks; the default remains fail closed.
-    if (preflight !== null && preflight.enforce && !preflight.report.safe) {
-      const blocked = await this.blockPreflight(running, preflight.report)
-      return { ticket: blocked, worker: 'failed', workerAgentId: null }
     }
-    const spawn = await this.spawnWorker(agent, running, workerLabel, preflight === null ? undefined : preflight.report)
-    if (!spawn.ok) {
-      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
-        ? 'worker spawn failed: ' + spawn.errorMessage
-        : 'worker spawn ' + spawn.reason
-      const blocked = await this.mutate(ticketId, 'fail', ticket => ({
-        ...ticket,
-        status: 'blocked',
-        failure: { reason: failureReason, at: Date.now() },
-        updatedAt: Date.now(),
-      })).catch(() => running)
-      return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
+    // V6-1 idempotence plus a manual drain: a card already waiting for a free
+    // member keeps its FIFO place, and the master re-asking is also a fresh
+    // attempt — when a member is free now, this dispatch starts it.
+    if (current.status === 'queued' && current.queue !== null && current.queue !== undefined) {
+      const retry = await this.reserveWorkerMember(current)
+      if ('queued' in retry) {
+        await this.repositionQueue(current.boardId)
+        return { ticket: await this.viewTicket(current.id), worker: 'queued', workerAgentId: null }
+      }
+      return this.startCardWithMember(
+        agent, current, retry.member, 'assign',
+        'dispatched from the queue to ' + memberTag(retry.member.id) + ' by master ' + agentLabel(agent),
+        workerLabel,
+      )
     }
-    const withWorker = await this.mutate(ticketId, 'assign', ticket => ({
-      ...ticket,
-      workerAgentId: spawn.sessionId,
-      workerSessionId: spawn.sessionId,
-      updatedAt: Date.now(),
-    }))
-    // Attach termination reclamation only after the worker identity is durable:
-    // an already-settled run (e.g. an infrastructure rejection) fires its
-    // settlement callback immediately, and the reclaim must see the card's
-    // workerSessionId to avoid a spurious no-op.
-    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run, spawn.controller)
-    return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
+    // V6-1 matching dispatch: the card gets an idle roster member (its own
+    // member first, then the member familiar with its modules, then the
+    // least-loaded one). Only when every member is busy at the configured cap
+    // does it enter the visible queue instead of spawning yet another agent.
+    const reservation = await this.reserveWorkerMember(current)
+    if ('queued' in reservation) {
+      return { ticket: await this.enqueueCard(current, reservation.queued), worker: 'queued', workerAgentId: null }
+    }
+    return this.startCardWithMember(
+      agent, current, reservation.member, 'assign', 'assigned to a worker by master ' + agentLabel(agent), workerLabel,
+    )
   }
 
   /**
@@ -3411,35 +4104,53 @@ export class TaskboardService extends TypertRemoteService {
         'worker reported development done, waiting for review',
       )
     })
-    // Spawn the reviewer first, notify the master after: a notification fault
+    // Seat the reviewer first, notify the master after: a notification fault
     // must never rob the card of its reviewer seat.
-    const spawn = await this.spawnReviewer(agent, ticket)
-    if (!spawn.spawned) {
-      if (spawn.reason === 'failed') {
-        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
-      }
-      await this.notifyMaster(ticket.boardId,
-        'Taskboard notice: ' + formatCompactEvent('WORKER_DONE', {
-          ticket: ticket.id,
-          title: ticket.title,
-          state: compactCardState(ticket),
-          scope: ticket.filesScope,
-          anomaly: 'reviewer spawn ' + spawn.reason,
-        }) + '. Adjudicate the review with taskboard_resolve_review.',
-        NOTICE_KIND.workerDone, ticket.id)
-      return { ticket, review: spawn.reason, reviewerAgentId: null }
-    }
-    const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
-    await this.notifyMaster(withReviewer.boardId,
+    const seat = await this.seatReviewerForCard(agent, ticket)
+    await this.notifyMaster(seat.ticket.boardId,
       'Taskboard notice: ' + formatCompactEvent('WORKER_DONE', {
-        ticket: withReviewer.id,
-        title: withReviewer.title,
-        state: compactCardState(withReviewer),
-        scope: withReviewer.filesScope,
+        ticket: seat.ticket.id,
+        title: seat.ticket.title,
+        state: compactCardState(seat.ticket),
+        scope: seat.ticket.filesScope,
+        ...(seat.review === 'spawned' ? {} : {
+          anomaly: seat.ticket.queue !== null && seat.ticket.queue !== undefined
+            ? 'review seat queued: ' + seat.ticket.queue.reason
+            : 'reviewer seat ' + seat.review,
+        }),
       }) + '. Adjudicate the review with taskboard_resolve_review.',
-      NOTICE_KIND.workerDone, withReviewer.id)
-    return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
+      NOTICE_KIND.workerDone, seat.ticket.id)
+    return seat
+  }
+
+  /**
+   * Reserve and seat the fixed reviewer for a freshly finished card (V6-1):
+   * the partner of the card's worker member holds the seat, so the same
+   * reviewer re-reviews the same card every rework round (user decision B).
+   * When the reviewer roster is at its cap and every reviewer is busy, the
+   * card keeps its In testing column and flips to the visible queue with a
+   * readable reason instead of spawning another reviewer agent.
+   * @param agent - the reporting worker session (the parent of the reviewer).
+   * @param ticket - the In testing card needing its seat.
+   * @returns the card plus the seat outcome in the report-tool vocabulary.
+   */
+  private async seatReviewerForCard(agent: Agent, ticket: TicketView): Promise<CompleteTicketResult> {
+    const reservation = await this.reserveReviewerMember(ticket, ticket.reviewerMemberId ?? ticket.workerMemberId)
+    if ('queued' in reservation) {
+      return {
+        ticket: await this.enqueueCard(ticket, reservation.queued, 'reviewer'),
+        review: 'unavailable',
+        reviewerAgentId: null,
+      }
+    }
+    const seat = await this.seatReviewer(agent, ticket, reservation.member)
+    if (!seat.ok) {
+      if (seat.reason === 'failed' && seat.errorMessage !== undefined) {
+        await this.recordReviewerSpawnFailure(ticket.id, seat.errorMessage).catch(() => {})
+      }
+      return { ticket, review: seat.reason, reviewerAgentId: null }
+    }
+    return { ticket: seat.ticket, review: 'spawned', reviewerAgentId: seat.reviewerAgentId }
   }
 
   /**
@@ -3559,10 +4270,13 @@ export class TaskboardService extends TypertRemoteService {
           reviewer: null,
           autoRetries: 0,
           reviewerRetries: 0,
+          queue: null,
           updatedAt: Date.now(),
         }
         delete reset.workerAgentId
         delete reset.workerSessionId
+        delete reset.workerMemberId
+        delete reset.reviewerMemberId
         return appendHistory(
           reset,
           'reassign',
@@ -3570,55 +4284,29 @@ export class TaskboardService extends TypertRemoteService {
         )
       })
       // The card left the in-flight state: release its run handle so a later
-      // pause cannot target a worker that no longer owns the card.
+      // pause cannot target a worker that no longer owns the card. The member
+      // it freed takes the next queued card (V6-1, first-come-first-served).
       this.runHandles.delete(ticketId)
+      void this.drainQueue(ticket.boardId).catch(() => 0)
       return { ticket, worker: null, workerAgentId: null }
     }
-    const running = await this.mutate(ticketId, 'reassign', (retried) => {
-      if (retried.column !== 'in_progress') {
-        throw new TaskboardError(
-          'ticket "' + retried.id + '" is in "' + retried.column + '" (retry requires In progress)',
-          'TASKBOARD_INVALID_TRANSITION',
-        )
-      }
-      return appendHistory(
-        { ...retried, status: 'running', failure: null, autoRetries: 0, reviewerRetries: 0, updatedAt: Date.now() },
-        'reassign',
-        retried.status === 'paused'
-          ? 're-dispatched by master (resumed from pause)'
-          : 're-dispatched by master',
-      )
-    })
-    // V3-20: deterministic repo/worktree preflight before any re-dispatch
-    // spawn; a violated repo fails the retry closed (card blocked, no worker).
-    const preflight = await this.preflightDispatch(running, agent)
-    // facts-only mode (enforce: false) still surfaces the facts in the worker
-    // prompt but never blocks; the default remains fail closed.
-    if (preflight !== null && preflight.enforce && !preflight.report.safe) {
-      const blocked = await this.blockPreflight(running, preflight.report)
-      return { ticket: blocked, worker: 'failed', workerAgentId: null }
+    // V6-1: a retry rotates the card's own member session when the member is
+    // free (原人返修), and otherwise queues the card instead of adding a member.
+    const reservation = await this.reserveWorkerMember(current)
+    if ('queued' in reservation) {
+      const queued = await this.enqueueCard(current, reservation.queued)
+      return { ticket: queued, worker: 'queued', workerAgentId: null }
     }
-    const spawn = await this.spawnWorker(agent, running, workerLabel, preflight === null ? undefined : preflight.report)
-    if (!spawn.ok) {
-      const failureReason = spawn.reason === 'failed' && spawn.errorMessage !== undefined
-        ? 'worker spawn failed: ' + spawn.errorMessage
-        : 'worker spawn ' + spawn.reason
-      const blocked = await this.mutate(ticketId, 'fail', ticket => ({
-        ...ticket,
-        status: 'blocked',
-        failure: { reason: failureReason, at: Date.now() },
-        updatedAt: Date.now(),
-      })).catch(() => running)
-      return { ticket: blocked, worker: spawn.reason, workerAgentId: null }
-    }
-    const withWorker = await this.mutate(ticketId, 'reassign', ticket => ({
-      ...ticket,
-      workerAgentId: spawn.sessionId,
-      workerSessionId: spawn.sessionId,
-      updatedAt: Date.now(),
-    }))
-    this.trackWorkerRun(ticketId, spawn.sessionId, spawn.run, spawn.controller)
-    return { ticket: withWorker, worker: 'spawned', workerAgentId: spawn.sessionId }
+    return this.startCardWithMember(
+      agent,
+      current,
+      reservation.member,
+      'reassign',
+      current.status === 'paused'
+        ? 're-dispatched by master (resumed from pause)'
+        : 're-dispatched by master',
+      workerLabel,
+    )
   }
 
   /**
@@ -3895,16 +4583,7 @@ export class TaskboardService extends TypertRemoteService {
         'development done, waiting for review',
       )
     })
-    const spawn = await this.spawnReviewer(agent, ticket)
-    if (!spawn.spawned) {
-      if (spawn.reason === 'failed') {
-        await this.recordReviewerSpawnFailure(ticket.id, spawn.errorMessage).catch(() => {})
-      }
-      return { ticket, review: spawn.reason, reviewerAgentId: null }
-    }
-    const withReviewer = await this.attachReviewer(ticket.id, spawn.reviewer, 'reviewer ' + spawn.reviewer.label + ' started')
-    this.trackReviewerRun(ticket.id, spawn.reviewer.agentId, spawn.run, spawn.controller)
-    return { ticket: withReviewer, review: 'spawned', reviewerAgentId: spawn.reviewer.agentId }
+    return this.seatReviewerForCard(agent, ticket)
   }
 
   /**
@@ -3915,7 +4594,7 @@ export class TaskboardService extends TypertRemoteService {
    * @returns the approved Done ticket.
    */
   async approve(agent: Agent, ticketId: string, summary: string): Promise<TicketView> {
-    return this.mutate(ticketId, 'approve', (current) => {
+    const approved = await this.mutate(ticketId, 'approve', (current) => {
       if (current.column !== 'in_testing') {
         throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
       }
@@ -3941,6 +4620,11 @@ export class TaskboardService extends TypertRemoteService {
         'review approved',
       )
     })
+    // V6-1: the card closed — credit the pair's 履历 and hand the freed member
+    // the next queued card, first-come-first-served.
+    await this.settlePairHistory(approved)
+    void this.drainQueue(approved.boardId).catch(() => 0)
+    return approved
   }
 
   /**
@@ -3976,6 +4660,9 @@ export class TaskboardService extends TypertRemoteService {
             at: Date.now(),
           },
           reviewer: null,
+          // V6-1: the reviewer member stays, so the re-review returns to the
+          // same reviewer; the visible queue flag is lifted with the seat.
+          queue: null,
           autoRetries: 0,
           reviewerRetries: 0,
           updatedAt: Date.now(),
@@ -4066,6 +4753,10 @@ export class TaskboardService extends TypertRemoteService {
         )
       })
       const archived = await this.archiveWorkerSession(approved)
+      // V6-1: the card is closed — the pair's 履历 picks it up and the freed
+      // member takes the next queued card (first-come-first-served).
+      await this.settlePairHistory(approved)
+      void this.drainQueue(approved.boardId).catch(() => 0)
       return { ticket: approved, action: 'approved', followup: 'none', archived, blockedAfterReject: false }
     }
 
@@ -4093,6 +4784,10 @@ export class TaskboardService extends TypertRemoteService {
             at: Date.now(),
           },
           reviewer: null,
+          // V6-1: the reviewer MEMBER stays on the card, so the re-review
+          // returns to the same reviewer (its own defects memory) instead of
+          // picking someone new.
+          queue: null,
           autoRetries: 0,
           reviewerRetries: 0,
           updatedAt: Date.now(),
@@ -4233,6 +4928,9 @@ export class TaskboardService extends TypertRemoteService {
         type: ticket.type,
         status: ticket.status,
         workerAgentId: ticket.workerAgentId ?? null,
+        workerMemberId: ticket.workerMemberId ?? null,
+        reviewerMemberId: ticket.reviewerMemberId ?? null,
+        queue: ticket.queue ?? null,
         failure: ticket.failure,
         position: ticket.position,
         assignee: ticket.assignee,
@@ -4315,6 +5013,28 @@ export class TaskboardService extends TypertRemoteService {
         workerAgentId: {
           oneOf: [
             { type: 'string' as const },
+            { type: 'null' as const },
+          ] as const, required: true as const,
+        },
+        workerMemberId: {
+          oneOf: [
+            { type: 'string' as const },
+            { type: 'null' as const },
+          ] as const, required: true as const,
+        },
+        reviewerMemberId: {
+          oneOf: [
+            { type: 'string' as const },
+            { type: 'null' as const },
+          ] as const, required: true as const,
+        },
+        queue: {
+          oneOf: [
+            { type: 'object' as const, additionalProperties: false, properties: {
+              reason: { type: 'string' as const, required: true as const },
+              enqueuedAt: { type: 'number' as const, required: true as const },
+              position: { type: 'number' as const, required: true as const },
+            } },
             { type: 'null' as const },
           ] as const, required: true as const,
         },
@@ -4429,6 +5149,77 @@ export class TaskboardService extends TypertRemoteService {
         return { tickets }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'List taskboard tickets', kind: 'other' as const, rawInput: args.column ?? null }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_roster',
+      description: 'Read one board\'s fixed roster (V6-1): every member\'s id, role, fixed partner, derived load (idle/busy), the card it currently holds, and its SHORT work summary. This is the master\'s whole matching input — the master never reads a member\'s full context. Read it before dispatching when you want to see who is free, who is familiar with the card\'s modules, and whether the headcount is saturated (a saturated roster queues new cards instead of creating agents).',
+      parameters: {
+        boardId: { type: 'string' as const, description: 'Board whose roster to read; defaults to "default".' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            /** The effective fixed pair count (min of the two configured caps). */
+            capacity: { type: 'number', required: true },
+            members: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  id: { type: 'string', required: true },
+                  role: { type: 'string', required: true, enum: [...TASKBOARD_MEMBER_ROLES] },
+                  partnerId: { type: 'string', required: true },
+                  sessionId: { type: 'string', required: true },
+                  status: { type: 'string', required: true, enum: ['idle', 'busy'] },
+                  currentTicketId: {
+                    oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true,
+                  },
+                  summary: { type: 'string', required: true },
+                  modules: { type: 'array', required: true, items: { type: 'string' } },
+                  recentTickets: { type: 'array', required: true, items: { type: 'string' } },
+                },
+              },
+            },
+          },
+        },
+        render: (_args, value: {
+          boardId: string
+          capacity: number
+          members: { id: string; role: string; partnerId: string; status: string; currentTicketId: string | null; summary: string }[]
+        }) => [{
+          type: 'text' as const,
+          text: 'roster board=' + value.boardId + ' capability=' + String(value.capacity) + ' pair(s)\n'
+            + (value.members.length === 0
+              ? '(no member created yet — the first dispatch creates W1/R1)'
+              : value.members.map(member => '- ' + member.id + ' (' + member.role + ', partner ' + member.partnerId + ', '
+                + member.status + (member.currentTicketId === null ? '' : ' on ' + member.currentTicketId) + '): ' + member.summary).join('\n')),
+        }],
+      },
+      execute: async (args: { boardId?: string }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        const boardId = args.boardId ?? 'default'
+        await this.assertBoardAccessible(boardId, agent)
+        const roster = await this.rosterOf(boardId)
+        return {
+          boardId,
+          capacity: this.resolved.pairCapacity,
+          members: roster.views.map(member => ({
+            id: member.id,
+            role: member.role,
+            partnerId: member.partnerId,
+            sessionId: member.sessionId,
+            status: member.status,
+            currentTicketId: member.currentTicketId,
+            summary: member.summary,
+            modules: member.modules,
+            recentTickets: member.recentTickets,
+          })),
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Read taskboard roster', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
     }))
 
     this.ctx.tools.register(defineTool({
@@ -4997,7 +5788,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_assign',
-      description: 'Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.',
+      description: 'Dispatch a Backlog or Not started taskboard ticket (master only). V6-1 fixed headcount: the card is given to an IDLE ROSTER MEMBER — its own member on a rework, else the idle member whose summary/modules match the card, else the least-loaded idle member; that member\'s existing session is woken (continue) when it has one, otherwise a first session is spawned for it. When every member is busy at the configured cap the card is QUEUED (status "queued", visible with its reason and FIFO position) instead of creating another agent, and it starts automatically when a member frees up. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker and its member identity.',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The Backlog or Not started ticket to dispatch.' },
         workerLabel: {
@@ -5012,7 +5803,7 @@ export class TaskboardService extends TypertRemoteService {
             ticketId: { type: 'string', required: true },
             column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
             status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
-            worker: { type: 'string', required: true, enum: ['spawned', 'unavailable', 'failed'] },
+            worker: { type: 'string', required: true, enum: ['spawned', 'continued', 'queued', 'unavailable', 'failed'] },
             workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
           },
         },
@@ -5020,9 +5811,13 @@ export class TaskboardService extends TypertRemoteService {
           type: 'text' as const,
           text: (value.worker === 'spawned'
             ? 'ticket ' + value.ticketId + ' dispatched; worker ' + String(value.workerAgentId) + ' started'
-            : value.status === 'blocked'
-              ? 'ticket ' + value.ticketId + ' blocked before a worker was spawned (see the card failure for the reason)'
-              : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker)
+            : value.worker === 'continued'
+              ? 'ticket ' + value.ticketId + ' dispatched; the idle roster member\'s existing session was woken (its context and working tree are preserved)'
+              : value.worker === 'queued'
+                ? 'ticket ' + value.ticketId + ' is QUEUED: every roster member is busy at the configured headcount. The card stays in its column with status queued and carries the wait reason; it is dispatched first-come-first-served as soon as a member is free (no new agent is created).'
+                : value.status === 'blocked'
+                  ? 'ticket ' + value.ticketId + ' blocked before a worker was spawned (see the card failure for the reason)'
+                  : 'ticket ' + value.ticketId + ' moved In progress but worker spawn ' + value.worker)
             + '\n' + DISPATCH_TURN_END,
         }],
       },
@@ -5041,7 +5836,7 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_report',
-      description: 'Report taskboard ticket development as complete (assigned worker only): the card moves to In testing and the board automatically assigns a fresh reviewer agent. devNotes summarizes what changed, which files were touched, and how it was verified — the reviewer reads exactly that.',
+      description: 'Report taskboard ticket development as complete (assigned worker only): the card moves to In testing and the board seats its FIXED REVIEWER — the roster member paired with this card\'s worker (the same reviewer re-reviews every rework round). devNotes summarizes what changed, which files were touched, and how it was verified — the reviewer reads exactly that.',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The ticket this worker was assigned.' },
         devNotes: {
@@ -5101,12 +5896,12 @@ export class TaskboardService extends TypertRemoteService {
 
     this.ctx.tools.register(defineTool({
       name: 'taskboard_reassign',
-      description: 'Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "continue" (V3-28) instead wakes the card\'s existing worker session — it keeps its context and the preserved working tree, so prefer it for a blocked, paused or silent worker, and it degrades to a fresh spawn by itself when the session cannot be resumed; action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.',
+      description: 'Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and puts the card back on its own roster member (rotation of that member\'s session — the headcount never grows; if no member is free the card queues); action "continue" (V3-28) instead wakes the card\'s existing worker session — it keeps its context and the preserved working tree, so prefer it for a blocked, paused or silent worker; action "backlog" returns the card to Not started with status ready, clearing assignee, worker identity and the roster pair.',
       parameters: {
         ticketId: { type: 'string' as const, required: true, description: 'The In progress card to re-dispatch.' },
         action: {
           type: 'string' as const, required: true, enum: ['retry', 'continue', 'backlog'],
-          description: 'retry spawns a new worker; continue wakes the existing worker session (falling back to a fresh spawn); backlog returns the card to Not started.',
+          description: 'retry re-dispatches to the card\'s roster member (rotating its session when the old one is gone; queues when no member is free); continue wakes the existing worker session; backlog returns the card to Not started.',
         },
         workerLabel: {
           type: 'string' as const,
@@ -5120,7 +5915,7 @@ export class TaskboardService extends TypertRemoteService {
             ticketId: { type: 'string', required: true },
             column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
             status: { type: 'string', required: true, enum: [...TASKBOARD_WORKER_STATUSES] },
-            worker: { oneOf: [{ type: 'string', enum: ['spawned', 'continued', 'unavailable', 'failed'] }, { type: 'null' }] as const, required: true },
+            worker: { oneOf: [{ type: 'string', enum: ['spawned', 'continued', 'queued', 'unavailable', 'failed'] }, { type: 'null' }] as const, required: true },
             workerAgentId: { oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true },
           },
         },
@@ -5130,7 +5925,9 @@ export class TaskboardService extends TypertRemoteService {
             ? 'ticket ' + value.ticketId + ' re-dispatched; new worker started'
             : value.worker === 'continued'
               ? 'ticket ' + value.ticketId + ' re-dispatched; the existing worker session was woken (context and working tree preserved)'
-              : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker))
+              : value.worker === 'queued'
+                ? 'ticket ' + value.ticketId + ' is QUEUED: no idle roster member inside the configured headcount. The card keeps its column with status queued and a readable wait reason; it starts first-come-first-served when a member is free.'
+                : 'ticket ' + value.ticketId + ' re-dispatched; worker spawn ' + String(value.worker))
             + '\n' + DISPATCH_TURN_END,
         }],
       },

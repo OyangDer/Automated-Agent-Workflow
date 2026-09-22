@@ -108,6 +108,15 @@ export function TaskboardView({
   const ticketCount = board?.tickets.length ?? 0
 
   /**
+   * The board's roster (V6-1) and its current pair count. Pairs are the unit
+   * of the fixed headcount, so the count is the number of worker members (or
+   * of reviewer members when only those exist yet).
+   */
+  const roster = board?.members ?? []
+  const pairCount = roster.filter(member => member.role === 'worker').length
+    || roster.filter(member => member.role === 'reviewer').length
+
+  /**
    * Master-seat banner state for the active board: vacant, held (with a
    * lease about to expire warning) or expired. The host reports
    * masterExpiresAt (claim time plus the configured lease), so the expiring
@@ -389,6 +398,32 @@ export function TaskboardView({
         <div className={css.errorBanner} role="alert">
           <span>{error}</span>
           <button type="button" className={css.errorClose} onClick={() => setError(null)} aria-label={t('action.close')}>×</button>
+        </div>
+      )}
+      {/*
+        V6-1 visualization base: the board's fixed roster — member id, role,
+        fixed partner, derived load and the SHORT work summary the master
+        matches on. It is a read-only strip: dispatching stays with the master
+        (taskboard_assign) and the queue is drained by the board itself.
+      */}
+      {roster.length > 0 && (
+        <div className={css.roster} data-testid="taskboard-roster">
+          <span className={css.rosterTitle}>
+            {t('roster.title')}
+            <span className={css.rosterCapacity}>{t('roster.capacity').replace('{count}', String(pairCount))}</span>
+          </span>
+          {roster.map(member => (
+            <span key={member.id} className={css.rosterChip} data-status={member.status}>
+              <b className={css.rosterId}>{member.id}</b>
+              <span className={css.rosterPartner}>{'↔ ' + member.partnerId}</span>
+              <span className={css.rosterState}>
+                {member.status === 'busy'
+                  ? t('roster.busy').replace('{ticket}', member.currentTicketId ?? '')
+                  : t('roster.idle')}
+              </span>
+              <span className={css.rosterSummary} title={member.summary}>{member.summary}</span>
+            </span>
+          ))}
         </div>
       )}
       <div className={css.board} ref={boardRef} onDragOver={handleBoardDragOver}>

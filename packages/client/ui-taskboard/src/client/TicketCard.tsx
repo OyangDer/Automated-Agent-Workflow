@@ -40,6 +40,15 @@ function typeAccent(type: TicketView['type']): string {
   return TYPE_ACCENT[type] ?? 'var(--dsw-alias-label-tertiary)'
 }
 
+/**
+ * The fixed partner of one roster member id (V6-1): W<n> pairs with R<n>.
+ * The board computes the pairing the same way, so this only renders it.
+ */
+function partnerOf(id: string): string {
+  const match = /^[WR](\d+)$/.exec(id)
+  return (id.startsWith('R') ? 'W' : 'R') + (match === null ? '' : match[1])
+}
+
 export function TicketCard({
   ticket, selected, dragging, t,
   onSelect, onDragStart, onDragEnd,
@@ -48,6 +57,11 @@ export function TicketCard({
   const reviewing = ticket.column === 'in_testing'
   const approved = ticket.lastReview?.outcome === 'approved'
   const paused = ticket.status === 'paused'
+  const queued = ticket.status === 'queued'
+  // V6-1: the fixed worker -> reviewer pair is readable on the card itself.
+  const pair = ticket.workerMemberId === undefined
+    ? null
+    : { worker: ticket.workerMemberId, reviewer: ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId) }
   return (
     <article
       className={css.card + (selected ? ' ' + css.cardSelected : '') + (dragging ? ' ' + css.cardDragging : '')}
@@ -80,10 +94,21 @@ export function TicketCard({
       {ticket.description.trim() !== '' && (
         <p className={css.cardDescription}>{ticket.description}</p>
       )}
+      {queued && ticket.queue !== null && ticket.queue !== undefined && (
+        <p className={css.cardQueue}>
+          {t('state.queueReason').replace('{reason}', ticket.queue.reason)}
+        </p>
+      )}
       <div className={css.cardMeta}>
         {ticket.assignee === null
           ? <span className={css.metaLabel}>{t('state.unassigned')}</span>
           : <span className={css.metaLabel}>{ticket.assignee.label}</span>}
+        {pair !== null && (
+          <span className={css.metaLabel}>
+            {t('state.pair').replace('{worker}', pair.worker).replace('{reviewer}', pair.reviewer)}
+          </span>
+        )}
+        {queued && <span className={css.badge + ' ' + css.badgeQueued}>{t('state.queued')}</span>}
         {reviewing && <span className={css.badge + ' ' + css.badgeReviewing}>{t('state.reviewing')}</span>}
         {rejected && <span className={css.badge + ' ' + css.badgeRejected}>{t('state.rejected')}</span>}
         {approved && <span className={css.badge + ' ' + css.badgeApproved}>{t('state.approved')}</span>}

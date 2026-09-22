@@ -17,6 +17,16 @@ const COLUMNS: readonly ColumnId[] = ['backlog', 'not_started', 'in_progress', '
 const PRIORITIES: readonly Priority[] = ['low', 'normal', 'high']
 
 /**
+ * The fixed partner of one roster member id (V6-1): W<n> pairs with R<n>.
+ * @param id - the member id shown on the card.
+ * @returns the partner member id.
+ */
+function partnerOf(id: string): string {
+  const match = /^[WR](\d+)$/.exec(id)
+  return (id.startsWith('R') ? 'W' : 'R') + (match === null ? '' : match[1])
+}
+
+/**
  * Turn one rejected verb into a user-facing message: surface the real
  * server failure text when the rejection carries one, falling back to the
  * generic copy for non-Error rejections.
@@ -115,6 +125,22 @@ export function TicketDetail({
             <dt>{t('detail.reviewer')}</dt>
             <dd>{ticket.reviewer === null ? t('state.unassigned') : ticket.reviewer.label}</dd>
           </div>
+          {ticket.workerMemberId !== undefined && (
+            <div className={css.fact}>
+              <dt>{t('detail.pair')}</dt>
+              <dd>
+                {t('detail.pairValue')
+                  .replace('{worker}', ticket.workerMemberId)
+                  .replace('{reviewer}', ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId))}
+              </dd>
+            </div>
+          )}
+          {ticket.queue !== null && ticket.queue !== undefined && (
+            <div className={css.fact}>
+              <dt>{t('detail.queue')}</dt>
+              <dd>{'#' + String(ticket.queue.position) + ' · ' + ticket.queue.reason}</dd>
+            </div>
+          )}
           <div className={css.fact}>
             <dt>{t('detail.reviewAttempts')}</dt>
             <dd>{String(ticket.reviewAttempts)}</dd>

@@ -26,11 +26,79 @@ export const TASKBOARD_TYPES = ['feature', 'bugfix', 'refactor', 'docs', 'test',
 /** One ticket kind. */
 export type TicketType = typeof TASKBOARD_TYPES[number]
 
-/** The worker lifecycle of one card (v2 dispatch protocol). */
-export const TASKBOARD_WORKER_STATUSES = ['ready', 'claimed', 'running', 'blocked', 'paused'] as const
+/**
+ * The worker lifecycle of one card (v2 dispatch protocol, extended by the V6-1
+ * fixed-headcount roster). `queued` is the roster's visible waiting state: the
+ * card stayed in its column (Backlog/Not started) because every member that
+ * could take it is busy and the headcount cap is reached — it never silently
+ * stops moving, and the wait reason is readable on the card itself.
+ */
+export const TASKBOARD_WORKER_STATUSES = ['ready', 'claimed', 'running', 'blocked', 'paused', 'queued'] as const
 
 /** One worker lifecycle state. */
 export type TicketWorkerStatus = typeof TASKBOARD_WORKER_STATUSES[number]
+
+/** The two roster roles; every member is exactly one of them. */
+export const TASKBOARD_MEMBER_ROLES = ['worker', 'reviewer'] as const
+
+/** One roster role. */
+export type MemberRole = typeof TASKBOARD_MEMBER_ROLES[number]
+
+/**
+ * One durable roster member (V6-1). A member is NOT a session: the member
+ * identity survives session rotation — its number,履历 (modules/recent cards)
+ * and short summary persist — while {@link MemberRecord.sessionId} names the
+ * session currently bound to it, which may be woken (continue) or replaced on
+ * a threshold without ever changing the headcount.
+ */
+export interface MemberRecord {
+  /** Stable per-board member id: "W1"/"W2" for workers, "R1"/"R2" for reviewers. */
+  id: string
+  /** The board this member belongs to (member ids are per board). */
+  boardId: string
+  role: MemberRole
+  /** The fixed partner member id: W1 <-> R1, W2 <-> R2 (one pair owns one card). */
+  partnerId: string
+  /** The session currently bound to the member; '' before its first dispatch. */
+  sessionId: string
+  /**
+   * The member's short work summary (capped at MEMBER_SUMMARY_LIMIT
+   * characters), built from its familiar modules, recently finished cards and
+   * current load. This is the ONLY thing the master reads for matching
+   * (the master never reads a member's full context), and it is persisted
+   * server-side so a later office view can render it.
+   */
+  summary: string
+  /** Familiar module keywords (lower-case path segments harvested from filesScope). */
+  modules: string[]
+  /** Recently finished ticket ids, newest first (capped). */
+  recentTickets: string[]
+  createdAt: number
+  updatedAt: number
+}
+
+/** One roster member as the wire serves it: the durable record plus derived load. */
+export interface MemberView extends MemberRecord {
+  /** Derived load: busy holds a card that has not reached Done yet. */
+  status: 'idle' | 'busy'
+  /** The card the member currently holds (In progress or In testing); null when idle. */
+  currentTicketId: string | null
+}
+
+/**
+ * One card's visible queue state (V6-1). Set when a dispatch had to wait:
+ * every member that could take the card is busy and the headcount cap is
+ * reached. The card keeps its column and carries the reason, so the wait is
+ * readable instead of the card silently standing still.
+ */
+export interface TicketQueue {
+  /** Why the card is waiting, in the board language (names the busy members). */
+  reason: string
+  /** Unix epoch milliseconds when the card entered the queue. */
+  enqueuedAt: number
+  /** 1-based first-come-first-served position among this board's queued cards. */
+  position: number
+}
 
 /** One durable worker-failure record, written by taskboard_fail or auto-reclamation. */
 export interface TicketFailure {
@@ -97,6 +165,24 @@ export interface TicketView {
   workerAgentId?: string | undefined
   /** The spawned worker run session id (equals workerAgentId for in-process spawns). */
   workerSessionId?: string | undefined
+  /**
+   * The fixed roster member that owns this card as worker (V6-1), e.g. "W1".
+   * Absent on cards dispatched before the roster existed. The member identity
+   * outlives its session, so a rework after a rejection goes back to this
+   * member instead of picking someone new.
+   */
+  workerMemberId?: string | undefined
+  /**
+   * The fixed roster member holding this card's review seat (V6-1), e.g.
+   * "R1" — the fixed partner of {@link workerMemberId}. Kept across rework
+   * rounds so the same reviewer re-reviews the same card.
+   */
+  reviewerMemberId?: string | undefined
+  /**
+   * The card's visible wait state; null (or absent on old records) while the
+   * card is not waiting for a free member.
+   */
+  queue?: TicketQueue | null | undefined
   /** Last worker failure; null while the card is healthy. */
   failure: TicketFailure | null
   /**
@@ -247,6 +333,13 @@ export interface BoardSnapshot {
   tickets: TicketView[]
   /** The board's durable master notices, newest last; absent on old hosts. */
   notices?: BoardNotice[]
+  /**
+   * The board's roster (V6-1), ordered by role then member index; absent on
+   * old hosts. Each row carries the member's short work summary, its derived
+   * load and the card it currently holds — the server-side data the office
+   * view reads, with no member context on the wire.
+   */
+  members?: MemberView[]
 }
 
 /**

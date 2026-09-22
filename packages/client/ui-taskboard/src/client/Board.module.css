@@ -17,6 +17,73 @@
   border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
+/* V6-1: the fixed roster strip — who is on the team, who is free, and the
+   short work summary the master matches against. Read-only. */
+.roster {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.rosterTitle {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.rosterCapacity {
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.rosterChip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 340px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+
+.rosterChip[data-status='busy'] {
+  border-color: var(--dsw-alias-state-warn-primary);
+}
+
+.rosterId {
+  font-family: var(--dsw-font-mono);
+  color: var(--dsw-alias-label-primary);
+}
+
+.rosterPartner {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.rosterState {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+
+.rosterSummary {
+  color: var(--dsw-alias-label-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .title {
   font-size: 15px;
   line-height: 22px;

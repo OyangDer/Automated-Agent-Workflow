@@ -234,6 +234,10 @@ interface HarnessOptions {
   reviewerStaleTimeoutMs?: number
   /** Per-card reviewer re-review cap passed to the plugin (defaults to 2). */
   reviewerAutoRetryLimit?: number
+  /** V6-1 fixed headcount: max worker roster members per board (defaults to 2). */
+  workerCapacity?: number
+  /** V6-1 fixed headcount: max reviewer roster members per board (defaults to 2). */
+  reviewerCapacity?: number
   /** When set, a fake session-persistence seam (append/inspect) is provided to the service. */
   sessionPersistence?: ReturnType<typeof fakeSessionPersistence>
   /**
@@ -366,6 +370,8 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     ...(options.workerAutoRetryLimit === undefined ? {} : { workerAutoRetryLimit: options.workerAutoRetryLimit }),
     ...(options.reviewerStaleTimeoutMs === undefined ? {} : { reviewerStaleTimeoutMs: options.reviewerStaleTimeoutMs }),
     ...(options.reviewerAutoRetryLimit === undefined ? {} : { reviewerAutoRetryLimit: options.reviewerAutoRetryLimit }),
+    ...(options.workerCapacity === undefined ? {} : { workerCapacity: options.workerCapacity }),
+    ...(options.reviewerCapacity === undefined ? {} : { reviewerCapacity: options.reviewerCapacity }),
   })
   const service = ctx.taskboard
   const changes: TaskboardChanged[] = []
@@ -793,33 +799,38 @@ describe('TaskboardService workflow', () => {
     await expect(service.pause(devA, 'ticket-missing', 'gone')).rejects.toMatchObject({ code: 'TASKBOARD_TICKET_NOT_FOUND' })
   })
 
-  it('auto-redispatches a card whose worker run settles without reporting', async () => {
+  it('parks a card 待处理 when its worker run settles without reporting — same session tried first, no extra member', async () => {
     let settle!: (result: RunResultStub) => void
     const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
-    const { service, devA } = await harness({ workerRunResults: [runResult] })
+    const { service, devA, subagentsStart } = await harness({ workerRunResults: [runResult] })
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'vanishing worker')
     await toNotStarted(service, devA, ticket)
     const assigned = await service.assign(devA, ticket.id)
     expect(assigned.ticket.status).toBe('running')
+    expect(assigned.ticket.workerMemberId).toBe('W1')
     settle({ output: [], stopReason: 'error' })
-    // Mid-flight death: the settlement callback auto-redispatches a fresh
-    // worker (budget 1 of 2) and the card stays running.
+    // Mid-flight death (V6-1): the recorded session is woken first; a refused
+    // wake parks the card as 待处理 instead of spawning a replacement member.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(ticket.id)
-      expect(current.status).toBe('running')
-      expect(current.autoRetries).toBe(1)
-      expect(current.failure).toBeNull()
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toContain('待处理')
     })
     const current = await service.viewTicket(ticket.id)
-    expect(current.description).toContain('续做勿回滚')
-    expect(current.history.some(row => row.kind === 'reassign' && row.detail.includes('auto-redispatched'))).toBe(true)
+    expect(current.failure?.reason).toContain('could not be restored')
+    // Exactly one dispatch for the whole lifetime: no replacement session and
+    // no new member.
+    expect(subagentsStart).toHaveBeenCalledTimes(1)
+    expect(current.workerMemberId).toBe('W1')
+    expect(current.workerSessionId).toBe('worker-child-agent')
+    expect(current.history.some(row => row.kind === 'fail' && row.detail.includes('待处理'))).toBe(true)
   })
 
-  it('auto-redispatches a card when the worker run infrastructure rejects', async () => {
+  it('parks a card 待处理 when the worker run infrastructure rejects', async () => {
     const runResult = Promise.reject(new Error('transport broke'))
     void runResult.catch(() => {})
-    const { service, devA } = await harness({ workerRunResults: [runResult] })
+    const { service, devA, subagentsStart } = await harness({ workerRunResults: [runResult] })
     await service.claimMaster('default', devA)
     const ticket = await createTicket(service, 'crashing worker')
     await toNotStarted(service, devA, ticket)
@@ -827,9 +838,10 @@ describe('TaskboardService workflow', () => {
     expect(assigned.ticket.status).toBe('running')
     await vi.waitFor(async () => {
       const current = await service.viewTicket(ticket.id)
-      expect(current.status).toBe('running')
-      expect(current.autoRetries).toBe(1)
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toContain('待处理')
     })
+    expect(subagentsStart).toHaveBeenCalledTimes(1)
   })
 
   it('reconciles a running card whose worker session is missing from the live registry on startup and notifies the master', async () => {
@@ -888,26 +900,28 @@ describe('TaskboardService workflow', () => {
     const followup = vi.spyOn(devA, 'followup')
     // The startup pass (scheduled once the domain is open) recovers the card:
     // the master session (devA) is live in the registry, so the lost worker
-    // is auto-redispatched — the card stays running with a fresh worker and
-    // the auto-retry budget incremented, instead of being blocked outright.
+    // session is woken first; the wake is refused here (no continuable seam),
+    // and V6-1 parks the card as 待处理 rather than adding a member.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(orphan.id)
-      expect(current.status).toBe('running')
-      expect(current.autoRetries).toBe(1)
-      expect(current.failure).toBeNull()
-      expect(current.workerSessionId).toBe('worker-child-agent')
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toContain('待处理')
     })
     const recovered = await service.viewTicket(orphan.id)
-    expect(recovered.history.some(row => row.kind === 'reassign' && row.detail.includes('auto-redispatched'))).toBe(true)
-    expect(recovered.description).toContain('续做勿回滚')
+    expect(recovered.history.some(row => row.kind === 'fail' && row.detail.includes('待处理'))).toBe(true)
+    // The worker identity is untouched: nothing was respawned.
+    expect(recovered.workerSessionId).toBe('ghost-worker-session')
     // The master inbox received exactly one notice naming the card.
     expect(followup).toHaveBeenCalledTimes(1)
     const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
     expect(message.source.kind).toBe('taskboard')
     expect(textOf(message)).toContain(orphan.id)
-    expect(textOf(message)).toContain('auto-redispatched')
+    expect(textOf(message)).toContain('WORKER_PENDING')
+    expect(textOf(message)).toContain('no member was added')
     // The forwarded change event carries the recovery mutation.
-    expect(changes.some(change => change.operation === 'reassign' && change.ticketId === orphan.id)).toBe(true)
+    expect(changes.some(change => change.operation === 'fail' && change.ticketId === orphan.id)).toBe(true)
+    // Idempotent: a parked card is never recovered twice.
+    expect(await service.reconcileLostWorkers()).toBe(0)
   })
 
   it('blocks a running card on restart when no live master session exists to auto-redispatch', async () => {
@@ -985,57 +999,48 @@ describe('TaskboardService workflow', () => {
     expect(current.status).toBe('running')
     expect(followup).not.toHaveBeenCalled()
     // The worker session vanishes (termination / host restart): the next pass
-    // auto-redispatches a fresh worker — the card stays running with the
-    // budget incremented and a master notice.
+    // wakes the recorded session and — the wake being refused here — parks the
+    // card as 待处理 with one master notice (V6-1: no replacement member).
     unregisterWorker()
     expect(await service.reconcileLostWorkers()).toBe(1)
     current = await service.viewTicket(card.id)
-    expect(current.status).toBe('running')
-    expect(current.autoRetries).toBe(1)
-    expect(current.failure).toBeNull()
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toContain('待处理')
     expect(followup).toHaveBeenCalledTimes(1)
     const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
     expect(textOf(message)).toContain(card.id)
-    expect(textOf(message)).toContain('auto-redispatched')
-    // The replacement worker (same stub id) is not re-registered, so the next
-    // loss exhausts the budget and the card finally blocks.
-    expect(await service.reconcileLostWorkers()).toBe(1)
-    current = await service.viewTicket(card.id)
-    expect(current.status).toBe('running')
-    expect(current.autoRetries).toBe(2)
-    expect(await service.reconcileLostWorkers()).toBe(1)
-    current = await service.viewTicket(card.id)
-    expect(current.status).toBe('blocked')
-    expect(current.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
-    expect(current.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(textOf(message)).toContain('WORKER_PENDING')
+    // The parked card holds no member and is never recovered again: the pass
+    // finds nothing to do and the roster keeps its single worker.
+    expect(await service.reconcileLostWorkers()).toBe(0)
+    const parked = await service.viewTicket(card.id)
+    expect(parked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(parked.workerMemberId).toBe('W1')
   })
 
-  it('periodically scans running cards: auto-redispatch until the budget is exhausted, then one block', async () => {
+  it('periodically scans running cards: a lost worker is parked once and the scan stays idempotent', async () => {
     const { service, devA, unregisterWorker } = await harness({ reconcileIntervalMs: 20 })
     await service.claimMaster('default', devA)
     const card = await createTicket(service, 'periodic scan card')
     await scheduleToNotStarted(service, devA, card)
     await service.assign(devA, card.id)
     unregisterWorker()
-    // Each tick auto-redispatches (budget 1, then 2), and the third tick
-    // blocks the card — the periodic scanner closes the loop end to end.
+    // The periodic scanner wakes-or-parks the card once (V6-1), end to end.
     await vi.waitFor(async () => {
       const current = await service.viewTicket(card.id)
       expect(current.status).toBe('blocked')
     })
     const blocked = await service.viewTicket(card.id)
-    expect(blocked.autoRetries).toBe(2)
-    expect(blocked.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
-    // Let several more interval ticks fire: the scan stays idempotent — one
-    // fail row and one notice for the whole lifetime (the redispatch notices
-    // dedupe by kind inside their own window).
+    expect(blocked.failure?.reason).toContain('待处理')
+    // Let several more interval ticks fire: the scan stays idempotent — the
+    // parked card is skipped, so exactly one fail row for the whole lifetime.
     await new Promise(resolve => setTimeout(resolve, 80))
     const again = await service.viewTicket(card.id)
     expect(again.status).toBe('blocked')
     expect(again.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    expect(again.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
+    expect(again.failure?.reason).toContain('待处理')
   })
-  it('judges a still-registered but idle worker lost and auto-redispatches it', async () => {
+  it('judges a still-registered but idle worker lost and parks the card 待处理', async () => {
     const { ctx, service, devA, unregisterWorker } = await harness({ lostWorkerTimeoutMs: 100 })
     await service.claimMaster('default', devA)
     const followup = vi.spyOn(devA, 'followup')
@@ -1056,20 +1061,20 @@ describe('TaskboardService workflow', () => {
     ctx.agents.register(staleWorker)
     expect(await service.reconcileLostWorkers()).toBe(1)
     const current = await service.viewTicket(card.id)
-    expect(current.status).toBe('running')
-    expect(current.autoRetries).toBe(1)
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toContain('待处理')
     expect(followup).toHaveBeenCalledTimes(1)
-    expect(textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })).toContain('auto-redispatched')
+    expect(textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })).toContain('WORKER_PENDING')
   })
 
-  it('blocks the card once the per-card auto-redispatch budget is exhausted', async () => {
-    // Every worker spawn dies immediately, so the settlement callback keeps
-    // firing: attempt 1 and 2 auto-redispatch, attempt 3 blocks.
+  it('never grows the roster when the worker keeps dying: the first loss parks the card 待处理', async () => {
+    // The worker spawn dies immediately: under V6-1 the settlement callback
+    // wakes-or-parks once and adds no replacement member, so exactly one
+    // dispatch ever happens for this card.
     const failing = Promise.reject(new Error('always dies'))
     void failing.catch(() => {})
-    const { service, devA } = await harness({
-      workerRunResults: [failing, failing, failing],
-      workerSpawnIds: ['worker-child-agent', 'worker-child-2', 'worker-child-3'],
+    const { service, devA, subagentsStart } = await harness({
+      workerRunResults: [failing],
       noticeDedupeWindowMs: 0,
     })
     await service.claimMaster('default', devA)
@@ -1082,11 +1087,12 @@ describe('TaskboardService workflow', () => {
       expect(current.status).toBe('blocked')
     })
     const blocked = await service.viewTicket(card.id)
-    expect(blocked.autoRetries).toBe(2)
-    expect(blocked.failure?.reason).toContain('worker lost after 2 automatic redispatch attempts')
+    expect(blocked.failure?.reason).toContain('待处理')
     expect(blocked.history.filter(row => row.kind === 'fail')).toHaveLength(1)
-    // The master heard about both redispatches and the terminal block.
-    expect(followup).toHaveBeenCalledTimes(3)
+    expect(subagentsStart).toHaveBeenCalledTimes(1)
+    // The master heard exactly once: the park notice.
+    expect(followup).toHaveBeenCalledTimes(1)
+    expect(textOf(followup.mock.calls[0]![0] as { content: { type: string; text: string }[] })).toContain('WORKER_PENDING')
   })
 
   it('releases a ghost reviewer seat and auto-redispatches a fresh reviewer', async () => {
@@ -1335,7 +1341,7 @@ describe('TaskboardService workflow', () => {
   })
 
   it('recoveries are reentry-safe: concurrent passes recover each card exactly once', async () => {
-    const { service, devA, unregisterWorker } = await harness({
+    const { service, devA, unregisterWorker, subagentsStart } = await harness({
       workerSpawnIds: ['worker-child-agent', 'worker-child-reentry'],
     })
     await service.claimMaster('default', devA)
@@ -1345,18 +1351,21 @@ describe('TaskboardService workflow', () => {
     unregisterWorker()
     // Two overlapping passes (startup scan racing a periodic tick) both see
     // the loss; the guarded recovery lets exactly one land and the second
-    // pass sees the card already running with a live replacement.
+    // pass sees the card already parked.
     const [first, second] = await Promise.all([
       service.reconcileLostWorkers(),
       service.reconcileLostWorkers(),
     ])
     expect(first + second).toBe(1)
     const current = await service.viewTicket(card.id)
-    expect(current.autoRetries).toBe(1)
-    expect(current.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
+    expect(current.status).toBe('blocked')
+    expect(current.failure?.reason).toContain('待处理')
+    expect(current.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    // One dispatch for the whole lifetime: the second pass added nothing.
+    expect(subagentsStart).toHaveBeenCalledTimes(1)
   })
 
-  it('coexists with the settlement reclamation: one recovery wins, one redispatch per card', async () => {
+  it('coexists with the settlement reclamation: one recovery wins, one park per card', async () => {
     // Order A: the settlement callback wins; the reconciliation then skips.
     let settleA!: (result: RunResultStub) => void
     const runA = new Promise<RunResultStub>((resolve) => { settleA = resolve })
@@ -1373,13 +1382,13 @@ describe('TaskboardService workflow', () => {
     settleA({ output: [], stopReason: 'cancelled' })
     await vi.waitFor(async () => {
       const current = await service.viewTicket(cardA.id)
-      expect(current.status).toBe('running')
-      expect(current.autoRetries).toBe(1)
+      expect(current.status).toBe('blocked')
+      expect(current.failure?.reason).toContain('待处理')
     })
     // The reconciliation sees the card already recovered: nothing to do.
     expect(await service.reconcileLostWorkers()).toBe(0)
     const recoveredA = await service.viewTicket(cardA.id)
-    expect(recoveredA.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
+    expect(recoveredA.history.filter(row => row.kind === 'fail')).toHaveLength(1)
     expect(followup).toHaveBeenCalledTimes(1)
 
     // Order B: the reconciliation wins; the stale settlement callback skips.
@@ -1393,22 +1402,22 @@ describe('TaskboardService workflow', () => {
     const cardB = await createTicket(serviceB, 'dual path B')
     await scheduleToNotStarted(serviceB, devAB, cardB)
     await serviceB.assign(devAB, cardB.id)
-    // The spawned worker session vanishes; the reconciliation wins and
-    // auto-redispatches (the replacement 'worker-child-b' is registered).
+    // The spawned worker session vanishes; the reconciliation wins and parks
+    // the card (its session is kept — no replacement is spawned).
     unregisterB()
     expect(await serviceB.reconcileLostWorkers()).toBe(1)
     const recoveredB = await serviceB.viewTicket(cardB.id)
-    expect(recoveredB.status).toBe('running')
-    expect(recoveredB.autoRetries).toBe(1)
-    expect(recoveredB.workerSessionId).toBe('worker-child-b')
+    expect(recoveredB.status).toBe('blocked')
+    expect(recoveredB.failure?.reason).toContain('待处理')
+    expect(recoveredB.workerSessionId).toBe('worker-child-agent')
     // The stale settlement callback for the dead session must not
-    // double-recover: the card now names the replacement worker.
+    // double-recover: the card is already parked.
     settleB({ output: [], stopReason: 'error' })
     await new Promise(resolve => setTimeout(resolve, 20))
     const againB = await serviceB.viewTicket(cardB.id)
-    expect(againB.history.filter(row => row.kind === 'reassign')).toHaveLength(1)
-    expect(againB.autoRetries).toBe(1)
-    expect(againB.workerSessionId).toBe('worker-child-b')
+    expect(againB.history.filter(row => row.kind === 'fail')).toHaveLength(1)
+    expect(againB.status).toBe('blocked')
+    expect(againB.workerSessionId).toBe('worker-child-agent')
   })
 
   it('emits a forwarded change per mutation and a tombstone on removal', async () => {
@@ -3167,7 +3176,9 @@ describe('TaskboardService workflow', () => {
 })
 
 it('hands over the master seat with structured notes and continues cross-session', async () => {
-  const { service, devA, devB, workerChild } = await harness()
+  // The subject is the notes/seat transfer, not the roster cap: widen the
+  // headcount so the third concurrent card still dispatches (V6-1).
+  const { service, devA, devB, workerChild } = await harness({ workerCapacity: 8, reviewerCapacity: 8 })
   await service.claimMaster('default', devA)
   await createTicket(service, 'planned card')
   const inFlight = await createTicket(service, 'in flight')
@@ -3458,8 +3469,8 @@ it('carries the compact event line (ticket/state/scope/blocker/anomaly) in fail 
   expect(failed).toContain('blocker="dependency is down"')
   expect(failed).toContain('taskboard_reassign')
 
-  // A terminated worker is auto-redispatched: WORKER_REDISPATCHED ticket=...
-  // state=in_progress/running anomaly=lost (worker terminated (...)).
+  // A terminated worker whose session cannot be woken is parked (V6-1):
+  // WORKER_PENDING ticket=... state=in_progress/blocked blocker=...
   let settle!: (result: RunResultStub) => void
   const runResult = new Promise<RunResultStub>((resolve) => { settle = resolve })
   const { service: service2, devA: devA2 } = await harness({ workerRunResults: [runResult] })
@@ -3470,14 +3481,15 @@ it('carries the compact event line (ticket/state/scope/blocker/anomaly) in fail 
   await service2.assign(devA2, silent.id)
   settle({ output: [], stopReason: 'aborted' })
   await vi.waitFor(async () => {
-    expect((await service2.viewTicket(silent.id)).autoRetries).toBe(1)
+    expect((await service2.viewTicket(silent.id)).status).toBe('blocked')
   })
-  const redispatched = textOf(followup2.mock.calls[0]![0] as { content: { type: string; text: string }[] })
-  expect(redispatched).toContain('WORKER_REDISPATCHED ticket=' + silent.id)
-  expect(redispatched).toContain('state=in_progress/running')
-  expect(redispatched).toContain('anomaly=')
-  expect(redispatched).toContain('lost')
-  expect(redispatched).toContain('auto-redispatched')
+  const parked = textOf(followup2.mock.calls[0]![0] as { content: { type: string; text: string }[] })
+  expect(parked).toContain('WORKER_PENDING ticket=' + silent.id)
+  expect(parked).toContain('state=in_progress/blocked')
+  expect(parked).toContain('blocker=')
+  expect(parked).toContain('anomaly=')
+  expect(parked).toContain('lost')
+  expect(parked).toContain('no member was added')
 })
 
 it('notifies the master inbox when a worker reports failure', async () => {
@@ -3573,13 +3585,15 @@ it('notifies the master when a worker run terminates without reporting', async (
   settle({ output: [], stopReason: 'aborted' })
   await vi.waitFor(async () => {
     const current = await service.viewTicket(card.id)
-    expect(current.autoRetries).toBe(1)
+    expect(current.status).toBe('blocked')
   })
   expect(followup).toHaveBeenCalledTimes(1)
   const message = followup.mock.calls[0]![0] as { content: { type: string; text: string }[]; source: { kind: string; boardId: string } }
   expect(message.source.kind).toBe('taskboard')
   expect(textOf(message)).toContain('lost')
-  expect(textOf(message)).toContain('auto-redispatched')
+  // V6-1: the same session was tried first and the card is parked, not respawned.
+  expect(textOf(message)).toContain('WORKER_PENDING')
+  expect(textOf(message)).toContain('待处理')
 })
 
 it('skips the master notice while the seat is vacant', async () => {
@@ -3686,7 +3700,8 @@ it('dedupes repeated notices for the same ticket and kind inside the window and 
   const card = await createTicket(service, 'dedupe card')
   await scheduleToNotStarted(service, devA, card)
   await service.assign(devA, card.id)
-  // First loss: one 'worker-redispatched' notice reaches the master.
+  // First loss: one 'worker-pending' notice reaches the master (V6-1: the
+  // lost session is tried first and the card is parked instead of respawned).
   unregisterWorker()
   expect(await service.reconcileLostWorkers()).toBe(1)
   expect(followup).toHaveBeenCalledTimes(1)
@@ -4367,9 +4382,9 @@ describe('V3-28 continuable dispatch and wake-up recovery', () => {
     expect(notice).toMatchObject({ kind: 'worker-continued', ticketId: card.id })
   })
 
-  it('degrades to a fresh spawn when the wake is refused, and stays one-shot when the provider cannot resume', async () => {
+  it('parks the card 待处理 when the wake is refused — no replacement session and no extra member (V6-1)', async () => {
     // A seam that exposes startContinuable but whose sendMessage refuses the
-    // wake (no continuation state for that child): recovery falls back.
+    // wake (no continuation state for that child): V6-1 parks the card.
     const refused = await harness({
       continuable: true,
       sendMessageError: 'subagent has no supported continuation state',
@@ -4381,18 +4396,19 @@ describe('V3-28 continuable dispatch and wake-up recovery', () => {
     await refused.service.assign(refused.devA, card.id)
     refused.unregisterWorker()
     expect(await refused.service.reconcileLostWorkers()).toBe(1)
+    // The same session was tried exactly once and nothing new was started.
     expect(refused.subagentsSendMessage).toHaveBeenCalledTimes(1)
-    // The fallback is a fresh child (a new durable session), never the one the
-    // refused wake targeted.
-    expect(refused.subagentsStartContinuable).toHaveBeenCalledTimes(2)
+    expect(refused.subagentsStartContinuable).toHaveBeenCalledTimes(1)
     expect(refused.subagentsStart).not.toHaveBeenCalled()
-    const spawned = await refused.service.viewTicket(card.id)
-    expect(spawned.status).toBe('running')
-    expect(spawned.autoRetries).toBe(1)
-    expect(spawned.workerSessionId).toBe('worker-child-2')
-    expect(spawned.description).toContain('auto-redispatch #1')
-    // A provider without prepareContinuable keeps the historic one-shot path
-    // end to end — including recovery, which never tries to wake.
+    const parked = await refused.service.viewTicket(card.id)
+    expect(parked.status).toBe('blocked')
+    expect(parked.failure?.reason).toContain('待处理')
+    expect(parked.workerSessionId).toBe('worker-child-agent')
+    // The roster headcount is unchanged: one worker member, no W2.
+    const roster = await refused.service.snapshot(refused.devA)
+    expect((roster.members ?? []).filter(member => member.role === 'worker').map(member => member.id)).toEqual(['W1'])
+    // A provider without prepareContinuable keeps the one-shot dispatch path,
+    // and its recovery parks the card the same way instead of adding a member.
     const oneShot = await harness({ continuable: true, providerSupportsContinuable: false })
     await oneShot.service.claimMaster('default', oneShot.devA)
     const card2 = await createTicket(oneShot.service, 'one shot provider')
@@ -4402,10 +4418,11 @@ describe('V3-28 continuable dispatch and wake-up recovery', () => {
     expect(oneShot.subagentsStartContinuable).not.toHaveBeenCalled()
     oneShot.unregisterWorker()
     expect(await oneShot.service.reconcileLostWorkers()).toBe(1)
-    // The wake is refused (the child has no continuation state) and the
-    // recovery degrades to the historic spawn.
+    // The wake is refused (the child has no continuation state) and the card is
+    // parked — still exactly the one dispatch.
     expect(oneShot.subagentsSendMessage).toHaveBeenCalledTimes(1)
-    expect(oneShot.subagentsStart).toHaveBeenCalledTimes(2)
+    expect(oneShot.subagentsStart).toHaveBeenCalledTimes(1)
+    expect((await oneShot.service.viewTicket(card2.id)).status).toBe('blocked')
   })
 
   it('spawns the report-mode reviewer through startContinuable and lands its verdict through taskboard_review_verdict', async () => {
@@ -4468,5 +4485,213 @@ describe('V3-28 continuable dispatch and wake-up recovery', () => {
     expect(back.ticket.workerSessionId).toBe('worker-child-agent')
     expect(h.subagentsSendMessage).toHaveBeenCalledTimes(2)
     expect(h.subagentsStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('V6-1 fixed headcount, matching dispatch and fixed pairs', () => {
+  it('caps the roster: idle members are reused, the overflow queues visibly, and FIFO drains on a free member', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const cardA = await createTicket(service, 'cap card A')
+    const cardB = await createTicket(service, 'cap card B')
+    const cardC = await createTicket(service, 'cap card C')
+    const cardD = await createTicket(service, 'cap card D')
+    for (const card of [cardA, cardB, cardC, cardD]) await scheduleToNotStarted(service, devA, card)
+
+    // The first two dispatches fill both worker slots (default capacity 2).
+    const a = await service.assign(devA, cardA.id)
+    const b = await service.assign(devA, cardB.id)
+    expect(a.worker).toBe('spawned')
+    expect(a.ticket.workerMemberId).toBe('W1')
+    expect(b.ticket.workerMemberId).toBe('W2')
+    expect(subagentsStart).toHaveBeenCalledTimes(2)
+
+    // The third and fourth have nowhere to go: they QUEUE instead of creating
+    // agents — never a W3.
+    const c = await service.assign(devA, cardC.id)
+    expect(c.worker).toBe('queued')
+    expect(c.workerAgentId).toBeNull()
+    expect(c.ticket.column).toBe('not_started')
+    expect(c.ticket.status).toBe('queued')
+    expect(c.ticket.queue?.reason).toContain('编制上限 2')
+    expect(c.ticket.queue?.reason).toContain('W1 (worker)=')
+    expect(c.ticket.queue?.position).toBe(1)
+    const d = await service.assign(devA, cardD.id)
+    expect(d.ticket.queue?.position).toBe(2)
+    expect(subagentsStart).toHaveBeenCalledTimes(2)
+
+    // The wait is visible to the master too: the compact row carries the state
+    // and the readable reason.
+    const rows = await service.listRows(null, false, devA.id)
+    const rowC = rows.find(row => row.id === cardC.id)
+    expect(rowC?.status).toBe('queued')
+    expect(rowC?.queue?.reason).toContain('等待空闲 worker')
+    expect(rowC?.workerMemberId).toBeNull()
+
+    // Close card A through review: it reaches Done, W1 frees, and the queue
+    // drains first-come-first-served (C before D) with no new member.
+    const reportedA = await service.report(workerChild, cardA.id, 'card A done')
+    expect(reportedA.ticket.reviewerMemberId).toBe('R1')
+    const approved = await service.resolveReview(devA, cardA.id, 'approve', 'verified', [])
+    expect(approved.ticket.column).toBe('done')
+    await vi.waitFor(async () => {
+      const current = await service.viewTicket(cardC.id)
+      expect(current.status).toBe('running')
+    })
+    const startedC = await service.viewTicket(cardC.id)
+    expect(startedC.workerMemberId).toBe('W1')
+    expect(startedC.queue).toBeNull()
+    expect(startedC.column).toBe('in_progress')
+    // D is still waiting, first in line now.
+    const stillD = await service.viewTicket(cardD.id)
+    expect(stillD.status).toBe('queued')
+    expect(stillD.queue?.position).toBe(1)
+
+    // The roster never grew: two worker members for the whole episode.
+    const snapshot = await service.snapshot(devA)
+    expect((snapshot.members ?? []).filter(member => member.role === 'worker').map(member => member.id)).toEqual(['W1', 'W2'])
+  })
+
+  it('matches a card to the member familiar with its modules (path overlap, no algorithm)', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    // Two members build different module履历 first.
+    const parserA = await service.createAsMaster(devA, {
+      title: 'parser work', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/parser/src',
+    })
+    const rendererB = await service.createAsMaster(devA, {
+      title: 'renderer work', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/renderer/src',
+    })
+    for (const card of [parserA, rendererB]) await scheduleToNotStarted(service, devA, card)
+    const first = await service.assign(devA, parserA.id)
+    const second = await service.assign(devA, rendererB.id)
+    expect(first.ticket.workerMemberId).toBe('W1')
+    expect(second.ticket.workerMemberId).toBe('W2')
+    await service.report(workerChild, parserA.id, 'parser done')
+    await service.resolveReview(devA, parserA.id, 'approve', 'ok', [])
+    await service.report(workerChild, rendererB.id, 'renderer done')
+    await service.resolveReview(devA, rendererB.id, 'approve', 'ok', [])
+
+    // Both members are idle again; the next card goes to the one whose 履历
+    // overlaps its declared scope.
+    const parserC = await service.createAsMaster(devA, {
+      title: 'parser lexer', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/parser/src/lexer.ts',
+    })
+    await scheduleToNotStarted(service, devA, parserC)
+    const matched = await service.assign(devA, parserC.id)
+    expect(matched.ticket.workerMemberId).toBe('W1')
+    await service.report(workerChild, parserC.id, 'lexer done')
+
+    const rendererD = await service.createAsMaster(devA, {
+      title: 'renderer view', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/renderer/src/view.ts',
+    })
+    await scheduleToNotStarted(service, devA, rendererD)
+    const matchedD = await service.assign(devA, rendererD.id)
+    expect(matchedD.ticket.workerMemberId).toBe('W2')
+  })
+
+  it('keeps the fixed pair across a rework: the original worker fixes it and the original reviewer re-reviews', async () => {
+    const { service, devA, workerChild, reviewerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'pair card')
+    await scheduleToNotStarted(service, devA, card)
+    const assigned = await service.assign(devA, card.id)
+    expect(assigned.ticket.workerMemberId).toBe('W1')
+    const reported = await service.report(workerChild, card.id, 'first attempt')
+    // The seat is the fixed partner of W1.
+    expect(reported.ticket.reviewerMemberId).toBe('R1')
+    expect(reported.ticket.reviewer?.agentId).toBe(reviewerChild.id)
+    // Rejection: the card returns to the SAME worker member and keeps R1.
+    const rejected = await service.resolveReview(devA, card.id, 'reject', 'broken', ['fix the parse path'])
+    expect(rejected.action).toBe('rejected')
+    expect(rejected.ticket.workerMemberId).toBe('W1')
+    expect(rejected.ticket.reviewerMemberId).toBe('R1')
+    expect(rejected.ticket.reviewer).toBeNull()
+    // The rework report re-seats the same reviewer member (its session is the
+    // one rotated, never a new member).
+    const rework = await service.report(workerChild, card.id, 'second attempt')
+    expect(rework.review).toBe('spawned')
+    expect(rework.ticket.reviewerMemberId).toBe('R1')
+    expect(rework.ticket.workerMemberId).toBe('W1')
+    const snapshot = await service.snapshot(devA)
+    expect((snapshot.members ?? []).map(member => member.id).sort()).toEqual(['R1', 'W1'])
+  })
+
+  it('persists a short work summary per member and serves it on the board snapshot and the roster tool', async () => {
+    const { ctx, service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await service.createAsMaster(devA, {
+      title: 'summary card', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/parser/src',
+    })
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    // While the card is open the member reads as busy on it.
+    const busy = (await service.snapshot(devA)).members ?? []
+    expect(busy.find(member => member.id === 'W1')).toMatchObject({ status: 'busy', currentTicketId: card.id })
+    await service.report(workerChild, card.id, 'done')
+    await service.resolveReview(devA, card.id, 'approve', 'ok', [])
+    // Done archives the card, the member stays and carries a short summary.
+    const settled = (await service.snapshot(devA)).members ?? []
+    const w1 = settled.find(member => member.id === 'W1')
+    expect(w1).toMatchObject({ role: 'worker', partnerId: 'R1', status: 'idle', currentTicketId: null })
+    expect(w1?.summary).toContain('parser')
+    expect(w1?.summary).toContain('目前空闲')
+    expect(w1?.modules).toContain('parser')
+    expect(w1?.recentTickets).toEqual([card.id])
+    expect((w1?.summary ?? '').length).toBeLessThanOrEqual(200)
+
+    // The master reads the roster through its own tool — the summary, never
+    // the member's context.
+    const result = await ctx.tools.execute({
+      callId: ToolCallId('roster-read'),
+      name: 'taskboard_roster',
+      arguments: {},
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(result.isError).toBe(false)
+    const value = (result as {
+      value: { boardId: string; capacity: number; members: { id: string; summary: string; status: string }[] }
+    }).value
+    expect(value.boardId).toBe('default')
+    expect(value.capacity).toBe(2)
+    expect(value.members.map(member => member.id)).toContain('W1')
+    expect(value.members.find(member => member.id === 'W1')?.summary).toContain('parser')
+    const rendered = result.content.map(part => part.type === 'text' ? part.text : '').join('')
+    expect(rendered).toContain('W1')
+    expect(rendered).toContain('parser')
+  })
+
+  it('takes the headcount from config: workerCapacity 1 queues the second card', async () => {
+    const { service, devA, subagentsStart } = await harness({ workerCapacity: 1, reviewerCapacity: 1 })
+    await service.claimMaster('default', devA)
+    const first = await createTicket(service, 'only slot')
+    const second = await createTicket(service, 'second slot')
+    for (const card of [first, second]) await scheduleToNotStarted(service, devA, card)
+    expect((await service.assign(devA, first.id)).ticket.workerMemberId).toBe('W1')
+    const queued = await service.assign(devA, second.id)
+    expect(queued.worker).toBe('queued')
+    expect(queued.ticket.queue?.reason).toContain('编制上限 1')
+    expect(subagentsStart).toHaveBeenCalledTimes(1)
+    const roster = (await service.snapshot(devA)).members ?? []
+    expect(roster.filter(member => member.role === 'worker').map(member => member.id)).toEqual(['W1'])
+  })
+
+  it('retry re-dispatches to the card\'s own member and rotates only its session', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness({ workerSpawnIds: ['worker-child-agent', 'worker-child-2'] })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'retry member card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.fail(workerChild, card.id, 'stuck')
+    const retried = await service.reassign(devA, card.id, 'retry')
+    expect(retried.worker).toBe('spawned')
+    expect(retried.ticket.workerMemberId).toBe('W1')
+    expect(retried.ticket.workerSessionId).toBe('worker-child-2')
+    expect(subagentsStart).toHaveBeenCalledTimes(2)
+    const roster = (await service.snapshot(devA)).members ?? []
+    expect(roster.filter(member => member.role === 'worker')).toHaveLength(1)
+    const w1 = roster.find(member => member.id === 'W1')
+    expect(w1?.sessionId).toBe('worker-child-2')
   })
 })

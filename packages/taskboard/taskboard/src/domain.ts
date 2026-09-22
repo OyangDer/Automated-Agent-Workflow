@@ -331,6 +331,74 @@ export function buildContinuationPrompt(ticket: TicketView, reason: string): str
   ].join('\n')
 }
 
+/**
+ * The dispatch prompt for an EXISTING roster member whose session is being
+ * reused for a NEW card (V6-1). Unlike {@link buildContinuationPrompt} this is
+ * not a wake-up on the same card: the member's session holds its previous
+ * card's context, so the message opens with an explicit "this is a new card,
+ * the previous one is closed" boundary, then re-briefs the fresh ticket
+ * through the same worker capsule and branch convention the first dispatch
+ * uses.
+ * @param ticket - the new card the member owns.
+ * @param memberId - the roster member id taking the card ("W1").
+ * @param cwd - the shared working directory, when known.
+ * @param sessionId - the master session id; its short form names the worker branch.
+ * @param preflight - the dispatch-time preflight report, when computed.
+ * @returns the member's new-card prompt text.
+ */
+export function buildMemberDispatchPrompt(
+  ticket: TicketView, memberId: string, cwd?: string, sessionId?: string, preflight?: PreflightReport | null,
+): string {
+  const capsule = compileWorkerCapsule(ticket, preflight)
+  const branch = sessionId === undefined ? undefined : branchNameFor(sessionId, ticket.id)
+  return [
+    ['New assignment: taskboard ticket', ticket.id, '("' + ticket.title + '") is now yours — you are roster member', memberId + '.'].join(' '),
+    'Your previous card is closed; do not continue its work and do not mix its changes into this one. Start this card from its own branch.',
+    '',
+    renderWorkerCapsule(capsule, cwd),
+    ...(branch === undefined ? [] : [
+      '',
+      'Shared-workspace branch convention (parallel sessions must not clash):',
+      '  - Before starting, check the git status and the current branch in the working directory.',
+      '  - Switch to this card\'s branch "' + branch + '": create it if missing (git switch -c ' + branch + ' from the current base) and keep every change of this ticket on it.',
+      '  - Do not merge, push, or rebase: the master aggregates the branches when the work is done.',
+      '  - If the working tree is not clean, stash or carry it deliberately — never discard another card\'s work.',
+    ]),
+    '',
+    'Implement this ticket end to end against the goal, acceptance criteria and constraints in the capsule above, then finish with EXACTLY ONE call to taskboard_report with ticketId "' + ticket.id + '" and devNotes summarizing what changed, which files were touched, and how it was verified.',
+    'If you cannot complete the work (blocked, missing access, irrecoverable error), finish with EXACTLY ONE call to taskboard_fail with ticketId "' + ticket.id + '" and a concrete reason.',
+  ].join('\n')
+}
+
+/**
+ * The re-review prompt delivered to a FIXED reviewer member's existing session
+ * (V6-1): the same reviewer that reviewed this card before reviews it again
+ * after the rework. It carries the fresh card state and the rework feedback,
+ * but never the worker's reasoning — the reviewer keeps its own independent
+ * judgement and must re-verify the actual changes and evidence.
+ * @param ticket - the card back under review.
+ * @param memberId - the reviewer member id holding the seat ("R1").
+ * @param feedback - the previous rejection feedback, when this is a re-review.
+ * @returns the reviewer's re-review prompt text.
+ */
+export function buildMemberReviewPrompt(ticket: TicketView, memberId: string, feedback: string): string {
+  const lines = [
+    ['Re-review: taskboard ticket', ticket.id, '("' + ticket.title + '") has come back to you — you are roster member', memberId + ', the fixed reviewer for this card.'].join(' '),
+    'Judge the CURRENT state of the work on its own evidence: the card requirement, the actual diff, and the tests the worker ran. Do not assume it is correct because you are its usual reviewer, and do not inherit the worker\'s reasoning — verify.',
+  ]
+  if (feedback.trim() !== '') {
+    lines.push('', 'Your previous rejection on this card said (re-check each item):', feedback)
+  }
+  if (ticket.filesScope.trim() !== '') {
+    lines.push('', 'Declared file scope of the card: ' + ticket.filesScope)
+  }
+  lines.push(
+    '',
+    'Follow the same review contract as before: work on the card\'s branch, run the relevant checks, and finish with exactly one verdict call for ticketId "' + ticket.id + '".',
+  )
+  return lines.join('\n')
+}
+
 /** One card's handover line detail, scoped to its column. */
 function handoverCardDetail(ticket: TicketView): string {
   const bits: string[] = []
@@ -509,6 +577,9 @@ export function formatTicketRowLine(ticket: {
   priority?: string | undefined
   workerAgentId?: string | null | undefined
   reviewer?: { agentId: string } | null | undefined
+  workerMemberId?: string | null | undefined
+  reviewerMemberId?: string | null | undefined
+  queue?: { reason: string; position: number } | null | undefined
   dependsOn?: string[] | undefined
   lastReviewOutcome?: 'approved' | 'rejected' | null | undefined
   failure?: { reason: string } | null | undefined
@@ -523,6 +594,11 @@ export function formatTicketRowLine(ticket: {
   if (ticket.priority !== undefined) bits.push('priority=' + ticket.priority)
   if (ticket.workerAgentId) bits.push('worker=' + ticket.workerAgentId)
   if (ticket.reviewer) bits.push('reviewer=' + ticket.reviewer.agentId)
+  // V6-1: the fixed pair (worker member -> its partner reviewer) is always on
+  // the compact line; the queue position and reason ride along so a waiting
+  // card is never a mystery.
+  if (ticket.workerMemberId) bits.push('pair=' + ticket.workerMemberId + '->' + String(ticket.reviewerMemberId ?? ''))
+  if (ticket.queue) bits.push('queue=' + String(ticket.queue.position) + ':' + JSON.stringify(ticket.queue.reason))
   if (ticket.dependsOn !== undefined && ticket.dependsOn.length > 0) bits.push('dependsOn=' + ticket.dependsOn.join(','))
   if (ticket.lastReviewOutcome) bits.push('lastReview=' + ticket.lastReviewOutcome)
   if (ticket.failure) bits.push('failure=' + ticket.failure.reason)
@@ -646,15 +722,16 @@ export const WORKFLOW_SECTION = [
   '',
   '- When asked to work on the board — or when you are otherwise free and tickets are waiting — call taskboard_list with column "not_started". Tickets are ordered by implementation order; dependsOn lists hard ordering constraints.',
   '- Claiming a ticket is the master\'s scheduling action: only the board\'s current master may call taskboard_claim, and only for Not started tickets whose dependsOn are all in Done. One ticket at a time per caller. Workers and reviewers never claim — they receive cards through taskboard_assign (dispatch) or taskboard_reassign (re-dispatch).',
-  '- Parallelize: when several ready Not started tickets exist, dispatch each to a fresh worker with taskboard_assign — the assign spawns the worker subagent with the ticket content, the worker implements it, and finishes with taskboard_report (done) or taskboard_fail (blocked).',
+  '- Parallelize: when several ready Not started tickets exist, dispatch each with taskboard_assign — the card goes to an idle roster member, which implements it and finishes with taskboard_report (done) or taskboard_fail (blocked).',
+  '- Fixed headcount (V6-1): worker members (W1, W2, ...) each pair with a fixed reviewer; a fully busy roster QUEUES the card (status "queued", reason and first-come-first-served position on the card) instead of creating an agent.',
   '- When the implementation is done and verified, the owning agent calls taskboard_complete with devNotes summarizing what changed and how it was verified. The board moves the ticket to In testing and automatically spawns a fresh reviewer agent. Never review your own ticket.',
   '- If you are spawned as a reviewer: inspect the workspace changes and run the relevant tests, then finish with exactly one call — taskboard_approve(ticketId, summary) or taskboard_reject(ticketId, feedback). Rejections must list concrete, actionable problems. If no reviewer is assigned to an In testing ticket, taskboard_claim_review takes the seat.',
-  '- If a ticket you own returns to In progress with a rejected review, rework it per the feedback (delegate to a fresh subagent with the feedback in its prompt) and call taskboard_complete again.',
+  '- If a ticket you own returns to In progress with a rejected review, rework it per the feedback and call taskboard_complete again; the same reviewer re-reviews it.',
   "- v2 master dispatch: before assigning work, claim the board's master seat with taskboard_claim_master (boardId defaults to \"default\"). Only the current master may call taskboard_assign and taskboard_reassign.",
   '- Dispatch a Backlog or Not started ticket with taskboard_assign: the card moves to In progress and a fresh worker subagent (the configured worker model and reasoning effort; see taskboard_board_config for per-board overrides) is spawned with the ticket content; the card records the worker identity. Not started is the scheduling display for the next queue — a card needs no move before dispatch. Workers finish with taskboard_report (done) or taskboard_fail (blocked).',
   '- Pause a running card with taskboard_pause (master only): the in-flight worker run is aborted, the card is marked paused (column unchanged) with one history row naming the pauser and the reason, and the master is notified. A paused card is never auto-blocked by the settlement callback or the liveness reconciliation. Resume with taskboard_reassign action "retry", which clears the paused status and spawns a fresh worker.',
-  '- When a worker fails or its session terminates without reporting, the card stays In progress with status "blocked" and a failure record. Use taskboard_reassign with action "retry" to spawn a new worker, or action "backlog" to return the card to Not started.',
-  '- Seat self-healing is automatic: a lost worker session is auto-redispatched (up to the configured per-card cap) with the working tree preserved — the card description carries a "续做勿回滚" annotation and the master receives a "worker-redispatched" notice. A reviewer seat is released only when its holder session is gone for good (the master seat\'s liveness rule, V3-43) or a registered reviewer sits idle past the staleness timeout; re-review is capped per card, and a spent cap blocks the card. The master receives a "reviewer-released" notice. The master seat follows the same liveness rule and records a "master-released" notice. Only when the automatic budget is exhausted is the card blocked for manual taskboard_reassign.',
+  '- When a worker fails or its session terminates without reporting, the card stays In progress blocked with a failure record. taskboard_reassign "retry" re-dispatches it to its own roster member (rotating that member\'s session), "backlog" returns it to Not started.',
+  '- Seat self-healing is automatic: a lost worker session is woken (continue) with the working tree preserved — 续做勿回滚; when the wake is refused the card is parked 待处理 (blocked, the reason naming its member) for the master to reassign, and the roster never grows to replace it. A reviewer seat is released only when its holder session is gone for good (the master seat\'s liveness rule, V3-43) or sits idle past the staleness timeout, capped per card; re-review returns to the card\'s own member.',
   '- v2 report-mode review (config.reviewMode "report"): the spawned reviewer returns a structured verdict only and never touches the card. Read the ticket\'s reviewOutcome, then resolve the review with taskboard_resolve_review: approve lands the card in Done (and archives the worker session); reject returns the card for rework. When the result says the original worker could not be followed up, re-dispatch with taskboard_reassign action "retry". After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
   '- Master notifications are durable: worker done/failed/lost events and review verdicts land a notice on the board (readable via taskboard_notices, and carried by the taskboard_claim_master result) and are injected into the master\'s inbox live, or queued into the master\'s persisted inbox when the master session is not live so the next run receives them.',
   "- Moving cards between columns is the board's master's job, executed only after the master and the user agree on the phase scope; non-master agents never move cards. Not started is the scheduling display for the next queue: the master may dispatch directly from Backlog or Not started with taskboard_assign — no move is needed before dispatch. The user's drag-and-drop keeps its visual feedback, but intent is expressed in the conversation. See the master section's workflow discipline for the plan → phase → schedule → execute order.",
@@ -682,13 +759,14 @@ export const MASTER_SECTION = [
   'You are the board\'s master: you dispatch tickets to workers, adjudicate review results, and discuss the plan with the user. The master seat is per board — claim it with taskboard_claim_master (boardId defaults to "default") before assigning or resolving work.',
   '',
   '- Solve context pressure with compaction first: when the conversation is long or context is running low, compact instead of handing off.',
-  '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board — every card\'s status, each in-flight worker\'s identity (workerAgentId/workerSessionId), the In testing review seats, the backlog summary, and the master history — then releases the seat. The successor claims the seat with taskboard_claim_master; the claim result carries those notes, and the successor continues dispatching from them.',
+  '- When a handover is genuinely needed, run taskboard_handover (boardId): it writes structured notes onto the board (card statuses, in-flight worker identities, review seats, backlog, master history) and releases the seat; the successor claims it with taskboard_claim_master and continues from those notes.',
   '- Already-dispatched workers finish their current card on their own; do not follow them up across sessions.',
-  '- Master notices are durable: every worker done/failed/lost event and review verdict lands a {kind, text, at, ticketId} row on the board synchronously, and is injected into your inbox when your session is live (or queued into your persisted inbox when it is not, so the next run replays it). Read them with taskboard_notices, or with taskboard_claim_master whose result carries them — do not rely on polling the board in a loop.',
-  '- Read cards in layers (V3-21): default compact — taskboard_list returns one line per card (ticket/title/state/scope/worker/reviewer/dependsOn), enough to dispatch and adjudicate; taskboard_view is the on-demand full read (description, devNotes, history); use the full read only when a compact line leaves an anomaly unresolved.',
-  '- Seat self-healing keeps cards moving without you: a lost worker is auto-redispatched (working tree preserved, card description annotated "续做勿回滚") up to the per-card cap, and a reviewer seat is released only when its session is gone for good or a registered reviewer sits idle past the staleness timeout, capped per card. A "worker-redispatched" or "reviewer-released" notice tells you it happened; only when the automatic budget is exhausted does the card land blocked for manual taskboard_reassign.',
+  '- Master notices are durable: worker done/failed/lost events, review verdicts and queue events land a {kind, text, at, ticketId} row on the board and reach your inbox (live, or replayed on the next run); read them with taskboard_notices or the taskboard_claim_master result, never by polling.',
+  '- Read cards in layers (V3-21): default compact — taskboard_list returns one line per card (ticket/title/state/scope/worker/reviewer/pair/queue/dependsOn), enough to dispatch and adjudicate; taskboard_view is the on-demand full read (description, devNotes, history); use the full read only when a compact line leaves an anomaly unresolved.',
+  '- Fixed roster (V6-1): taskboard_roster returns each member\'s id, partner, load and SHORT summary — your whole matching input (never read a member\'s context). Match order: the card\'s own member on a rework, then the member familiar with its modules, then the least-loaded idle one; a fully busy roster queues the card, and a lost session is never answered by adding a member.',
+  '- Seat self-healing keeps cards moving without you: a lost worker session is woken (working tree preserved, 续做勿回滚), and a refused wake parks the card 待处理 (blocked with the reason) — the roster never grows to replace it. A reviewer seat is released only when its session is gone for good or sits idle past the staleness timeout, capped per card. The matching notice tells you what happened; a spent budget blocks the card for manual taskboard_reassign.',
   '- The master seat follows the session, not a clock (V3-25, revised by V3-32/V3-34): it is released only when the holder session is gone for good — absent from the registry and with no stored session record — so a restart or idle unload keeps the seat, silence never releases it, and ending your turn after a dispatch is safe — with a "master-released" notice and one master-history row; re-claim it with taskboard_claim_master (the result carries the structured snapshot). A release changes ownership only: in-flight cards keep their workers and reviewers.',
-  '- Pause a running card with taskboard_pause (master only): the worker run is aborted, the card is marked paused (column unchanged; history records the pauser and reason) and the master is notified. Paused cards are exempt from settlement reclamation and the liveness reconciliation; resume with taskboard_reassign action "retry" (spawns a fresh worker) or return them to Not started with action "backlog".',
+  '- Pause a running card with taskboard_pause (master only): the worker run is aborted, the card is marked paused (column unchanged; history records the pauser and reason) and the master is notified. Paused cards are exempt from settlement reclamation and the liveness reconciliation; resume with taskboard_reassign action "retry" (back to the card\'s own member) or return them to Not started with action "backlog".',
   '- Record the plan you agree with the user on the board: taskboard_create adds a card to a board\'s Backlog, taskboard_move schedules a card between columns, and taskboard_plan adjusts dependencies, priority, and ordering. These are master-only tools.',
   '- Claiming a Not started ticket (taskboard_claim) is your scheduling action, not the worker\'s: only the current master may claim.',
   '- Merge tickets (type "merge") are only approved after the master confirms the target branch; record it in the ticket\'s targetBranch field (or devNotes) before resolving the review.',
