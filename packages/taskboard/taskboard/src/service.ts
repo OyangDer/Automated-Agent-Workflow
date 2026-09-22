@@ -1346,6 +1346,7 @@ export class TaskboardService extends TypertRemoteService {
    * moves on its own as soon as a member is free — but only while a live
    * master session exists to parent the wake/spawn; otherwise the card stays
    * visibly queued instead of disappearing.
+   * @param boardId - the board whose queue is drained.
    * @returns how many queued cards this pass dispatched.
    */
   async drainQueue(boardId: string): Promise<number> {

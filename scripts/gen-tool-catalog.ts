@@ -407,7 +407,7 @@ const TOOL_PACKAGES: ToolPackage[] = [
       await ctx.plugin(TaskboardService, { reconcileIntervalMs: 0 })
     },
     note:
-      'The twenty-three taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.',
+      'The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.',
   },
   {
     pkg: '@deepseek-ai/dsh-schedule',

@@ -33,7 +33,7 @@
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`、`grep` | `ctx.tools`、`ctx.subprocess`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | glob 和 grep 是无条件可用的发现工具，通过 ctx.subprocess spawn 随包提供的 ripgrep 二进制文件（`@vscode/ripgrep`），并作为普通前台调用运行，绝不作为后台任务；无需在宿主机安装 `rg`，也不经过 shell 层。本目录使用 `sampleOverCapGlobResults: true`；部署必须显式选择该行为。结果超过上限时，会通过可选的 ctx.spillStore 后端保存完整的格式化列表；在共置部署中，如果后端公开本地路径，返回的定位信息可供后续读取／搜索。 |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`、`terminal_list`、`terminal_open`、`terminal_read`、`terminal_send`、`terminal_signal` | `ctx.tools`、`ctx.terminals`、`ctx.systemPrompt`、`ctx.jobs at call time for run_in_background` | `tool/call`、`tool/result` | - | 这 6 个终端工具需要选择启用，用于补充一次性 bash／文件系统工具。`terminal_send(run_in_background: true)` 会注册到 `ctx.jobs`；schema 不包含 TUI、具名按键序列、BEL、调整尺寸、自动启动和跨 agent 共享。 |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`、`get_goal`、`update_goal` | `ctx.tools`、`ctx.agents`、`ctx.goals`、`ctx.systemPrompt`、`a calling Agent in an authorized open turn` | `tool/call`、`goal/change for mutations`、`tool/result` | - | create、edit、pause 和 resume 要求直接来自人类的根权限；complete 和 blocked 也接受确切的当前 Goal Round。blocked 的默认下限是 3 个获准的 Round。 |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-three taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_roster`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`、`schedule_delete`、`schedule_list` | `ctx.tools`、`ctx.sessions`、Session 持久化、未来创建的 live 根 Agent | `tool/call`、`schedule/change create or delete`、`tool/result` | - | 仅在选择启用的 Schedule 插件加载后创建的 live 根 Agent scope 内注册。版本 1 接受 after_seconds、显式绝对 at 和有界固定速率 every_seconds，并披露 session-local 交付；管理读取与变更必须通过共享的 Session 持久化 barrier。 |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`、`ctx.lsp`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，因此其模型可见 schema 在更换提供方时保持稳定。运行时要求已注册提供方，例如 `@deepseek-ai/dsh-lsp-stdio`；如果没有提供方，查询会返回结构化 `LSP_UNAVAILABLE` 错误，而不会改变 schema。 |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`、`ctx.workflowEngine`、`ctx.subagents`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents every fresh round)` | `tool/call`、`tool/result`、`workflow and child session events during execution` | - | 固定的前台工作流会在每个 Round 启动一个全新的结构化子级；模型只能选择不可变目标和可选的 Round 上限。 |
@@ -1179,7 +1179,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_assign`
 
-Dispatch a Backlog or Not started taskboard ticket (master only): the card moves to In progress with status running and a fresh worker subagent (DeepSeek v4 flash) is spawned immediately with the ticket content. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker identity.
+Dispatch a Backlog or Not started taskboard ticket (master only). V6-1 fixed headcount: the card is given to an IDLE ROSTER MEMBER — its own member on a rework, else the idle member whose summary/modules match the card, else the least-loaded idle member; that member's existing session is woken (continue) when it has one, otherwise a first session is spawned for it. When every member is busy at the configured cap the card is QUEUED (status "queued", visible with its reason and FIFO position) instead of creating another agent, and it starts automatically when a member frees up. Not started is the scheduling display for the next queue, but a card needs no move before dispatch — assign accepts it straight from Backlog. When repo preflight is configured (V3-20), the live git facts are checked first and a violated repo lands the card blocked with the concrete violations instead of spawning a worker. The worker finishes with taskboard_report (done) or taskboard_fail (blocked); the card records the worker and its member identity.
 
 ```json
 {
@@ -1596,7 +1596,7 @@ Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/ta
 
 ### `taskboard_reassign`
 
-Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and spawns a fresh worker on the same In progress card (status back to running); action "continue" (V3-28) instead wakes the card's existing worker session — it keeps its context and the preserved working tree, so prefer it for a blocked, paused or silent worker, and it degrades to a fresh spawn by itself when the session cannot be resumed; action "backlog" returns the card to Not started with status ready, clearing assignee and worker identity.
+Re-dispatch one taskboard ticket (master only): action "retry" clears the failure and puts the card back on its own roster member (rotation of that member's session — the headcount never grows; if no member is free the card queues); action "continue" (V3-28) instead wakes the card's existing worker session — it keeps its context and the preserved working tree, so prefer it for a blocked, paused or silent worker; action "backlog" returns the card to Not started with status ready, clearing assignee, worker identity and the roster pair.
 
 ```json
 {
@@ -1608,7 +1608,7 @@ Re-dispatch one taskboard ticket (master only): action "retry" clears the failur
     },
     "action": {
       "type": "string",
-      "description": "retry spawns a new worker; continue wakes the existing worker session (falling back to a fresh spawn); backlog returns the card to Not started.",
+      "description": "retry re-dispatches to the card's roster member (rotating its session when the old one is gone; queues when no member is free); continue wakes the existing worker session; backlog returns the card to Not started.",
       "enum": [
         "retry",
         "continue",
@@ -1784,6 +1784,24 @@ Report your review verdict on an In testing taskboard ticket you are the designa
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_roster`
+
+Read one board's fixed roster (V6-1): every member's id, role, fixed partner, derived load (idle/busy), the card it currently holds, and its SHORT work summary. This is the master's whole matching input — the master never reads a member's full context. Read it before dispatching when you want to see who is free, who is familiar with the card's modules, and whether the headcount is saturated (a saturated roster queues new cards instead of creating agents).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "Board whose roster to read; defaults to \"default\"."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_update`
 
 Update a taskboard ticket. An assignee edits its own card (title, description, devNotes); the master of the card's board may additionally correct planning metadata on ANY card of that board — title, description, filesScope and devNotes — including cards already dispatched to someone else, so a planning typo in a frozen filesScope is fixable in place (V3-40). Omitted fields stay unchanged. Every master correction appends one history row naming the master and each changed field's old -> new summary; a correction that changes nothing is recorded too, never silently. Worker-side ownership is unchanged: an agent that is neither the assignee nor the board master is refused with TASKBOARD_NOT_OWNER, and only the master may change filesScope (a non-master, including the assignee, gets TASKBOARD_NOT_MASTER).
@@ -1842,7 +1860,7 @@ Read one full taskboard ticket: description, assignee, review state, rejection f
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
-The twenty-three taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.
+The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.
 
 <a id="deepseek-aidsh-schedule"></a>
 
