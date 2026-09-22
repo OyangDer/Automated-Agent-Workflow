@@ -24,17 +24,29 @@ export const MEMBER_RECENT_TICKET_LIMIT = 5
 /** How many module keywords the rendered summary names. */
 const SUMMARY_MODULE_SHOWN = 4
 
-/** The worker member id of one pair index (0-based): "W1", "W2", ... */
+/**
+ * The worker member id of one pair index (0-based): "W1", "W2", ...
+ * @param index - the 0-based pair index.
+ * @returns the worker member id, e.g. "W1".
+ */
 export function workerMemberId(index: number): string {
   return 'W' + String(index + 1)
 }
 
-/** The reviewer member id of one pair index (0-based): "R1", "R2", ... */
+/**
+ * The reviewer member id of one pair index (0-based): "R1", "R2", ...
+ * @param index - the 0-based pair index.
+ * @returns the reviewer member id, e.g. "R1".
+ */
 export function reviewerMemberId(index: number): string {
   return 'R' + String(index + 1)
 }
 
-/** The pair index encoded in one member id; 0 when the id carries none. */
+/**
+ * The pair index encoded in one member id; 0 when the id carries none.
+ * @param id - the member id, e.g. "W2".
+ * @returns the 0-based pair index.
+ */
 export function memberIndex(id: string): number {
   const match = /^[WR](\d+)$/.exec(id)
   if (match === null) return 0
@@ -53,7 +65,11 @@ export function partnerMemberId(id: string): string {
   return id.startsWith('R') ? workerMemberId(index) : reviewerMemberId(index)
 }
 
-/** The display tag of one member: "W1 (worker)" / "R2 (reviewer)". */
+/**
+ * The display tag of one member: "W1 (worker)" / "R2 (reviewer)".
+ * @param id - the member id.
+ * @returns the display tag.
+ */
 export function memberTag(id: string): string {
   return id + (id.startsWith('R') ? ' (reviewer)' : ' (worker)')
 }

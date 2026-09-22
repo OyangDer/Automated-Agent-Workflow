@@ -21,9 +21,9 @@ const PRIORITIES: readonly Priority[] = ['low', 'normal', 'high']
  * @param id - the member id shown on the card.
  * @returns the partner member id.
  */
-function partnerOf(id: string): string {
+function partnerOf(id: string, workerTag: string, reviewerTag: string): string {
   const match = /^[WR](\d+)$/.exec(id)
-  return (id.startsWith('R') ? 'W' : 'R') + (match === null ? '' : match[1])
+  return (id.startsWith('R') ? workerTag : reviewerTag) + (match === null ? '' : match[1])
 }
 
 /**
@@ -131,7 +131,7 @@ export function TicketDetail({
               <dd>
                 {t('detail.pairValue')
                   .replace('{worker}', ticket.workerMemberId)
-                  .replace('{reviewer}', ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId))}
+                  .replace('{reviewer}', ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId, t('roster.tagWorker'), t('roster.tagReviewer')))}
               </dd>
             </div>
           )}

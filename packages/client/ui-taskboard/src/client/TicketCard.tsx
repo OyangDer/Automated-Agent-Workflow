@@ -44,9 +44,9 @@ function typeAccent(type: TicketView['type']): string {
  * The fixed partner of one roster member id (V6-1): W<n> pairs with R<n>.
  * The board computes the pairing the same way, so this only renders it.
  */
-function partnerOf(id: string): string {
+function partnerOf(id: string, workerTag: string, reviewerTag: string): string {
   const match = /^[WR](\d+)$/.exec(id)
-  return (id.startsWith('R') ? 'W' : 'R') + (match === null ? '' : match[1])
+  return (id.startsWith('R') ? workerTag : reviewerTag) + (match === null ? '' : match[1])
 }
 
 export function TicketCard({
@@ -61,7 +61,7 @@ export function TicketCard({
   // V6-1: the fixed worker -> reviewer pair is readable on the card itself.
   const pair = ticket.workerMemberId === undefined
     ? null
-    : { worker: ticket.workerMemberId, reviewer: ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId) }
+    : { worker: ticket.workerMemberId, reviewer: ticket.reviewerMemberId ?? partnerOf(ticket.workerMemberId, t('roster.tagWorker'), t('roster.tagReviewer')) }
   return (
     <article
       className={css.card + (selected ? ' ' + css.cardSelected : '') + (dragging ? ' ' + css.cardDragging : '')}
