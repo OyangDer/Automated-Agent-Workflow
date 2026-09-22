@@ -2469,6 +2469,30 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'how many queued cards this pass dispatched.',
       },
       {
+        signature: '@Remote(\'listStages\') async listStages(agent: Agent): Promise<StageView[]>',
+        description: 'V6-4: the stage list — one development stage per board, oldest first, each with its card census per column, its stage name and whether it is the current stage or an ended (archived, read-only) one. The legacy "default" board shows up as stage 1 so its history is never lost.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; its session and workspace scope the list.' }],
+        returns: 'the visible stages with their card counts.',
+      },
+      {
+        signature: '@Remote(\'createStage\') async createStageRemote(agent: Agent, request: CreateStageRequest): Promise<StageView>',
+        description: 'V6-4: start the next development stage — a brand-new EMPTY board that becomes current. The stage being succeeded is archived (history stays fully readable, further commands against it are refused), while the team is carried forward: roster members with their 履历, the headcount and model overrides, and the master seat, so nobody has to rebuild the team.',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the stage name and the stage being succeeded.' }],
+        returns: 'the new stage with its (empty) census.',
+      },
+      {
+        signature: '@Remote(\'switchStage\') async switchStageRemote(agent: Agent, request: SwitchStageRequest): Promise<StageView>',
+        description: 'V6-4: make one stage current. Switching to an ENDED stage re-activates it — the explicit "switch back" (D) that re-opens that stage for edits; its cards, Done column and history are untouched by the switch itself, so switching back always shows the stage as it ended.',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the stage to make current.' }],
+        returns: 'the now-current stage with its census.',
+      },
+      {
+        signature: '@Remote(\'migrateTickets\') async migrateTicketsRemote(agent: Agent, request: MigrateTicketsRequest): Promise<MigrateTicketsResult>',
+        description: 'V6-4 G/H/I: migrate an explicit batch of cards to another stage in one operation. Every card keeps its column (Done included), devNotes, review outcome, history, dependencies and worker/reviewer identity; the receipt names exactly which cards moved and where from. A card may not be left behind by a dependency it still waits for (C), and an ended stage refuses to receive cards.',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the card ids and the target stage.' }],
+        returns: 'the migration receipt.',
+      },
+      {
         signature: 'async submitReviewVerdict( agent: Agent, ticketId: string, verdict: \'approve\' | \'reject\', summary: string, problems: readonly string[], ): Promise<TicketView>',
         description: 'Report one reviewer verdict from a continuable reviewer session (V3-28). A durable reviewer child cannot carry an outputSchema — structured output is a one-shot-only subagent capability — so instead of the structured-output capture it calls the taskboard_review_verdict tool, which lands the same { verdict, summary, problems } report through the one landing path. The reviewer still never decides the card: the master resolves it with taskboard_resolve_review.',
         parameters: [{ name: 'agent', description: 'the reviewer session agent.' }, { name: 'ticketId', description: 'the In testing ticket under review.' }, { name: 'verdict', description: '\'approve\' or \'reject\'.' }, { name: 'summary', description: 'what the reviewer inspected and concluded.' }, { name: 'problems', description: 'concrete rework items (empty when approving).' }],
@@ -2679,9 +2703,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the updated ticket.',
       },
       {
-        signature: 'async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: \'compact\' | \'full\' = \'compact\', ): Promise<TicketRow[]>',
+        signature: 'async listRows( column: ColumnId | null, mine: boolean, agentId: string, detail: \'compact\' | \'full\' = \'compact\', boardId: string | null = null, ): Promise<TicketRow[]>',
         description: 'Whole-board rows for the model, optionally filtered.',
-        parameters: [{ name: 'column', description: 'column filter, or null for every column.' }, { name: 'mine', description: 'when true, only rows assigned to agentId.' }, { name: 'agentId', description: 'the calling agent\'s id.' }, { name: 'detail', description: '"compact" (default) returns the compact row; "full" also carries description, devNotes and the pending review report (V3-21 card read layering: compact by default, full when an anomaly needs it).' }],
+        parameters: [{ name: 'column', description: 'column filter, or null for every column.' }, { name: 'mine', description: 'when true, only rows assigned to agentId.' }, { name: 'agentId', description: 'the calling agent\'s id.' }, { name: 'detail', description: '"compact" (default) returns the compact row; "full" also carries description, devNotes and the pending review report (V3-21 card read layering: compact by default, full when an anomaly needs it).' }, { name: 'boardId', description: 'the stage to scope the read to, or null for every stage (V6-4 callers pass the caller\'s current stage, so a list never mixes stages unless one is named).' }],
         returns: 'the matching rows in position order.',
       },
       {
@@ -4304,12 +4328,16 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface CreateSessionOptions {\n    readonly seed?: readonly SessionEvent[];\n    readonly inheritedEventCount?: SessionLogOffset;\n    readonly meta?: {\n        readonly cwd?: string;\n        readonly parentSession?: SessionId;\n        readonly createdAt?: number;\n        readonly isSeeded?: boolean;\n        readonly origin?: \'subagent\';\n        readonly delegationDepth?: number;\n        readonly agentPreset?: string;\n    };\n}',
   },
   {
+    name: 'CreateStageRequest',
+    declaration: 'export interface CreateStageRequest {\n    name?: string;\n    fromBoardId?: string;\n}',
+  },
+  {
     name: 'CreateTeamTaskRequest',
     declaration: 'export interface CreateTeamTaskRequest {\n    readonly subject: string;\n    readonly description: string;\n    readonly blockedBy?: readonly TeamTaskId[];\n    readonly writeScopes?: readonly string[];\n}',
   },
   {
     name: 'CreateTicketRequest',
-    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n}',
+    declaration: 'export interface CreateTicketRequest {\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n    crossStageReason?: string;\n}',
   },
   {
     name: 'CredentialInfo',
@@ -4465,7 +4493,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'EditTicketRequest',
-    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n}',
+    declaration: 'export interface EditTicketRequest {\n    ticketId: string;\n    title: string;\n    description: string;\n    priority: Priority;\n    dependsOn: string[];\n    boardId?: string;\n    targetBranch?: string;\n    filesScope?: string;\n    crossStageReason?: string;\n}',
   },
   {
     name: 'EncodedFileAttachment',
@@ -4998,6 +5026,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'MessageSourceMap',
     declaration: 'export interface MessageSourceMap {\n    user: {\n        kind: \'user\';\n    };\n    plugin: {\n        kind: \'plugin\';\n        plugin: string;\n    } & ContextFormed;\n    model: ModelMessageSource;\n    tool: ToolMessageSource;\n}',
+  },
+  {
+    name: 'MigrateTicketsRequest',
+    declaration: 'export interface MigrateTicketsRequest {\n    ticketIds: string[];\n    targetBoardId: string;\n}',
+  },
+  {
+    name: 'MigrateTicketsResult',
+    declaration: 'export interface MigrateTicketsResult {\n    targetBoardId: string;\n    moved: string[];\n    fromBoardIds: string[];\n}',
   },
   {
     name: 'ModelCatalog',
@@ -6028,6 +6064,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type SpillSource = {\n    kind: \'tool\';\n    toolName: string;\n    callId: ToolCallId;\n    label: string;\n} | {\n    kind: \'session-reference\';\n    sessionId: SessionId;\n    label: string;\n};',
   },
   {
+    name: 'StageView',
+    declaration: 'export interface StageView {\n    boardId: string;\n    name: string;\n    stageName: string;\n    stageIndex: number;\n    active: boolean;\n    archivedAt: number | null;\n    scope: \'session\' | \'project\';\n    workspaceId: string;\n    counts: Record<ColumnId, number>;\n    total: number;\n}',
+  },
+  {
     name: 'StorageBackend',
     declaration: 'export interface StorageBackend {\n    readonly kv?: KvFacet;\n    close(): Promise<void>;\n}',
   },
@@ -6198,6 +6238,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SurfaceOp',
     declaration: 'export type SurfaceOp = \'append\' | {\n    op: \'replace\';\n    startSeq: SessionSeq;\n    endSeq: SessionSeq;\n};',
+  },
+  {
+    name: 'SwitchStageRequest',
+    declaration: 'export interface SwitchStageRequest {\n    boardId: string;\n}',
   },
   {
     name: 'SystemMessage',
@@ -6385,7 +6429,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketView',
-    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    workerMemberId?: string | undefined;\n    reviewerMemberId?: string | undefined;\n    queue?: TicketQueue | null | undefined;\n    failure: TicketFailure | null;\n    autoRetries: number;\n    reviewerRetries?: number | undefined;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    workerMemberId?: string | undefined;\n    reviewerMemberId?: string | undefined;\n    queue?: TicketQueue | null | undefined;\n    failure: TicketFailure | null;\n    autoRetries: number;\n    reviewerRetries?: number | undefined;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    crossStageReason?: string | undefined;\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TicketWorkerStatus',
