@@ -1,5 +1,11 @@
-import { describe, expect, expectTypeOf, it, vi } from 'vitest'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import FileSettingsProvider from '@deepseek-ai/dsh-settings-file'
+import { COMPACTION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-compaction-basic/src/settings.ts'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
@@ -2134,5 +2140,168 @@ describe('route-priced image pressure', () => {
       .filter(node => result?.shadowedSeqs.includes(node.seq))
       .reduce((total, node) => total + node.heuristicTokens, 0)
     expect(summaryEvent?.data.shadowedTokenCount).toBe(shadowedHeuristic)
+  })
+})
+
+/** Settings namespace the ceiling section lives under. */
+const SETTINGS_NS = COMPACTION_SETTINGS_NAMESPACE
+
+/** In-memory settings provider fixture: raw document plus every persisted section. */
+class MemorySettings extends SettingsProvider {
+  /** Raw document this provider's storage currently holds. */
+  doc: Record<string, unknown>
+
+  constructor(ctx: Context, doc: Record<string, unknown> = {}) {
+    super(ctx)
+    this.doc = structuredClone(doc)
+  }
+
+  get writable(): boolean {
+    return true
+  }
+
+  protected load(): Promise<Record<string, unknown>> {
+    return Promise.resolve(structuredClone(this.doc))
+  }
+
+  protected async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+    this.doc[ns] = structuredClone(section)
+  }
+}
+
+/** Wait until an engine's deferred settings binding has registered the section. */
+async function registered(ctx: Context): Promise<void> {
+  await vi.waitFor(() => { expect(ctx.settings.get(SETTINGS_NS)).toBeDefined() })
+}
+
+describe('the user-owned automatic compaction ceiling', () => {
+  /** Every temp root this block created, removed after each test. */
+  const roots: string[] = []
+  afterEach(async () => {
+    for (const home of roots.splice(0)) await rm(home, { recursive: true, force: true })
+  })
+
+  it('takes the user ceiling over the composition value and returns to it when cleared', async () => {
+    const ctx = createContext()
+    await ctx.plugin(MemorySettings)
+    const compact = service({ auto: false, thresholdRatio: 0.8, retainRatio: 0.1 }, ctx)
+    await registered(ctx)
+
+    expect(compact.config.thresholdRatio).toBe(0.8)
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.5 })
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.5)
+    })
+
+    await ctx.settings.replace(SETTINGS_NS, {})
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.8)
+    })
+  })
+
+  it('refuses a ceiling this composition could not compact under', async () => {
+    const ctx = createContext()
+    await ctx.plugin(MemorySettings)
+    const compact = service({ auto: false, thresholdRatio: 0.8 }, ctx)
+    await registered(ctx)
+
+    // The package default retains 0.16 of the window, so a 0.1 ceiling would
+    // retain more than it folds: the write is refused instead of stored.
+    await expect(ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.1 }))
+      .rejects.toThrow(/retainRatio \(0.16\) must be less than the resolved thresholdRatio \(0.1\)/)
+    expect(compact.config.thresholdRatio).toBe(0.8)
+    expect(ctx.settings.get(SETTINGS_NS)).toEqual({ thresholdRatio: 0.8 })
+  })
+
+  it('fires pressure compaction at the user ceiling and not above it', async () => {
+    const ctx = createContext(1_000)
+    await ctx.plugin(MemorySettings)
+    const compact = service({ auto: false, thresholdRatio: 0.5, retainTokens: 50 }, ctx)
+    await registered(ctx)
+    const log: string[] = []
+    ctx.logger.info = ((message: string) => void log.push(message)) as typeof ctx.logger.info
+
+    const measured = ctx.tokenMeter.measure(conversation(2, 'x'.repeat(600))).totalTokens
+    expect(measured).toBeGreaterThan(300)
+    expect(measured).toBeLessThan(850)
+
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.3 })
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.3)
+    })
+    expect(await compactIfNeeded(compact, conversation(2, 'x'.repeat(600)))).not.toBeNull()
+    expect(log).toEqual([
+      'compaction threshold set to 0.3 of the routed context window',
+      `compaction threshold crossed: ${measured} estimated tokens >= 300 (ratio 0.3 x 1000 window)`,
+    ])
+
+    log.length = 0
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.85 })
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.85)
+    })
+    expect(await compactIfNeeded(compact, conversation(2, 'x'.repeat(600)))).toBeNull()
+    expect(log).toEqual(['compaction threshold set to 0.85 of the routed context window'])
+  })
+
+  it('drives every engine on the shared section, keeping one a preset cannot run', async () => {
+    const ctx = createContext()
+    await ctx.plugin(MemorySettings)
+    const owner = service({ auto: false, thresholdRatio: 0.8, retainRatio: 0.16 }, ctx)
+    await registered(ctx)
+    // A second preset's engine finds the namespace claimed and observes it. The
+    // isolated realm mirrors the preset isolate group that keeps both alive.
+    const follower = service(
+      { auto: false, thresholdRatio: 0.35, retainRatio: 0.3 },
+      ctx.isolate('compaction'),
+    )
+    expect(ctx.settings.get(SETTINGS_NS)).toEqual({ thresholdRatio: 0.8 })
+
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.5 })
+    await vi.waitFor(() => {
+      expect(owner.config.thresholdRatio).toBe(0.5)
+      expect(follower.config.thresholdRatio).toBe(0.5)
+    })
+
+    // A ceiling only the owner can run: the follower keeps its last good value.
+    const warnings: string[] = []
+    ctx.logger.warn = ((message: string) => void warnings.push(message)) as typeof ctx.logger.warn
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.2 })
+    await vi.waitFor(() => {
+      expect(owner.config.thresholdRatio).toBe(0.2)
+    })
+    expect(follower.config.thresholdRatio).toBe(0.5)
+    expect(warnings.some(line => line.includes('stored 0.2 cannot drive this composition'))).toBe(true)
+
+    // Clearing the choice returns every engine to its own composition value.
+    await ctx.settings.replace(SETTINGS_NS, {})
+    await vi.waitFor(() => {
+      expect(owner.config.thresholdRatio).toBe(0.8)
+      expect(follower.config.thresholdRatio).toBe(0.35)
+    })
+  })
+
+  it('persists the chosen ceiling across a fresh provider on the same document', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dsh-compaction-settings-'))
+    roots.push(home)
+    const file = join(home, 'settings.yaml')
+
+    const ctx = createContext()
+    await ctx.plugin(FileSettingsProvider, { path: file, watch: false })
+    const compact = service({ auto: false, thresholdRatio: 0.8, retainRatio: 0.1 }, ctx)
+    await registered(ctx)
+    await ctx.settings.update(SETTINGS_NS, { thresholdRatio: 0.5 })
+    await vi.waitFor(() => {
+      expect(compact.config.thresholdRatio).toBe(0.5)
+    })
+
+    // What a host restart sees: a new context and provider on the same document.
+    const restarted = createContext()
+    await restarted.plugin(FileSettingsProvider, { path: file, watch: false })
+    const revived = service({ auto: false, thresholdRatio: 0.8, retainRatio: 0.1 }, restarted)
+    await registered(restarted)
+    expect(await readFile(file, 'utf8')).toContain('compaction-basic:')
+    expect(restarted.settings.get(SETTINGS_NS)).toEqual({ thresholdRatio: 0.5 })
+    expect(revived.config.thresholdRatio).toBe(0.5)
   })
 })

@@ -22,9 +22,15 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Type-only: the settings domain's Context merge (ctx.settingsScope).
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { BoardSnapshot } from '@deepseek-ai/dsh-taskboard/client'
+import {
+  COMPACTION_CEILING_NS, createCompactionCeilingFace,
+  type CompactionCeilingFace, type CompactionCeilingSection,
+} from './compaction-threshold.ts'
 import { createTaskboardStore } from './stores.ts'
 import { TaskboardView } from './TaskboardView.tsx'
 import type { BoardScope, BoardState, BoardView, CreateBoardRequest, TaskboardInjected } from './contract.ts'
@@ -83,6 +89,22 @@ interface BoardSource {
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-taskboard: dictionaries')
   const t = ctx.locale.bind(NS)
+
+  // V6-2: one ceiling face per plugin, shared by every session tab. The scope
+  // belongs to this fiber, so the control and the Host section it edits share
+  // one lifetime. The settings domain stays optional: a composition that mounts
+  // no settings client renders exactly the board it always did.
+  let ceiling: CompactionCeilingFace | undefined
+  ctx.inject(['settingsScope'], (settingsCtx) => {
+    const face = createCompactionCeilingFace(
+      settingsCtx.settingsScope.bind<CompactionCeilingSection>({ namespace: COMPACTION_CEILING_NS }),
+    )
+    ceiling = face
+    return () => {
+      ceiling = undefined
+      face.dispose()
+    }
+  })
 
   /**
    * Per-session board state sources: the host scopes snapshot/listBoards/
@@ -180,13 +202,11 @@ export function apply(ctx: ClientContext): void {
     }
 
     /** Switch the active board and refetch both feeds. */
-    const selectBoard = async (boardId: string): Promise<void> => {
-      if (boardId === current.boardId) {
-        void refresh()
-        return
-      }
-      current = { ...current, boardId }
+    const selectBoard = (boardId: string): Promise<void> => {
+      if (boardId !== current.boardId) current = { ...current, boardId }
+      // The refetch stays fire-and-forget: the returned promise settles at once.
       void refresh()
+      return Promise.resolve()
     }
 
     /** Create one board from its display name and scope, then open it. */
@@ -194,14 +214,14 @@ export function apply(ctx: ClientContext): void {
       const request: CreateBoardRequest = { name, scope }
       // The request's scope rides the wire to the host; the return row is
       // pinned to the client view the host contract will provide.
-      const created = unwrap(await ctx.remote.taskboard.createBoard(sessionId, request)) as BoardView
+      const created = unwrap(await ctx.remote.taskboard.createBoard(sessionId, request))
       await selectBoard(created.boardId)
       return created
     }
 
     /** Archive one board; archiving the active board falls back to default. */
     const archiveBoard = async (boardId: string): Promise<BoardView> => {
-      const archived = unwrap(await ctx.remote.taskboard.archiveBoard(sessionId, { boardId })) as BoardView
+      const archived = unwrap(await ctx.remote.taskboard.archiveBoard(sessionId, { boardId }))
       if (archived.boardId === current.boardId) {
         await selectBoard('default')
       } else {
@@ -240,9 +260,9 @@ export function apply(ctx: ClientContext): void {
     label: () => t('view.taskboard'),
     store: createTaskboardStore(),
     inject: (sessionId: SessionId): TaskboardInjected => {
-      let source = sources.get(sessionId)
-      if (source === undefined) {
-        source = makeSource(sessionId)
+      const existing = sources.get(sessionId)
+      const source = existing ?? makeSource(sessionId)
+      if (existing === undefined) {
         sources.set(sessionId, source)
         void source.refresh()
       }
@@ -253,10 +273,11 @@ export function apply(ctx: ClientContext): void {
         remove: async request => unwrap(await ctx.remote.taskboard.delete(sessionId, request)),
         requestReview: async request => unwrap(await ctx.remote.taskboard.requestReview(sessionId, request)),
         refresh: () => { void source.refresh() },
-        selectBoard: source.selectBoard,
-        createBoard: source.createBoard,
-        archiveBoard: source.archiveBoard,
+        selectBoard: boardId => source.selectBoard(boardId),
+        createBoard: (name, scope) => source.createBoard(name, scope),
+        archiveBoard: boardId => source.archiveBoard(boardId),
         hooks: { board: source.board },
+        ...(ceiling === undefined ? {} : { compaction: ceiling }),
       }
     },
   }, TaskboardView))

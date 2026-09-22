@@ -28,6 +28,9 @@
       "path": "../../core/agent"
     },
     {
+      "path": "../../settings/settings"
+    },
+    {
       "path": "../../interaction/commands"
     },
     {

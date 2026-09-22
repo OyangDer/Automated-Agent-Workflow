@@ -17,6 +17,7 @@ import {
   type DragAutoScrollOptions,
 } from './dragScroll.ts'
 import { createTaskboardStore } from './stores.ts'
+import { CompactionCeilingRow } from './CompactionCeilingRow.tsx'
 import { TicketCard } from './TicketCard.tsx'
 import { TicketDetail } from './TicketDetail.tsx'
 import { NewTicketForm } from './NewTicketForm.tsx'
@@ -51,7 +52,7 @@ interface DropTarget {
 
 export function TaskboardView({
   useBoard, useStore, actions, create, move, edit, remove, requestReview,
-  selectBoard, createBoard, archiveBoard, t, dragAutoScroll,
+  selectBoard, createBoard, archiveBoard, t, dragAutoScroll, compaction,
 }: TaskboardViewProps) {
   const boardState = useBoard(state => state)
   const board = boardState.snapshot
@@ -140,11 +141,9 @@ export function TaskboardView({
       .replaceAll('{boardId}', boardState.boardId)
       .replaceAll('{boardName}', board?.name ?? boardState.boardId)
     try {
-      if (navigator.clipboard !== undefined) {
-        await navigator.clipboard.writeText(script)
-      } else {
-        throw new Error('clipboard unavailable')
-      }
+      // lib.dom types clipboard non-optional, but insecure contexts omit it —
+      // the write then throws straight into the failure state below.
+      await navigator.clipboard.writeText(script)
       setCopyState('copied')
     } catch {
       setCopyState('failed')
@@ -319,7 +318,7 @@ export function TaskboardView({
             {t(('board.scope.' + boardState.scope) as never)}
           </span>
           {!confirmArchive ? (
-            <button type="button" className={css.archiveButton} onClick={() => setConfirmArchive(true)}>
+            <button type="button" className={css.archiveButton} onClick={() => { setConfirmArchive(true) }}>
               {t('board.archive')}
             </button>
           ) : (
@@ -328,7 +327,7 @@ export function TaskboardView({
               <button type="button" className={css.confirmButton} onClick={() => { setConfirmArchive(false); void handleArchive() }}>
                 {t('board.confirm')}
               </button>
-              <button type="button" className={css.cancelButton} onClick={() => setConfirmArchive(false)}>
+              <button type="button" className={css.cancelButton} onClick={() => { setConfirmArchive(false) }}>
                 {t('action.cancel')}
               </button>
             </span>
@@ -357,10 +356,10 @@ export function TaskboardView({
           )}
         </div>
         <div className={css.headerActions}>
-          <button type="button" className={css.secondaryButton} onClick={() => setNewBoardOpen(open => !open)}>
+          <button type="button" className={css.secondaryButton} onClick={() => { setNewBoardOpen(open => !open) }}>
             {t('board.new')}
           </button>
-          <button type="button" className={css.newButton} onClick={() => setFormOpen(true)}>
+          <button type="button" className={css.newButton} onClick={() => { setFormOpen(true) }}>
             {t('action.new')}
           </button>
         </div>
@@ -373,7 +372,7 @@ export function TaskboardView({
           <input
             className={css.boardNameInput}
             value={boardName}
-            onChange={event => setBoardName(event.target.value)}
+            onChange={(event) => { setBoardName(event.target.value) }}
             placeholder={t('board.newName')}
             aria-label={t('board.newName')}
           />
@@ -397,9 +396,15 @@ export function TaskboardView({
       {error !== null && (
         <div className={css.errorBanner} role="alert">
           <span>{error}</span>
-          <button type="button" className={css.errorClose} onClick={() => setError(null)} aria-label={t('action.close')}>×</button>
+          <button type="button" className={css.errorClose} onClick={() => { setError(null) }} aria-label={t('action.close')}>×</button>
         </div>
       )}
+      {/*
+        V6-2: the automatic-compaction ceiling. It renders the Host's
+        `compaction-basic` settings section, so the value shown is the one
+        every engine compacts under — no restart, no board reload.
+      */}
+      {compaction !== undefined && <CompactionCeilingRow ceiling={compaction} t={t} />}
       {/*
         V6-1 visualization base: the board's fixed roster — member id, role,
         fixed partner, derived load and the SHORT work summary the master
@@ -431,6 +436,7 @@ export function TaskboardView({
           const tickets = byColumn.get(column) ?? []
           const gloss = t(('column.' + column + '.gloss') as never)
           const isDropTarget = dropTarget !== null && dropTarget.column === column
+          const columnClass = css.column ?? ''
           /** Slot the drop lands in: the index to insert before (length = append). */
           const dropSlot = isDropTarget
             ? insertionSlot(tickets.map(ticket => ticket.id), dropTarget.beforeTicketId)
@@ -438,7 +444,7 @@ export function TaskboardView({
           return (
             <section
               key={column}
-              className={css.column + (isDropTarget ? ' ' + css.columnDropTarget : '')}
+              className={isDropTarget ? `${columnClass} ${css.columnDropTarget ?? ''}` : columnClass}
               data-column={column}
               onDragOver={(event) => {
                 handleColumnDragOver(event)
@@ -520,7 +526,7 @@ export function TaskboardView({
               setError(t('error.generic'))
             }
           }}
-          onCancel={() => setFormOpen(false)}
+          onCancel={() => { setFormOpen(false) }}
         />
       )}
     </div>

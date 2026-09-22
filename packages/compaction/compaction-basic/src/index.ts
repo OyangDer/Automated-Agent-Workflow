@@ -23,6 +23,7 @@ import {
   resolveTargetPolicy,
   TargetPressureConfigError,
 } from './config.ts'
+import { bindThresholdSettings } from './settings.ts'
 import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
@@ -45,6 +46,8 @@ export type {
   ResolvedRetention,
   ResolvedTargetPolicy,
 } from './types.ts'
+export { COMPACTION_SETTINGS_NAMESPACE } from './settings.ts'
+export type { CompactionThresholdSettings } from './settings.ts'
 
 /** The region transaction's view of this service's dynamically dispatched summarizer. */
 type RegionSummarize = (input: SummarizationInput, agent: Agent, signal?: AbortSignal) => Promise<SummaryResult>
@@ -117,8 +120,17 @@ export class BasicCompactionEngine extends CompactionEngine {
     auto: z.boolean(),
   })
 
-  /** Resolved and validated compaction configuration. */
-  readonly config: ResolvedConfig
+  /**
+   * Resolved and validated compaction configuration. Re-resolved whenever the
+   * user-owned ceiling section commits a value this composition can run.
+   */
+  get config(): ResolvedConfig {
+    return this.resolvedConfig
+  }
+
+  private resolvedConfig: ResolvedConfig
+  /** The composition entry every user ceiling re-resolves over. */
+  private readonly compositionConfig: BasicCompactionConfig
 
   private readonly warnedPressureConfigTargets = new Set<string>()
   private readonly overflowRetries = new WeakMap<Agent, number>()
@@ -126,8 +138,46 @@ export class BasicCompactionEngine extends CompactionEngine {
 
   constructor(ctx: Context, config: BasicCompactionConfig = {}) {
     super(ctx)
-    this.config = resolveConfig(config)
-    if (this.config.auto) this._registerAutomaticCompaction()
+    this.compositionConfig = config
+    this.resolvedConfig = resolveConfig(config)
+    if (this.resolvedConfig.auto) this._registerAutomaticCompaction()
+    this._bindThresholdSettings()
+  }
+
+  /**
+   * Follow the user-owned ceiling section. A deployment without a settings
+   * provider never runs the binding and keeps its composition value.
+   */
+  private _bindThresholdSettings(): void {
+    bindThresholdSettings(this.ctx, this.resolvedConfig.thresholdRatio, {
+      // The load-time policy owns every cross-field rule, so re-running it here
+      // refuses a stored ceiling this composition could not compact under
+      // (a retain budget at or above the new ceiling) instead of storing one.
+      validate: (ratio) => { resolveConfig({ ...this.compositionConfig, thresholdRatio: ratio }) },
+      apply: (ratio) => { this._adoptThreshold(ratio) },
+    })
+  }
+
+  /**
+   * Re-resolve the policy under one user ceiling, keeping the last usable
+   * configuration when the stored value cannot drive this composition.
+   * @param ratio - the ceiling now in force, as a fraction of the routed window.
+   */
+  private _adoptThreshold(ratio: number): void {
+    if (ratio === this.resolvedConfig.thresholdRatio) return
+    let next: ResolvedConfig
+    try {
+      next = resolveConfig({ ...this.compositionConfig, thresholdRatio: ratio })
+    } catch (error: unknown) {
+      this.ctx.logger.warn(
+        `compaction-basic: keeping thresholdRatio ${this.resolvedConfig.thresholdRatio}; the `
+        + `stored ${ratio} cannot drive this composition: `
+        + (error instanceof Error ? error.message : String(error)),
+      )
+      return
+    }
+    this.resolvedConfig = next
+    this.ctx.logger.info(`compaction threshold set to ${ratio} of the routed context window`)
   }
 
   /**
@@ -303,6 +353,12 @@ export class BasicCompactionEngine extends CompactionEngine {
     }
     const spec = resolveCompactSpec(policy, context.contextWindow)
     if (measurement.totalTokens < spec.thresholdTokens) return null
+    // One durable record of the crossing, so a deployment can see where its
+    // configured ceiling put the fold for the window this session routed to.
+    this.ctx.logger.info(
+      `compaction threshold crossed: ${measurement.totalTokens} estimated tokens >= `
+      + `${spec.thresholdTokens} (ratio ${spec.thresholdRatio} x ${context.contextWindow} window)`,
+    )
 
     // Once pressure qualifies, land the model-free pass before choosing a
     // summary range, then remeasure through the singleton replay fold.

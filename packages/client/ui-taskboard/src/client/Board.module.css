@@ -17,6 +17,74 @@
   border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
+/* V6-2: the automatic-compaction ceiling row. Preset buttons plus a percent
+   input over the `compaction-basic` settings namespace, with the value in
+   force and the composition fallback it resets to. */
+.ceiling {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  font-size: 12px;
+}
+
+.ceilingTitle {
+  color: var(--dsw-alias-text-2);
+  font-weight: 600;
+}
+
+.ceilingPreset {
+  padding: 2px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-text-1);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ceilingPreset[data-active='true'] {
+  border-color: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-brand-primary);
+  font-weight: 600;
+}
+
+.ceilingPreset:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.ceilingInput {
+  width: 64px;
+  padding: 2px 6px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-text-1);
+  font-size: 12px;
+}
+
+.ceilingValue {
+  color: var(--dsw-alias-text-2);
+}
+
+.ceilingAction {
+  padding: 2px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dsw-alias-text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ceilingError {
+  color: var(--dsw-alias-state-error-primary);
+}
+
 /* V6-1: the fixed roster strip — who is on the team, who is free, and the
    short work summary the master matches against. Read-only. */
 .roster {

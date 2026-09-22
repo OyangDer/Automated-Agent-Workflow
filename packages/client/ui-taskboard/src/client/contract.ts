@@ -8,6 +8,7 @@ import type {
   BoardSnapshot, BoardView as HostBoardView, CreateTicketRequest, EditTicketRequest, MoveTicketRequest,
   RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
+import type { CompactionCeilingFace } from './compaction-threshold.ts'
 
 /**
  * The two board scopes the header selector groups by. A session-scoped board
@@ -90,4 +91,10 @@ export interface TaskboardInjected {
   archiveBoard(boardId: string): Promise<BoardView>
   /** Live board state source; the renderer binds it into useBoard. */
   hooks: { board: HostObservable<BoardState> }
+  /**
+   * The automatic-compaction ceiling control (V6-2). Absent when the
+   * deployment serves no `compaction-basic` settings namespace, so the tab
+   * renders exactly the board it always did.
+   */
+  compaction?: CompactionCeilingFace
 }
