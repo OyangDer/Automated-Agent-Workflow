@@ -4716,6 +4716,9 @@ describe('V6-3 roster headcount changes, named archiving and restore', () => {
   it('a) raising a headcount creates the new member, numbered and immediately dispatchable', async () => {
     const { service, devA, workerChild } = await harness()
     await service.claimMaster('default', devA)
+    // j) the deployment default is 2 pairs, and the user (not the board)
+    // raises or lowers it — the whole point of this card.
+    expect((await service.snapshot(devA)).capacity).toEqual({ worker: 2, reviewer: 2 })
     // 2 -> 3 worker slots: W3 appears at once, idle and paired with R3.
     const raisedWorker = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
     expect(raisedWorker.capacity).toEqual({ worker: 3, reviewer: 2 })

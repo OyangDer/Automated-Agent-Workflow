@@ -119,10 +119,22 @@ export function TaskboardView({
   const roster = board?.members ?? []
   const capacity = board?.capacity
   const activeRoster = roster.filter(member => member.archivedAt === null)
+  /**
+   * V6-3 i): the header reads the CONFIGURED headcount, never the number of
+   * members built so far — a board with cap 2 and one created pair still has
+   * room for a second pair, so "cap 1 pair" would be a lie. The census next to
+   * it names what actually exists: how many members are built and how many of
+   * them are busy. An old host serving no capacity falls back to the built
+   * count, which is the best fact available there.
+   */
   const pairCount = capacity === undefined
     ? (activeRoster.filter(member => member.role === 'worker').length
       || activeRoster.filter(member => member.role === 'reviewer').length)
     : Math.min(capacity.worker, capacity.reviewer)
+  const busyCount = activeRoster.filter(member => member.status === 'busy').length
+  const census = t('roster.census')
+    .replace('{created}', String(activeRoster.length))
+    .replace('{busy}', String(busyCount))
 
   /**
    * Master-seat banner state for the active board: vacant, held (with a
@@ -424,7 +436,10 @@ export function TaskboardView({
         <div className={css.roster} data-testid="taskboard-roster">
           <span className={css.rosterTitle}>
             {t('roster.title')}
-            <span className={css.rosterCapacity}>{t('roster.capacity').replace('{count}', String(pairCount))}</span>
+            <span className={css.rosterCapacity} data-testid="taskboard-roster-capacity">
+              {t('roster.capacity').replace('{count}', String(pairCount))}
+              {' · ' + census}
+            </span>
           </span>
           <RosterControls
             members={roster}

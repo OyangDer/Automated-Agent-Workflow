@@ -96,6 +96,26 @@ function boardRow(
   }
 }
 
+/** One roster member fixture (V6-1/V6-3 headcount strip). */
+function rosterMember(id: string, role: MemberRole, overrides: Partial<MemberView> = {}): MemberView {
+  return {
+    id,
+    boardId: 'default',
+    role,
+    partnerId: (role === 'worker' ? 'R' : 'W') + id.slice(1),
+    sessionId: '',
+    summary: id + ' summary',
+    modules: [],
+    recentTickets: [],
+    archivedAt: null,
+    createdAt: 1,
+    updatedAt: 1,
+    status: 'idle',
+    currentTicketId: null,
+    ...overrides,
+  }
+}
+
 /** Assemble the four shares the component destructures. */
 function propsOf({
   board, boards = [], boardId = 'default', workspaceId = '', scope, ownerSessionId,
@@ -654,22 +674,6 @@ describe('TaskboardView', () => {
   })
 
   it('renders the V6-3 headcount controls over the board roster and lowers only on a named member', () => {
-    const rosterMember = (id: string, role: MemberRole, overrides: Partial<MemberView> = {}): MemberView => ({
-      id,
-      boardId: 'default',
-      role,
-      partnerId: (role === 'worker' ? 'R' : 'W') + id.slice(1),
-      sessionId: '',
-      summary: id + ' summary',
-      modules: [],
-      recentTickets: [],
-      archivedAt: null,
-      createdAt: 1,
-      updatedAt: 1,
-      status: 'idle',
-      currentTicketId: null,
-      ...overrides,
-    })
     const setRosterCapacity = vi.fn(async (_request: SetRosterCapacityRequest) => (
       { boardId: 'default', name: 'default', tickets: [] } as BoardSnapshot
     ))
@@ -689,6 +693,25 @@ describe('TaskboardView', () => {
     expect(setRosterCapacity).not.toHaveBeenCalled()
     fireEvent.click(screen.getByTestId('roster-archive-W2'))
     expect(setRosterCapacity).toHaveBeenCalledWith({ boardId: 'default', role: 'worker', count: 1, archiveMemberId: 'W2' })
+  })
+
+  it('labels the CONFIGURED cap, never the created pair count, and names the census (V6-3 i)', () => {
+    // The deployment reported in the master's note: cap 2 pairs, but only one
+    // pair built so far, its worker already busy on a card.
+    render(createElement(TaskboardView, propsOf({
+      board: [],
+      members: [
+        rosterMember('W1', 'worker', { status: 'busy', currentTicketId: 'ticket-1' }),
+        rosterMember('R1', 'reviewer'),
+      ],
+      capacity: { worker: 2, reviewer: 2 },
+    })))
+
+    const capacity = screen.getByTestId('taskboard-roster-capacity').textContent ?? ''
+    expect(capacity).toContain('上限 2 组')
+    expect(capacity).toContain('已建 2、在忙 1')
+    // The old label would have read "上限 1 组" (one built pair).
+    expect(capacity).not.toContain('上限 1 组')
   })
 
 })
