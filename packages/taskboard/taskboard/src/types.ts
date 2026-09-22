@@ -166,7 +166,7 @@ export interface TicketView {
   description: string
   column: ColumnId
   priority: Priority
-  /** The board this ticket belongs to; one Sprint one board. */
+  /** The board (stage, V6-4) this ticket belongs to; one stage one board. */
   boardId: string
   /** Ticket kind badge. */
   type: TicketType
@@ -239,8 +239,18 @@ export interface TicketView {
    * on each other, and to spot soft (file-level) dependencies between cards.
    */
   filesScope: string
-  /** Hard ordering constraints: every listed ticket must be in Done before claim. */
+  /**
+   * Hard ordering constraints: every listed ticket must be in Done before
+   * claim, and (V6-4 C) every one of them must live on the SAME stage — a
+   * cross-stage dependency is only accepted when it was declared explicitly
+   * with a reason, which is recorded here.
+   */
   dependsOn: string[]
+  /**
+   * V6-4 C: the reason a card was allowed to keep a dependency pointing at
+   * another stage. Empty when every dependency is same-stage (the default).
+   */
+  crossStageReason?: string
   history: TicketHistoryEntry[]
 }
 
@@ -341,6 +351,21 @@ export interface BoardView {
   rosterConfig?: BoardRosterConfig
   /** When the board was archived; null while active. */
   archivedAt: number | null
+  /**
+   * V6-4 stage ordering: the 1-based position of this board in the caller
+   * workspace's stage chain (stage 1 is the oldest kept stage, so the legacy
+   * "default" board becomes stage 1). Absent on a board created before stages
+   * existed; the stage list fills the gap lazily.
+   */
+  stageIndex?: number
+  /** V6-4 stage display name ("阶段 2"); absent falls back to {@link name}. */
+  stageName?: string
+  /**
+   * V6-4: true on the workspace's CURRENT stage — the board every read and
+   * defaulted write resolves to. Exactly one visible stage is current; a board
+   * without the field reads as not current (v1 behaviour: "default").
+   */
+  active?: boolean
 }
 
 /**
@@ -455,6 +480,11 @@ export interface CreateTicketRequest {
   targetBranch?: string
   /** Declared file scope (paths this card touches); '' when not declared. */
   filesScope?: string
+  /**
+   * V6-4 C: the reason a dependency pointing at ANOTHER stage is declared on
+   * purpose. Omit it for the default (same-stage) dependency rule.
+   */
+  crossStageReason?: string
 }
 
 /** User drags a ticket to another column, optionally next to an anchor. */
@@ -482,6 +512,8 @@ export interface EditTicketRequest {
   targetBranch?: string
   /** Declared file scope (paths this card touches); omitted keeps the current scope. */
   filesScope?: string
+  /** V6-4 C: the explicit reason for a cross-stage dependency (see CreateTicketRequest). */
+  crossStageReason?: string
 }
 
 /** User deletes a ticket from the board. */
@@ -514,6 +546,85 @@ export interface CreateBoardRequest {
 /** User archives a board through the Remote API. */
 export interface ArchiveBoardRequest {
   boardId: string
+}
+
+/**
+ * One development stage (V6-4) as the stage list surfaces it: the board that
+ * holds it, its stage bookkeeping, and its card census. Cards, Done and card
+ * history belong to the stage; members, headcount, seats and model config are
+ * carried across stages so a new stage never needs its team rebuilt.
+ */
+export interface StageView {
+  boardId: string
+  /** The board's own name. */
+  name: string
+  /** The stage display name; the board name when no stage name is set. */
+  stageName: string
+  /** 1-based position in the caller workspace's stage chain. */
+  stageIndex: number
+  /** True on the workspace's current stage: what every read defaults to. */
+  active: boolean
+  /** When the stage ended; null while it is still live. */
+  archivedAt: number | null
+  scope: 'session' | 'project'
+  workspaceId: string
+  /** Cards per column on this stage. */
+  counts: Record<ColumnId, number>
+  /** Total cards on this stage (every column). */
+  total: number
+}
+
+/** One compact stage row, as the stage tool and the stage list report it (V6-4). */
+export interface StageRow {
+  boardId: string
+  /** The stage display name. */
+  stageName: string
+  /** 1-based position in the stage chain. */
+  stageIndex: number
+  /** True on the workspace's current stage. */
+  active: boolean
+  /** True when the stage ended: its history is readable, commands are refused. */
+  archived: boolean
+  /** Cards on the stage (every column). */
+  total: number
+  /** Cards in the Done column. */
+  done: number
+}
+
+/** V6-4: start the next stage, leaving the previous one as read-only history. */
+export interface CreateStageRequest {
+  /** Stage display name; defaults to "阶段 <n>". */
+  name?: string
+  /** The stage this one succeeds; defaults to the caller's current stage. */
+  fromBoardId?: string
+}
+
+/**
+ * V6-4: make one stage current. Switching to an ended (archived) stage
+ * re-activates it — the explicit "switch back" that sanctions editing that
+ * stage's history again.
+ */
+export interface SwitchStageRequest {
+  boardId: string
+}
+
+/**
+ * V6-4 (G/H): migrate an explicit batch of cards to another stage in one
+ * operation. Card history, devNotes, dependencies and the Done column travel
+ * with the cards; the tool reports exactly which cards moved where.
+ */
+export interface MigrateTicketsRequest {
+  ticketIds: string[]
+  targetBoardId: string
+}
+
+/** V6-4: the receipt of one migration. */
+export interface MigrateTicketsResult {
+  targetBoardId: string
+  /** The migrated card ids, in the order given. */
+  moved: string[]
+  /** The stages the cards came from, first-seen order. */
+  fromBoardIds: string[]
 }
 
 /**

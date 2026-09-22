@@ -37,10 +37,11 @@ import {
 } from './types.ts'
 import type {
   ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardRosterConfig, BoardSnapshot, BoardView, ColumnId,
-  CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MemberRecord, MemberRole,
-  MemberView, MoveTicketRequest, PreflightReport, Priority, RemoveTicketRequest, RemoveTicketResult,
-  RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest, TaskboardChanged, TaskboardOperation,
-  TicketAssignee, TicketFailure, TicketQueue, TicketType, TicketView, TicketWorkerStatus,
+  CreateBoardRequest, CreateStageRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MemberRecord,
+  MemberRole, MemberView, MigrateTicketsRequest, MigrateTicketsResult, MoveTicketRequest, PreflightReport, Priority,
+  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest,
+  StageRow, StageView, SwitchStageRequest, TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure,
+  TicketQueue, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
   foldMemberHistory, matchMember, memberIndex, memberTag, partnerMemberId,
@@ -126,6 +127,9 @@ const ticketSchema = zod.object({
     zod.null(),
   ]).default(null),
   dependsOn: zod.array(zod.string()),
+  // V6-4 C: set only when a cross-stage dependency was declared explicitly,
+  // with the reason. Absent (the default) means every dependency is same-stage.
+  crossStageReason: zod.string().optional(),
   history: zod.array(zod.object({ at: zod.number(), kind: zod.string(), detail: zod.string() })),
 })
 
@@ -190,6 +194,13 @@ const boardSchema = zod.object({
     reviewerCapacity: zod.number().optional(),
   }).default({}),
   archivedAt: zod.number().nullable().default(null),
+  // V6-4 stage bookkeeping. All three default away, so every board record
+  // written before stages existed reads back exactly as before; the stage list
+  // fills the name/index in lazily and "active" keeps read defaults on the
+  // v1 board until the user starts or switches a stage.
+  stageName: zod.string().optional(),
+  stageIndex: zod.number().optional(),
+  active: zod.boolean().default(false),
 })
 
 /**
@@ -1793,6 +1804,12 @@ export class TaskboardService extends TypertRemoteService {
         'TASKBOARD_NOT_MASTER',
       )
     }
+    // V6-4 B/D: every master command routed through the ticket (assign,
+    // reassign, pause, move, plan, update, claim) is refused on an ended stage
+    // so a stray order cannot rewrite history. The worker's own settlement
+    // (report/fail/complete) is not a master command and stays available, so a
+    // card still in flight when its stage ends can land.
+    await this.assertStageWritable(ticket.boardId, 'a master command')
   }
 
   /** Require the caller to be the current master of one board (by id). */
@@ -1806,6 +1823,353 @@ export class TaskboardService extends TypertRemoteService {
         'TASKBOARD_NOT_MASTER',
       )
     }
+    // V6-4 B/D: config/roster/master claims against an ended stage are refused
+    // the same way every other master command is.
+    await this.assertStageWritable(boardId, 'a master command')
+  }
+
+  /**
+   * V6-4: every board the caller may see, ordered as stages — explicit stage
+   * indexes first (stage 1 is the oldest stage), the legacy "default" board as
+   * stage 1, anything recorded without an index after them.
+   * @param agent - the calling session agent; its session and workspace scope the list.
+   * @returns the visible board records in stage order.
+   */
+  private async visibleBoards(agent: Agent): Promise<BoardView[]> {
+    const workspace = await this.workspaceOf(agent)
+    const workspaceId = workspace === undefined ? '' : workspace.id
+    await this.ensureSessionDefaultBoard(agent, workspace)
+    await this.ensureDefaultBoard(
+      workspaceId,
+      workspace === undefined ? undefined : basename(workspace.path),
+    )
+    const table = await this.boards()
+    const boards: BoardView[] = []
+    for (const [, board] of table.entries()) {
+      if (!this.isBoardVisible(board, agent.id, workspaceId)) continue
+      // V3-25: the retired master lease is reported empty so a legacy stored
+      // expiry never resurfaces as a fake deadline.
+      boards.push({ ...board, masterExpiresAt: null })
+    }
+    return boards.sort((left, right) => TaskboardService.stageOrder(left) - TaskboardService.stageOrder(right))
+  }
+
+  /**
+   * V6-4: the ordering key of one stage. An explicit stageIndex wins; the
+   * legacy "default" board sorts as stage 1 and an unindexed board after every
+   * numbered stage.
+   * @param board - the board to place.
+   * @returns the sort key.
+   */
+  private static stageOrder(board: BoardView): number {
+    if (typeof board.stageIndex === 'number' && board.stageIndex > 0) return board.stageIndex
+    return board.boardId === 'default' ? 1 : Number.MAX_SAFE_INTEGER
+  }
+
+  /**
+   * V6-4 D: fill in one stage's lazily derived index and display name so the
+   * legacy "default" board is recorded as "阶段 1" instead of being renamed
+   * (its history stays exactly where it was). The write is idempotent and is
+   * skipped entirely once the record carries both fields.
+   * @param board - the visible board record.
+   * @param index - its 1-based position in the stage order.
+   * @returns the board with the stage bookkeeping filled in.
+   */
+  private async materializeStage(board: BoardView, index: number): Promise<BoardView> {
+    const stageName = board.stageName ?? '阶段 ' + String(index)
+    if (board.stageIndex === index && board.stageName === stageName) return board
+    const table = await this.boards()
+    if (table.get(board.boardId) === undefined) {
+      return { ...board, stageIndex: index, stageName }
+    }
+    return await this.mutateBoard(board.boardId, current => ({
+      ...current,
+      stageIndex: index,
+      stageName: current.stageName ?? stageName,
+    }))
+  }
+
+  /**
+   * V6-4: the stage list — one development stage per board, oldest first, each
+   * with its card census per column, its stage name and whether it is the
+   * current stage or an ended (archived, read-only) one. The legacy "default"
+   * board shows up as stage 1 so its history is never lost.
+   * @param agent - the calling session agent; its session and workspace scope the list.
+   * @returns the visible stages with their card counts.
+   */
+  @Remote('listStages')
+  async listStages(agent: Agent): Promise<StageView[]> {
+    const boards = await this.visibleBoards(agent)
+    const tickets = await this.tickets()
+    const stages: StageView[] = []
+    let index = 0
+    for (const board of boards) {
+      index += 1
+      const stage = await this.materializeStage(board, index)
+      const counts = {} as Record<ColumnId, number>
+      for (const column of TASKBOARD_COLUMNS) counts[column] = 0
+      let total = 0
+      for (const [, ticket] of tickets.entries()) {
+        if (ticket.boardId !== stage.boardId) continue
+        counts[ticket.column] += 1
+        total += 1
+      }
+      stages.push({
+        boardId: stage.boardId,
+        name: stage.name,
+        stageName: stage.stageName ?? stage.name,
+        stageIndex: stage.stageIndex ?? index,
+        active: stage.active === true,
+        archivedAt: stage.archivedAt,
+        scope: stage.scope,
+        workspaceId: stage.workspaceId,
+        counts,
+        total,
+      })
+    }
+    return stages
+  }
+
+  /**
+   * V6-4: the current stage of the caller's workspace — the board every read
+   * and every defaulted write resolves to. Falls back to the v1 "default"
+   * board while no stage was ever started or switched, so nothing changes for
+   * an existing deployment until the user acts.
+   * @param agent - the calling session agent.
+   * @returns the current stage's board id.
+   */
+  private async activeBoardId(agent: Agent): Promise<string> {
+    const stages = await this.listStages(agent)
+    const active = stages.find(stage => stage.active)
+    return active === undefined ? 'default' : active.boardId
+  }
+
+  /**
+   * V6-4 B/D: refuse a command-class operation against an ended (archived)
+   * stage. An archived stage is history and must not be mutated behind the
+   * user's back; the sanctioned ways forward are switching back to it
+   * explicitly (which re-activates it) or starting a new stage.
+   * @param boardId - the board the operation targets.
+   * @param operation - the refused operation, named in the error.
+   */
+  private async assertStageWritable(boardId: string, operation: string): Promise<void> {
+    const board = (await this.boards()).get(boardId)
+    if (board === undefined || board.archivedAt === null) return
+    throw new TaskboardError(
+      'stage "' + (board.stageName ?? board.name) + '" (' + boardId + ') is archived — ' + operation
+        + ' is refused on an ended stage: switch back to that stage explicitly, or start a new stage',
+      'TASKBOARD_STAGE_ARCHIVED',
+    )
+  }
+
+  /**
+   * V6-4 C: every dependency must live on the card's own stage. A cross-stage
+   * dependency is only accepted when the caller declared it explicitly with a
+   * reason, which is recorded on the card so the exception stays auditable.
+   * @param table - the opened tickets table.
+   * @param boardId - the stage the card lives on.
+   * @param dependsOn - the card's declared dependencies.
+   * @param crossStageReason - the explicit reason, when the caller declared one.
+   */
+  private static assertDependencyStages(
+    table: KvTable<string, TicketView>,
+    boardId: string,
+    dependsOn: readonly string[],
+    crossStageReason: string | undefined,
+  ): void {
+    if (dependsOn.length === 0) return
+    const foreign = dependsOn.filter((id) => {
+      const dependency = table.get(id)
+      // An unknown id is the existing unknown-dependency problem, not this one.
+      return dependency !== undefined && dependency.boardId !== boardId
+    })
+    if (foreign.length === 0) return
+    if (crossStageReason !== undefined && crossStageReason.trim() !== '') return
+    throw new TaskboardError(
+      'dependsOn ' + JSON.stringify(foreign) + ' lives on another stage: dependencies stay inside one stage'
+        + ' — declare the cross-stage dependency explicitly with a reason if it is genuinely needed',
+      'TASKBOARD_INVALID_INPUT',
+    )
+  }
+
+  /**
+   * Carry a stage's roster forward (V6-4 A): members, their number, fixed
+   * partner, 履历 and summary belong to the team, not to one stage, so a new
+   * stage starts with the same members instead of an empty roster that would
+   * have to be rebuilt.
+   * @param fromBoardId - the stage being succeeded.
+   * @param toBoardId - the new stage.
+   */
+  private async copyRoster(fromBoardId: string, toBoardId: string): Promise<void> {
+    const members = await this.boardMembers(fromBoardId)
+    if (members.length === 0) return
+    const table = await this.members()
+    const now = Date.now()
+    for (const member of members) {
+      await table.put(TaskboardService.memberKey(toBoardId, member.id), {
+        ...member,
+        boardId: toBoardId,
+        createdAt: now,
+        updatedAt: now,
+      })
+    }
+  }
+
+  /**
+   * V6-4: start the next development stage — a brand-new EMPTY board that
+   * becomes current. The stage being succeeded is archived (history stays
+   * fully readable, further commands against it are refused), while the team
+   * is carried forward: roster members with their 履历, the headcount and
+   * model overrides, and the master seat, so nobody has to rebuild the team.
+   * @param agent - the calling session agent.
+   * @param request - the stage name and the stage being succeeded.
+   * @returns the new stage with its (empty) census.
+   */
+  @Remote('createStage')
+  async createStageRemote(agent: Agent, request: CreateStageRequest): Promise<StageView> {
+    const workspace = await this.workspaceOf(agent)
+    const callerWorkspaceId = workspace === undefined ? '' : workspace.id
+    const from = request.fromBoardId ?? await this.activeBoardId(agent)
+    await this.assertBoardAccessible(from, agent)
+    const stages = await this.listStages(agent)
+    const boards = await this.boards()
+    const source = boards.get(from)
+    const workspaceId = source?.workspaceId ?? callerWorkspaceId
+    const scope = source?.scope ?? (workspaceId === '' ? 'session' as const : 'project' as const)
+    const stageIndex = stages.reduce((top, stage) => Math.max(top, stage.stageIndex), 0) + 1
+    const stageName = request.name === undefined || request.name.trim() === ''
+      ? '阶段 ' + String(stageIndex)
+      : request.name.trim()
+    const record: BoardView = {
+      boardId: 'board-' + randomUUID(),
+      name: stageName,
+      stageName,
+      stageIndex,
+      active: true,
+      workspaceId,
+      scope,
+      ownerSessionId: scope === 'session' ? (source?.ownerSessionId ?? agent.id) : null,
+      masterAgentId: source?.masterAgentId ?? null,
+      masterClaimedAt: source?.masterClaimedAt ?? null,
+      masterExpiresAt: null,
+      handoverNotes: '',
+      archivedAt: null,
+      masterHistory: [],
+      notices: [],
+      modelConfig: source?.modelConfig ?? {},
+      rosterConfig: source?.rosterConfig ?? {},
+    }
+    await boards.put(record.boardId, record)
+    await this.copyRoster(from, record.boardId)
+    const now = Date.now()
+    for (const stage of stages) {
+      if (stage.boardId === record.boardId || stage.workspaceId !== workspaceId) continue
+      await this.mutateBoard(stage.boardId, current => ({
+        ...current,
+        active: false,
+        archivedAt: stage.boardId === from ? (current.archivedAt ?? now) : current.archivedAt,
+      }))
+    }
+    const created = (await this.listStages(agent)).find(stage => stage.boardId === record.boardId)
+    if (created === undefined) {
+      throw new TaskboardError('stage "' + record.boardId + '" is not listed after creation', 'TASKBOARD_BOARD_NOT_FOUND')
+    }
+    return created
+  }
+
+  /**
+   * V6-4: make one stage current. Switching to an ENDED stage re-activates it
+   * — the explicit "switch back" (D) that re-opens that stage for edits; its
+   * cards, Done column and history are untouched by the switch itself, so
+   * switching back always shows the stage as it ended.
+   * @param agent - the calling session agent.
+   * @param request - the stage to make current.
+   * @returns the now-current stage with its census.
+   */
+  @Remote('switchStage')
+  async switchStageRemote(agent: Agent, request: SwitchStageRequest): Promise<StageView> {
+    await this.assertBoardAccessible(request.boardId, agent)
+    const stages = await this.listStages(agent)
+    const target = stages.find(stage => stage.boardId === request.boardId)
+    if (target === undefined) {
+      throw new TaskboardError('board "' + request.boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+    }
+    for (const stage of stages) {
+      if (stage.workspaceId !== target.workspaceId) continue
+      await this.ensureBoard(stage.boardId)
+      await this.mutateBoard(stage.boardId, current => ({
+        ...current,
+        active: stage.boardId === target.boardId,
+        ...(stage.boardId === target.boardId && current.archivedAt !== null ? { archivedAt: null } : {}),
+      }))
+    }
+    const current = (await this.listStages(agent)).find(stage => stage.boardId === target.boardId)
+    if (current === undefined) {
+      throw new TaskboardError('board "' + request.boardId + '" does not exist', 'TASKBOARD_BOARD_NOT_FOUND')
+    }
+    return current
+  }
+
+  /**
+   * V6-4 G/H/I: migrate an explicit batch of cards to another stage in one
+   * operation. Every card keeps its column (Done included), devNotes, review
+   * outcome, history, dependencies and worker/reviewer identity; the receipt
+   * names exactly which cards moved and where from. A card may not be left
+   * behind by a dependency it still waits for (C), and an ended stage refuses
+   * to receive cards.
+   * @param agent - the calling session agent.
+   * @param request - the card ids and the target stage.
+   * @returns the migration receipt.
+   */
+  @Remote('migrateTickets')
+  async migrateTicketsRemote(agent: Agent, request: MigrateTicketsRequest): Promise<MigrateTicketsResult> {
+    await this.assertBoardAccessible(request.targetBoardId, agent)
+    await this.assertStageWritable(request.targetBoardId, 'migrating cards into it')
+    const ids = [...new Set(request.ticketIds)]
+    if (ids.length === 0) {
+      throw new TaskboardError('a migration needs at least one ticket id', 'TASKBOARD_INVALID_INPUT')
+    }
+    const table = await this.tickets()
+    const moving: TicketView[] = []
+    for (const id of ids) {
+      const ticket = table.get(id)
+      if (ticket === undefined) {
+        throw new TaskboardError('ticket "' + id + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+      }
+      await this.assertBoardAccessible(ticket.boardId, agent)
+      moving.push(ticket)
+    }
+    const movingIds = new Set(moving.map(ticket => ticket.id))
+    for (const ticket of moving) {
+      for (const dependency of ticket.dependsOn) {
+        if (movingIds.has(dependency)) continue
+        const known = table.get(dependency)
+        if (known === undefined) continue
+        if (known.boardId === request.targetBoardId) continue
+        if (known.boardId === ticket.boardId) {
+          throw new TaskboardError(
+            'ticket "' + ticket.id + '" waits for "' + dependency + '" on its current stage: migrate that card too,'
+              + ' or the dependency would cross stages',
+            'TASKBOARD_INVALID_INPUT',
+          )
+        }
+      }
+    }
+    const fromBoardIds: string[] = []
+    const moved: string[] = []
+    const now = Date.now()
+    for (const ticket of moving) {
+      if (!fromBoardIds.includes(ticket.boardId)) fromBoardIds.push(ticket.boardId)
+      const from = ticket.boardId
+      await this.mutate(ticket.id, 'move', current => appendHistory(
+        { ...current, boardId: request.targetBoardId, updatedAt: now },
+        'stage-move',
+        'migrated from stage ' + from + ' to ' + request.targetBoardId,
+        now,
+      ))
+      moved.push(ticket.id)
+    }
+    return { targetBoardId: request.targetBoardId, moved, fromBoardIds }
   }
 
   /**
@@ -1867,11 +2231,20 @@ export class TaskboardService extends TypertRemoteService {
     return last === undefined ? 0 : last.position + 1
   }
 
-  /** Validate the dependency edge set of one request against the live board. */
+  /**
+   * Validate the dependency edge set of one request against the live board.
+   * V6-4 C: the edges must also stay inside the card's own stage unless the
+   * caller declared the cross-stage edge explicitly with a reason.
+   * @param table - the opened tickets table.
+   * @param selfId - the card being written.
+   * @param dependsOn - the declared dependency edges.
+   * @param stage - the card's stage and the explicit cross-stage reason, if any.
+   */
   private validateDependencies(
     table: KvTable<string, TicketView>,
     selfId: string,
     dependsOn: string[],
+    stage: { boardId: string; crossStageReason?: string | undefined },
   ): void {
     const seen = new Set(dependsOn)
     if (seen.size !== dependsOn.length) {
@@ -1885,6 +2258,7 @@ export class TaskboardService extends TypertRemoteService {
         throw new TaskboardError('unknown dependency ticket "' + dependencyId + '"', 'TASKBOARD_DEPENDENCY_UNKNOWN')
       }
     }
+    TaskboardService.assertDependencyStages(table, stage.boardId, dependsOn, stage.crossStageReason)
     // Walk the transitive edge set from each dependency; reaching self = cycle.
     const queue = [...dependsOn]
     const visited = new Set<string>()
@@ -3473,8 +3847,9 @@ export class TaskboardService extends TypertRemoteService {
    */
   @Remote('setRosterCapacity')
   async setRosterCapacityRemote(agent: Agent, request: SetRosterCapacityRequest): Promise<BoardSnapshot> {
-    const boardId = request.boardId ?? 'default'
+    const boardId = await this.targetBoardId(agent, request.boardId)
     await this.assertBoardAccessible(boardId, agent)
+    await this.assertStageWritable(boardId, 'changing the roster headcount')
     await this.ensureBoard(boardId)
     const role = resolveMemberRole(request.role)
     const count = resolveCapacity(request.count)
@@ -3570,8 +3945,9 @@ export class TaskboardService extends TypertRemoteService {
    */
   @Remote('restoreMember')
   async restoreMemberRemote(agent: Agent, request: RestoreMemberRequest): Promise<BoardSnapshot> {
-    const boardId = request.boardId ?? 'default'
+    const boardId = await this.targetBoardId(agent, request.boardId)
     await this.assertBoardAccessible(boardId, agent)
+    await this.assertStageWritable(boardId, 'restoring a roster member')
     await this.ensureBoard(boardId)
     const table = await this.members()
     const member = table.get(TaskboardService.memberKey(boardId, request.memberId))
@@ -3622,7 +3998,9 @@ export class TaskboardService extends TypertRemoteService {
     agent: Agent,
     request: CreateTicketRequest & { type?: TicketType; targetBranch?: string },
   ): Promise<TicketView> {
-    await this.assertBoardAccessible(request.boardId ?? 'default', agent)
+    const boardId = await this.targetBoardId(agent, request.boardId)
+    await this.assertBoardAccessible(boardId, agent)
+    await this.assertStageWritable(boardId, 'creating a card on it')
     const title = resolveTitle(request.title)
     const priority = TASKBOARD_PRIORITIES.includes(request.priority) ? request.priority : 'normal'
     const type = request.type !== undefined && TASKBOARD_TYPES.includes(request.type) ? request.type : 'feature'
@@ -3633,7 +4011,7 @@ export class TaskboardService extends TypertRemoteService {
       description: typeof request.description === 'string' ? request.description : '',
       column: 'backlog' as ColumnId,
       priority,
-      boardId: request.boardId ?? 'default',
+      boardId,
       type,
       status: 'ready' as TicketWorkerStatus,
       failure: null,
@@ -3650,6 +4028,8 @@ export class TaskboardService extends TypertRemoteService {
       targetBranch: typeof request.targetBranch === 'string' ? request.targetBranch : '',
       filesScope: typeof request.filesScope === 'string' ? request.filesScope : '',
       dependsOn: Array.isArray(request.dependsOn) ? request.dependsOn : [],
+      // V6-4 C: only written when the caller declared a cross-stage edge.
+      ...(typeof request.crossStageReason === 'string' ? { crossStageReason: request.crossStageReason } : {}),
       history: [] as TicketView['history'],
     }
     return this.createRecord(record, now)
@@ -3658,7 +4038,10 @@ export class TaskboardService extends TypertRemoteService {
   /** Persist a fresh backlog record after dependency validation. */
   private async createRecord(record: Omit<TicketView, 'position'>, now: number): Promise<TicketView> {
     const table = await this.tickets()
-    this.validateDependencies(table, record.id, record.dependsOn)
+    this.validateDependencies(table, record.id, record.dependsOn, {
+      boardId: record.boardId,
+      crossStageReason: record.crossStageReason,
+    })
     const open = await this.openedTable()
     let max = 0
     for (const [, ticket] of open.entries()) {
@@ -3702,7 +4085,10 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
-    this.validateDependencies(table, request.ticketId, request.dependsOn)
+    this.validateDependencies(table, request.ticketId, request.dependsOn, {
+      boardId: current.boardId,
+      crossStageReason: request.crossStageReason,
+    })
     return this.mutate(request.ticketId, 'edit', edited => appendHistory(
       {
         ...edited,
@@ -4649,7 +5035,7 @@ export class TaskboardService extends TypertRemoteService {
     agent: Agent,
     request: CreateTicketRequest & { type?: TicketType; targetBranch?: string },
   ): Promise<TicketView> {
-    const boardId = request.boardId ?? 'default'
+    const boardId = await this.targetBoardId(agent, request.boardId)
     await this.assertMasterOfBoard(boardId, agent)
     return this.createRecordForBoard(agent, { ...request, boardId })
   }
@@ -4703,7 +5089,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertMasterOfTicket(current, agent)
     const nextDependsOn = dependsOn === undefined ? current.dependsOn : dependsOn
-    this.validateDependencies(table, ticketId, nextDependsOn)
+    this.validateDependencies(table, ticketId, nextDependsOn, { boardId: current.boardId })
     if (priority !== undefined && !TASKBOARD_PRIORITIES.includes(priority)) {
       throw new TaskboardError('unknown priority "' + String(priority) + '"', 'TASKBOARD_INVALID_INPUT')
     }
@@ -5170,10 +5556,14 @@ export class TaskboardService extends TypertRemoteService {
     mine: boolean,
     agentId: string,
     detail: 'compact' | 'full' = 'compact',
+    boardId: string | null = null,
   ): Promise<TicketRow[]> {
     const table = await this.tickets()
     const rows: TicketRow[] = []
     for (const [, ticket] of table.entries()) {
+      // V6-4: reads are stage-scoped — a named stage filters to itself instead
+      // of mixing every stage's cards into one list.
+      if (boardId !== null && ticket.boardId !== boardId) continue
       if (column !== null && ticket.column !== column) continue
       if (mine && ticket.assignee?.agentId !== agentId) continue
       rows.push({
@@ -5373,6 +5763,10 @@ export class TaskboardService extends TypertRemoteService {
           enum: ['compact', 'full'],
           description: 'compact (default) returns one line per card; full also includes description, devNotes and the pending review report for anomaly adjudication.',
         },
+        boardId: {
+          type: 'string' as const,
+          description: 'The stage (board) to read. Omit for the CURRENT stage: reads never span stages unless one is named explicitly.',
+        },
       },
       output: {
         schema: {
@@ -5395,14 +5789,14 @@ export class TaskboardService extends TypertRemoteService {
             ).join('\n'),
         }],
       },
-      execute: async (args: { column?: string; mine?: boolean; detail?: string }, exec) => {
+      execute: async (args: { column?: string; mine?: boolean; detail?: string; boardId?: string }, exec) => {
         const agent = TaskboardService.agentOf(exec)
         const column = args.column === undefined ? null : args.column as ColumnId
         if (column !== null && !isColumn(column)) {
           throw new TaskboardError('unknown column "' + String(column) + '"', 'TASKBOARD_INVALID_COLUMN')
         }
         const detail = args.detail === 'full' ? 'full' : 'compact'
-        const tickets = await this.listRows(column, args.mine === true, agent.id, detail)
+        const tickets = await this.listRows(column, args.mine === true, agent.id, detail, await this.targetBoardId(agent, args.boardId))
         return { tickets }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'List taskboard tickets', kind: 'other' as const, rawInput: args.column ?? null }),
@@ -5475,7 +5869,7 @@ export class TaskboardService extends TypertRemoteService {
       },
       execute: async (args: { boardId?: string }, exec) => {
         const agent = TaskboardService.agentOf(exec)
-        const boardId = args.boardId ?? 'default'
+        const boardId = await this.targetBoardId(agent, args.boardId)
         await this.assertBoardAccessible(boardId, agent)
         const roster = await this.rosterOf(boardId)
         const capacity = await this.capacityOf(boardId)
@@ -5950,7 +6344,8 @@ export class TaskboardService extends TypertRemoteService {
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
-        const board = await this.claimMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        const agent = TaskboardService.agentOf(exec)
+        const board = await this.claimMaster(await this.targetBoardId(agent, args.boardId), agent)
         const table = await this.tickets()
         const tickets: TicketView[] = []
         for (const [, ticket] of table.entries()) {
@@ -6006,7 +6401,8 @@ export class TaskboardService extends TypertRemoteService {
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
-        return await this.boardNotices(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        const agent = TaskboardService.agentOf(exec)
+        return await this.boardNotices(await this.targetBoardId(agent, args.boardId), agent)
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Read taskboard board notices', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
     }))
@@ -6031,7 +6427,8 @@ export class TaskboardService extends TypertRemoteService {
         render: (_args, value: { boardId: string }) => [{ type: 'text' as const, text: 'master seat of board ' + value.boardId + ' released' }],
       },
       execute: async (args: { boardId?: string }, exec) => {
-        const board = await this.releaseMaster(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        const agent = TaskboardService.agentOf(exec)
+        const board = await this.releaseMaster(await this.targetBoardId(agent, args.boardId), agent)
         return { boardId: board.boardId, masterAgentId: board.masterAgentId }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Release taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
@@ -6061,7 +6458,8 @@ export class TaskboardService extends TypertRemoteService {
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
-        const result = await this.handover(args.boardId ?? 'default', TaskboardService.agentOf(exec))
+        const agent = TaskboardService.agentOf(exec)
+        const result = await this.handover(await this.targetBoardId(agent, args.boardId), agent)
         return { boardId: result.board.boardId, masterAgentId: result.board.masterAgentId, notes: result.notes }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Hand over taskboard master seat', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
@@ -6313,7 +6711,7 @@ export class TaskboardService extends TypertRemoteService {
       parameters: {
         boardId: {
           type: 'string' as const,
-          description: 'The board to create the ticket on. Omit for the default board.',
+          description: 'The stage (board) to create the ticket on. Omit for the CURRENT stage.',
         },
         title: { type: 'string' as const, required: true, description: 'Ticket title.' },
         description: { type: 'string' as const, required: true, description: 'Ticket description / acceptance criteria.' },
@@ -6335,6 +6733,10 @@ export class TaskboardService extends TypertRemoteService {
         filesScope: {
           type: 'string' as const,
           description: 'Declared file scope: the ABSOLUTE paths (files or directories, e.g. "C:/repo/packages/x/src") this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards; it also locates the card\'s repo, so a scope written only as relative paths makes the dispatch fall back to the master cwd (V3-33).',
+        },
+        crossStageReason: {
+          type: 'string' as const,
+          description: 'V6-4 C: only for a dependsOn entry that lives on ANOTHER stage. Dependencies default to the same stage; declaring one across stages is refused unless this reason is given, and the reason is recorded on the card.',
         },
       },
       output: {
@@ -6358,6 +6760,7 @@ export class TaskboardService extends TypertRemoteService {
         priority?: Priority
         dependsOn?: string[]
         filesScope?: string
+        crossStageReason?: string
       }, exec) => {
         const agent = TaskboardService.agentOf(exec)
         const ticket = await this.createAsMaster(agent, {
@@ -6368,6 +6771,7 @@ export class TaskboardService extends TypertRemoteService {
           ...(args.boardId === undefined ? {} : { boardId: args.boardId }),
           ...(args.type === undefined ? {} : { type: args.type }),
           ...(args.filesScope === undefined ? {} : { filesScope: args.filesScope }),
+          ...(args.crossStageReason === undefined ? {} : { crossStageReason: args.crossStageReason }),
         })
         return { id: ticket.id, title: ticket.title, column: ticket.column, type: ticket.type, boardId: ticket.boardId }
       },
@@ -6523,7 +6927,7 @@ export class TaskboardService extends TypertRemoteService {
       }, exec) => {
         const board = await this.setBoardModelConfig(
           TaskboardService.agentOf(exec),
-          args.boardId ?? 'default',
+          await this.targetBoardId(TaskboardService.agentOf(exec), args.boardId),
           {
             ...(args.workerModel === undefined ? {} : { workerModel: args.workerModel }),
             ...(args.workerEffort === undefined ? {} : { workerEffort: args.workerEffort }),
@@ -6543,6 +6947,205 @@ export class TaskboardService extends TypertRemoteService {
         return { boardId: board.boardId, name: board.name, modelConfig }
       },
       presentCall: args => ({ card: 'generic' as const, title: 'Set taskboard board model config', kind: 'other' as const, rawInput: args.boardId ?? 'default' }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_stage_list',
+      description: 'List the development stages (V6-4): one stage = one board, oldest first. Each row carries the stage name,'
+        + ' its 1-based index, whether it is the CURRENT stage (what taskboard_list and every defaulted write resolve to),'
+        + ' whether it is an ended (archived) stage that refuses commands, and its card census.'
+        + ' Reads never span stages: name a stage with boardId to read another one.',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            stages: {
+              type: 'array', required: true,
+              items: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  boardId: { type: 'string', required: true },
+                  stageName: { type: 'string', required: true },
+                  stageIndex: { type: 'number', required: true },
+                  active: { type: 'boolean', required: true },
+                  archived: { type: 'boolean', required: true },
+                  total: { type: 'number', required: true },
+                  done: { type: 'number', required: true },
+                },
+              },
+            },
+          },
+        },
+        render: (_args, value: { stages: StageRow[] }) => [{
+          type: 'text' as const,
+          text: value.stages.length === 0
+            ? '0 stages'
+            : String(value.stages.length) + ' stage(s):\n' + value.stages.map(stage =>
+              '- ' + stage.stageName + ' (' + stage.boardId + ') #' + String(stage.stageIndex)
+                + (stage.active ? ' [current]' : '')
+                + (stage.archived ? ' [archived: read-only]' : '')
+                + ' — ' + String(stage.total) + ' card(s), ' + String(stage.done) + ' done').join('\n'),
+        }],
+      },
+      execute: async (_args, exec) => {
+        const stages = await this.listStages(TaskboardService.agentOf(exec))
+        return {
+          stages: stages.map((stage): StageRow => ({
+            boardId: stage.boardId,
+            stageName: stage.stageName,
+            stageIndex: stage.stageIndex,
+            active: stage.active,
+            archived: stage.archivedAt !== null,
+            total: stage.total,
+            done: stage.counts.done,
+          })),
+        }
+      },
+      presentCall: () => ({ card: 'generic' as const, title: 'List taskboard stages', kind: 'other' as const, rawInput: null }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_stage_new',
+      description: 'Start the next development stage (V6-4, master only): a brand-new EMPTY board that becomes the current'
+        + ' stage, while the stage it succeeds is archived — still fully readable, but no longer accepting commands.'
+        + ' The team is carried forward (roster members with their history, the headcount, the model config and the master'
+        + ' seat), so nobody has to be re-created. Use taskboard_stage_list first to see where the current stage stands.',
+      parameters: {
+        name: {
+          type: 'string' as const,
+          description: 'Stage display name. Omit for "阶段 <n>".',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            stageName: { type: 'string', required: true },
+            stageIndex: { type: 'number', required: true },
+            total: { type: 'number', required: true },
+            archivedBoardId: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value: { boardId: string; stageName: string; stageIndex: number; total: number; archivedBoardId: string }) => [{
+          type: 'text' as const,
+          text: 'stage ' + value.stageName + ' (' + value.boardId + ') is now #' + String(value.stageIndex)
+            + ' and current with ' + String(value.total) + ' card(s); the previous stage (' + value.archivedBoardId + ') is archived (read-only)',
+        }],
+      },
+      execute: async (args: { name?: string }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        const from = await this.activeBoardId(agent)
+        await this.assertMasterOfBoard(from, agent)
+        const stage = await this.createStageRemote(agent, {
+          ...(args.name === undefined ? {} : { name: args.name }),
+          fromBoardId: from,
+        })
+        return {
+          boardId: stage.boardId,
+          stageName: stage.stageName,
+          stageIndex: stage.stageIndex,
+          total: stage.total,
+          archivedBoardId: from,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Start the next taskboard stage', kind: 'other' as const, rawInput: args.name ?? null }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_stage_switch',
+      description: 'Make one development stage current (V6-4, master only): every read and defaulted write then resolves to'
+        + ' it, and switching back to an ended stage shows exactly the cards, Done column and history it ended with.'
+        + ' Switching to an ARCHIVED stage re-activates it — that explicit switch back is what re-opens a stage for edits'
+        + ' again.',
+      parameters: {
+        boardId: { type: 'string' as const, required: true, description: 'The stage to make current (see taskboard_stage_list).' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            boardId: { type: 'string', required: true },
+            stageName: { type: 'string', required: true },
+            stageIndex: { type: 'number', required: true },
+            total: { type: 'number', required: true },
+            reactivated: { type: 'boolean', required: true },
+          },
+        },
+        render: (_args, value: { stageName: string; boardId: string; total: number; reactivated: boolean }) => [{
+          type: 'text' as const,
+          text: 'current stage: ' + value.stageName + ' (' + value.boardId + '), ' + String(value.total) + ' card(s)'
+            + (value.reactivated ? ' — the stage was archived and is now live again' : ''),
+        }],
+      },
+      execute: async (args: { boardId: string }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        await this.assertMasterOfBoard(await this.activeBoardId(agent), agent)
+        const before = (await this.listStages(agent)).find(stage => stage.boardId === args.boardId)
+        const stage = await this.switchStageRemote(agent, { boardId: args.boardId })
+        return {
+          boardId: stage.boardId,
+          stageName: stage.stageName,
+          stageIndex: stage.stageIndex,
+          total: stage.total,
+          reactivated: before !== undefined && before.archivedAt !== null,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Switch taskboard stage', kind: 'other' as const, rawInput: args.boardId }),
+    }))
+
+    this.ctx.tools.register(defineTool({
+      name: 'taskboard_migrate',
+      description: 'Migrate an explicit batch of taskboard cards to another stage (V6-4 G/H, master only). Cards keep their'
+        + ' column (Done included), description, devNotes, review outcome, history, dependencies and worker/reviewer'
+        + ' identity; the receipt names every migrated card and the target stage — nothing is ever moved implicitly.'
+        + ' A dependency may not be left behind across stages (V6-4 C), and an archived stage refuses to receive cards.',
+      parameters: {
+        ticketIds: {
+          type: 'array' as const,
+          required: true as const,
+          items: { type: 'string' as const },
+          description: 'The cards to migrate, by ticket id.',
+        },
+        targetBoardId: {
+          type: 'string' as const,
+          required: true as const,
+          description: 'The stage receiving the cards (see taskboard_stage_list).',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            targetBoardId: { type: 'string', required: true },
+            targetStageName: { type: 'string', required: true },
+            moved: { type: 'array', required: true, items: { type: 'string' } },
+            fromBoardIds: { type: 'array', required: true, items: { type: 'string' } },
+          },
+        },
+        render: (_args, value: { targetStageName: string; targetBoardId: string; moved: string[]; fromBoardIds: string[] }) => [{
+          type: 'text' as const,
+          text: 'migrated ' + String(value.moved.length) + ' card(s) from ' + value.fromBoardIds.join(', ')
+            + ' to ' + value.targetStageName + ' (' + value.targetBoardId + '):\n' + value.moved.map(id => '- ' + id).join('\n'),
+        }],
+      },
+      execute: async (args: { ticketIds: string[]; targetBoardId: string }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        await this.assertMasterOfBoard(args.targetBoardId, agent)
+        const target = (await this.listStages(agent)).find(stage => stage.boardId === args.targetBoardId)
+        const result = await this.migrateTicketsRemote(agent, {
+          ticketIds: args.ticketIds,
+          targetBoardId: args.targetBoardId,
+        })
+        return {
+          targetBoardId: result.targetBoardId,
+          targetStageName: target === undefined ? result.targetBoardId : target.stageName,
+          moved: result.moved,
+          fromBoardIds: result.fromBoardIds,
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Migrate taskboard cards between stages', kind: 'other' as const, rawInput: args.targetBoardId }),
     }))
   }
 }
@@ -6564,6 +7167,9 @@ const WORKER_DENIED_TOOLS = [
   'taskboard_release_master',
   'taskboard_handover', 'taskboard_create', 'taskboard_move', 'taskboard_plan',
   'taskboard_notices',
+  // V6-4 stage surface: the stage list is a board read and the other three are
+  // master-only commands, so no spawned worker may reach them.
+  'taskboard_stage_list', 'taskboard_stage_new', 'taskboard_stage_switch', 'taskboard_migrate',
 ] as const
 
 /**
