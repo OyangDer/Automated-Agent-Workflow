@@ -29,7 +29,7 @@ This table connects model-visible tool names to the plugin package and service s
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`, `grep` | `ctx.tools`, `ctx.subprocess`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | glob and grep are unconditional discovery tools that spawn the packaged ripgrep binary (`@vscode/ripgrep`) through ctx.subprocess as ordinary foreground calls (never background jobs) — no host `rg` install and no shell layer. The catalog uses `sampleOverCapGlobResults: true`; deployments must choose that behavior explicitly. Capped results save the complete formatted list through the optional ctx.spillStore backend; returned locators are follow-up-readable/searchable when the backend exposes local paths in co-located deployments. |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`, `terminal_list`, `terminal_open`, `terminal_read`, `terminal_send`, `terminal_signal` | `ctx.tools`, `ctx.terminals`, `ctx.systemPrompt`, `ctx.jobs at call time for run_in_background` | `tool/call`, `tool/result` | - | The six terminal tools are opt-in and complement one-shot shell/filesystem tools. `terminal_send(run_in_background: true)` registers with `ctx.jobs`; TUI, named key sequences, BEL, resize, auto-start, and cross-agent sharing are absent from the schema. |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`, `get_goal`, `update_goal` | `ctx.tools`, `ctx.agents`, `ctx.goals`, `ctx.systemPrompt`, `a calling Agent in an authorized open turn` | `tool/call`, `goal/change for mutations`, `tool/result` | - | create, edit, pause, and resume require direct-human root authority; complete and blocked also accept the exact current goal round. The default blocked lower bound is three admitted rounds. |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_roster`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_migrate`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_roster`, `taskboard_stage_list`, `taskboard_stage_new`, `taskboard_stage_switch`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`, `schedule_delete`, `schedule_list` | `ctx.tools`, `ctx.sessions`, `Session persistence`, `a future live root Agent` | `tool/call`, `schedule/change create or delete`, `tool/result` | - | Registered only inside live root Agent scopes created after the opt-in Schedule plugin loads. Version 1 accepts after_seconds, explicit absolute at, and bounded fixed-rate every_seconds, and discloses session-local delivery; management reads and mutations require the shared Session persistence barrier. |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`, `ctx.lsp`, `ctx.systemPrompt` | `tool/call`, `tool/result` | - | The lsp tool keeps provider selection and language-server subprocesses behind ctx.lsp, so its model-visible schema stays stable across providers. Requires a registered provider (e.g. `@deepseek-ai/dsh-lsp-stdio`) at runtime; without one, a query returns the structured `LSP_UNAVAILABLE` error rather than changing the schema. |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`, `ctx.workflowEngine`, `ctx.subagents`, `ctx.systemPrompt`, `a calling Agent (exec.agent parents every fresh round)` | `tool/call`, `tool/result`, `workflow and child session events during execution` | - | A fixed foreground workflow starts one fresh structured child per round; the model selects only the immutable objective and an optional round cap. |
@@ -1326,7 +1326,7 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
   "properties": {
     "boardId": {
       "type": "string",
-      "description": "The board to create the ticket on. Omit for the default board."
+      "description": "The stage (board) to create the ticket on. Omit for the CURRENT stage."
     },
     "title": {
       "type": "string",
@@ -1370,6 +1370,10 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
     "filesScope": {
       "type": "string",
       "description": "Declared file scope: the ABSOLUTE paths (files or directories, e.g. \"C:/repo/packages/x/src\") this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards; it also locates the card's repo, so a scope written only as relative paths makes the dispatch fall back to the master cwd (V3-33)."
+    },
+    "crossStageReason": {
+      "type": "string",
+      "description": "V6-4 C: only for a dependsOn entry that lives on ANOTHER stage. Dependencies default to the same stage; declaring one across stages is refused unless this reason is given, and the reason is recorded on the card."
     }
   },
   "required": [
@@ -1455,8 +1459,41 @@ List taskboard tickets. Tickets come back sorted by implementation order (positi
         "compact",
         "full"
       ]
+    },
+    "boardId": {
+      "type": "string",
+      "description": "The stage (board) to read. Omit for the CURRENT stage: reads never span stages unless one is named explicitly."
     }
   }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_migrate`
+
+Migrate an explicit batch of taskboard cards to another stage (V6-4 G/H, master only). Cards keep their column (Done included), description, devNotes, review outcome, history, dependencies and worker/reviewer identity; the receipt names every migrated card and the target stage — nothing is ever moved implicitly. A dependency may not be left behind across stages (V6-4 C), and an archived stage refuses to receive cards.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketIds": {
+      "type": "array",
+      "description": "The cards to migrate, by ticket id.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "targetBoardId": {
+      "type": "string",
+      "description": "The stage receiving the cards (see taskboard_stage_list)."
+    }
+  },
+  "required": [
+    "ticketIds",
+    "targetBoardId"
+  ]
 }
 ```
 
@@ -1791,6 +1828,58 @@ Read one board's fixed roster (V6-1): every member's id, role, fixed partner, de
       "description": "Board whose roster to read; defaults to \"default\"."
     }
   }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_stage_list`
+
+List the development stages (V6-4): one stage = one board, oldest first. Each row carries the stage name, its 1-based index, whether it is the CURRENT stage (what taskboard_list and every defaulted write resolve to), whether it is an ended (archived) stage that refuses commands, and its card census. Reads never span stages: name a stage with boardId to read another one.
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_stage_new`
+
+Start the next development stage (V6-4, master only): a brand-new EMPTY board that becomes the current stage, while the stage it succeeds is archived — still fully readable, but no longer accepting commands. The team is carried forward (roster members with their history, the headcount, the model config and the master seat), so nobody has to be re-created. Use taskboard_stage_list first to see where the current stage stands.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Stage display name. Omit for \"阶段 <n>\"."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_stage_switch`
+
+Make one development stage current (V6-4, master only): every read and defaulted write then resolves to it, and switching back to an ended stage shows exactly the cards, Done column and history it ended with. Switching to an ARCHIVED stage re-activates it — that explicit switch back is what re-opens a stage for edits again.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The stage to make current (see taskboard_stage_list)."
+    }
+  },
+  "required": [
+    "boardId"
+  ]
 }
 ```
 

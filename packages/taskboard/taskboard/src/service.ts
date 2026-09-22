@@ -1899,7 +1899,15 @@ export class TaskboardService extends TypertRemoteService {
    */
   @Remote('listStages')
   async listStages(agent: Agent): Promise<StageView[]> {
-    const boards = await this.visibleBoards(agent)
+    const visible = await this.visibleBoards(agent)
+    // A stage chain is one workspace's shared boards: the caller's private
+    // session board is a separate chain, not "stage 2" of the project's.
+    const anchor = visible.find(board => board.active === true)
+      ?? visible.find(board => board.boardId === 'default')
+      ?? visible[0]
+    const boards = anchor === undefined
+      ? []
+      : visible.filter(board => board.scope === anchor.scope && board.workspaceId === anchor.workspaceId)
     const tickets = await this.tickets()
     const stages: StageView[] = []
     let index = 0
@@ -1942,6 +1950,20 @@ export class TaskboardService extends TypertRemoteService {
     const stages = await this.listStages(agent)
     const active = stages.find(stage => stage.active)
     return active === undefined ? 'default' : active.boardId
+  }
+
+  /**
+   * V6-4: the board one call targets — an explicit boardId, else the caller's
+   * current stage. Every tool and Remote method that used to hardcode the v1
+   * "default" board resolves through here, so starting or switching a stage
+   * redirects reads and defaulted writes together.
+   * @param agent - the calling session agent.
+   * @param boardId - the board the caller named, when it named one.
+   * @returns the board id to act on.
+   */
+  private async targetBoardId(agent: Agent, boardId: string | undefined): Promise<string> {
+    if (boardId !== undefined) return boardId
+    return await this.activeBoardId(agent)
   }
 
   /**
@@ -3630,11 +3652,15 @@ export class TaskboardService extends TypertRemoteService {
     const workspace = await this.workspaceOf(agent)
     const workspaceId = workspace === undefined ? '' : workspace.id
     await this.ensureSessionDefaultBoard(agent, workspace)
-    const defaultBoard = await this.ensureDefaultBoard(
+    // V6-4: an unnamed snapshot follows the CURRENT stage — the same board
+    // every read and defaulted write resolves to (the legacy "default" board
+    // while no stage was ever started or switched). The default board is still
+    // materialized above for v1 compatibility.
+    await this.ensureDefaultBoard(
       workspaceId,
       workspace === undefined ? undefined : basename(workspace.path),
     )
-    const board = boardId ?? defaultBoard?.boardId ?? 'default'
+    const board = boardId ?? await this.activeBoardId(agent)
     await this.assertBoardAccessible(board, agent)
     const boards = await this.boards()
     const boardRow = boards.get(board) ?? await this.ensureBoard(board)

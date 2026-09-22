@@ -17,6 +17,7 @@ DeepSeek Harness 的五列看板工单系统：持久化工作流域（Backlog �
 - [配置](#configuration)
 - [工作流](#workflow)
 - [席位](#master-seat)
+- [开发阶段](#development-stages)
 - [席位自愈](#seat-self-healing)
 - [模型体验](#model-experience)
 - [已知限制与延期工作](#known-limitations-and-deferred-work)
@@ -64,6 +65,13 @@ master 与用户一起规划需求——每个达成一致的需求都会落成 
 ## 席位
 
 看板的 master（用 `taskboard_claim_master` 认领）把 Backlog 或 Not started 卡片派给全新 worker 子代理（`taskboard_assign`，仅限顶层会话 Agent）、重新派发被阻塞的工作（`taskboard_reassign`），并裁决 report 模式审核（`taskboard_resolve_review`）。worker 以 `taskboard_report`（完成）或 `taskboard_fail`（失败）收尾；当用户把卡片放入 Not started、worker 上报、失败或终止、worker 失联被自动重派，或审核结论落板时，master 的在线收件箱会收到一条轻量通知。`taskboard_handover` 将结构化交接笔记（各卡状态、worker 身份、审核席位、待办摘要与 master 历史）写入看板并释放席位；后继者通过 `taskboard_claim_master` 认领时，其返回结果携带这些笔记。
+
+<a id="development-stages"></a>
+## 开发阶段（V6-4）
+
+一个开发阶段就是一块看板：卡片、Done 列与每张卡的历史都属于该阶段；而成员（含履历）、编制上限、master 席位与模型配置会**带进新阶段**，因此开新阶段从不需要重建团队。`taskboard_stage_list` 列出每个阶段的序号、卡片统计与是否当前阶段；`taskboard_stage_new` 开启下一块**空板**并归档它所接替的阶段；`taskboard_stage_switch` 切换当前阶段，且**切回已结束的阶段会重新激活它**——这次显式切回正是重新打开该阶段进行修改的前提。历史遗留的 `default` 看板被记为「阶段 1」而不是改名，历史因此不丢。
+
+读取按阶段收敛：`taskboard_list` 默认只列当前阶段（除非显式给出 `boardId`），`taskboard_claim_master`、`taskboard_notices`、`taskboard_roster`、`taskboard_board_config` 与 `taskboard_create` 同样默认当前阶段。对已结束阶段的命令会以 `TASKBOARD_STAGE_ARCHIVED` 拒绝（「请显式切回该阶段，或新建阶段」）：派单、重派、暂停、移动、排期、新建卡片、领卡、编制与模型配置写入都属于 master 命令，一律拒绝；而 worker 自己的收尾动作（`taskboard_report`、`taskboard_fail`、`taskboard_complete`、审核结论）仍然可用，这样阶段结束时仍在飞行中的卡片还能落地。`dependsOn` 必须留在同一阶段内：跨阶段依赖除非显式声明理由（`crossStageReason`，会记在卡片上）否则拒绝。`taskboard_migrate`（V6-4 G/H）一次性把显式选定的卡片迁到另一阶段——列（含 Done）、描述、devNotes、审核结论、历史、依赖与 worker/reviewer 身份全部随行——并拒绝把依赖落下、或把卡片迁进已归档阶段；回执会写明迁了哪些卡、目标阶段是哪个。
 
 <a id="seat-self-healing"></a>
 ## 席位自愈（V3-9）

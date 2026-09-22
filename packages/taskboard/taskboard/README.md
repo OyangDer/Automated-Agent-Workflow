@@ -17,6 +17,7 @@ Five-column kanban ticket board for DeepSeek Harness: a durable workflow domain 
 - [Configuration](#configuration)
 - [Workflow](#workflow)
 - [Master seat](#master-seat)
+- [Development stages](#development-stages)
 - [Seat self-healing](#seat-self-healing)
 - [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
@@ -64,6 +65,13 @@ The master plans requirements with the user — every agreed requirement becomes
 ## Master seat
 
 A board's master (claim with `taskboard_claim_master`) dispatches Backlog or Not started cards to fresh worker subagents (`taskboard_assign`, restricted to the top-level session agent), re-dispatches blocked work (`taskboard_reassign`), and adjudicates report-mode reviews (`taskboard_resolve_review`). Workers finish with `taskboard_report` (done) or `taskboard_fail` (blocked); the master's live inbox receives a lightweight notice when the user schedules a card into Not started, when a worker reports, fails, or terminates, when a worker is lost and auto-redispatched, and when a reviewer verdict lands. `taskboard_handover` writes structured handover notes (every card's status, worker identities, review seats, backlog summary and master history) onto the board and releases the seat; the successor's `taskboard_claim_master` result carries those notes.
+
+<a id="development-stages"></a>
+## Development stages (V6-4)
+
+A development stage is one board: the cards, the Done column and every card's history belong to the stage, while the roster members (with their member history), the headcount, the master seat and the model configuration are carried forward into the new stage, so starting a stage never means rebuilding the team. `taskboard_stage_list` shows every stage with its 1-based index, its card census and whether it is the current one; `taskboard_stage_new` starts the next, EMPTY stage and archives the stage it succeeds; `taskboard_stage_switch` makes another stage current, and switching back to an ended stage re-activates it — that explicit switch back is what re-opens a stage for edits again. The legacy `default` board is recorded as stage 1 rather than renamed, so its history stays where it was.
+
+Reads are stage-scoped: `taskboard_list` lists the current stage unless it is given an explicit `boardId`, and `taskboard_claim_master`, `taskboard_notices`, `taskboard_roster`, `taskboard_board_config` and `taskboard_create` default to the current stage the same way. A command against an ended stage is refused with `TASKBOARD_STAGE_ARCHIVED` ("switch back to that stage explicitly, or start a new stage"): dispatch, re-dispatch, pause, move, plan, create, claim, roster and model-config writes are master commands and are all refused, while a worker's own settlement (`taskboard_report`, `taskboard_fail`, `taskboard_complete`, review verdicts) stays available so a card that was in flight when its stage ended can still land. `dependsOn` must stay inside one stage: a cross-stage edge is refused unless the caller declares it explicitly with a reason (`crossStageReason`), which is recorded on the card. `taskboard_migrate` (V6-4 G/H) moves an explicit batch of cards to another stage in one operation — column (Done included), description, devNotes, review outcome, history, dependencies and worker/reviewer identity all travel with them — and refuses to leave a dependency behind or to land cards on an archived stage; its receipt names every migrated card and the target stage.
 
 <a id="seat-self-healing"></a>
 ## Seat self-healing (V3-9)

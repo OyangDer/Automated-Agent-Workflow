@@ -250,7 +250,7 @@ export interface TicketView {
    * V6-4 C: the reason a card was allowed to keep a dependency pointing at
    * another stage. Empty when every dependency is same-stage (the default).
    */
-  crossStageReason?: string
+  crossStageReason?: string | undefined
   history: TicketHistoryEntry[]
 }
 
@@ -357,15 +357,15 @@ export interface BoardView {
    * "default" board becomes stage 1). Absent on a board created before stages
    * existed; the stage list fills the gap lazily.
    */
-  stageIndex?: number
+  stageIndex?: number | undefined
   /** V6-4 stage display name ("阶段 2"); absent falls back to {@link name}. */
-  stageName?: string
+  stageName?: string | undefined
   /**
    * V6-4: true on the workspace's CURRENT stage — the board every read and
    * defaulted write resolves to. Exactly one visible stage is current; a board
    * without the field reads as not current (v1 behaviour: "default").
    */
-  active?: boolean
+  active?: boolean | undefined
 }
 
 /**

@@ -4897,3 +4897,187 @@ describe('V6-3 roster headcount changes, named archiving and restore', () => {
       .toEqual(['W1', 'W3', 'W4'])
   })
 })
+
+describe('V6-4 development stages: one board per stage, switchable, read-only history', () => {
+  /** One stage's cards as a compact, printable comparison row. */
+  const cardRow = (view: { boardId: string; tickets: TicketView[] }) =>
+    'board=' + view.boardId + ' cards=' + JSON.stringify(view.tickets.map(ticket => ({
+      id: ticket.id, column: ticket.column, title: ticket.title,
+    })))
+
+  it('a/b) starts the next stage as an empty current board and archives the one it succeeds', async () => {
+    const { service, devA } = await harness()
+    await createTicket(service, 'stage 1 card')
+    await service.claimMaster('default', devA)
+    // D: the legacy default board is recorded as stage 1 instead of renamed.
+    const before = await service.listStages(devA)
+    expect(before).toHaveLength(1)
+    expect(before[0]).toMatchObject({
+      boardId: 'default', stageName: '阶段 1', stageIndex: 1, active: false, archivedAt: null, total: 1,
+    })
+    const stage2 = await service.createStageRemote(devA, {})
+    expect(stage2).toMatchObject({ stageName: '阶段 2', stageIndex: 2, active: true, archivedAt: null, total: 0 })
+    // b) the new stage is an EMPTY board: no cards and a Done column at zero.
+    expect(stage2.counts).toEqual({ backlog: 0, not_started: 0, in_progress: 0, in_testing: 0, done: 0 })
+    const current = await service.snapshot(devA, stage2.boardId)
+    expect(current).toMatchObject({ boardId: stage2.boardId, tickets: [] })
+    expect(current.notices ?? []).toEqual([])
+    // ④ reads and defaulted writes resolve to the current stage now.
+    const onStage2 = await service.createRemote(devA, {
+      title: 'stage 2 card', description: 'd', priority: 'normal', dependsOn: [],
+    })
+    expect(onStage2.boardId).toBe(stage2.boardId)
+    expect((await service.snapshot(devA, stage2.boardId)).tickets.map(ticket => ticket.id)).toEqual([onStage2.id])
+    // The stage it succeeded keeps exactly what it had, and is now ended.
+    const stage1 = (await service.listStages(devA)).find(stage => stage.boardId === 'default')!
+    expect(stage1).toMatchObject({ active: false, archivedAt: expect.any(Number), total: 1 })
+    expect(stage1.counts).toEqual({ backlog: 1, not_started: 0, in_progress: 0, in_testing: 0, done: 0 })
+  })
+
+  it('c/d) switching back shows the ended stage unchanged, while commands on it are refused', async () => {
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'stage 1 card')
+    await service.moveAsMaster(devA, { ticketId: card.id, column: 'done', beforeTicketId: null, afterTicketId: null })
+    const stage2 = await service.createStageRemote(devA, { name: '阶段 2' })
+    // d) every command against the ended stage is refused, with the reason.
+    await expect(service.createAsMaster(devA, {
+      title: 'late card', description: 'd', priority: 'normal', dependsOn: [], boardId: 'default',
+    })).rejects.toMatchObject({
+      code: 'TASKBOARD_STAGE_ARCHIVED',
+      message: expect.stringContaining('switch back to that stage explicitly'),
+    })
+    await expect(service.moveAsMaster(devA, {
+      ticketId: card.id, column: 'in_progress', beforeTicketId: null, afterTicketId: null,
+    })).rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 3, boardId: 'default' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+    // The ended stage still reads exactly as it ended (Done and history intact).
+    const ended = await service.snapshot(devA, 'default')
+    expect(ended.tickets.map(ticket => ({ id: ticket.id, column: ticket.column }))).toEqual([{ id: card.id, column: 'done' }])
+    // c) the explicit switch back re-activates it and shows the same content.
+    const switched = await service.switchStageRemote(devA, { boardId: 'default' })
+    expect(switched).toMatchObject({ boardId: 'default', active: true, archivedAt: null, total: 1 })
+    const back = await service.snapshot(devA, 'default')
+    expect(back.tickets.map(ticket => ticket.id)).toEqual([card.id])
+    expect(back.tickets[0]).toMatchObject({ column: 'done', title: 'stage 1 card' })
+    expect(back.tickets[0]!.history.map(row => row.kind)).toEqual(expect.arrayContaining(['create', 'move']))
+    // The other stage is the ended one now.
+    expect((await service.listStages(devA)).find(stage => stage.boardId === stage2.boardId)!.active).toBe(false)
+    // ⑤ the real switch, printed so the run output carries the comparison.
+    console.log('[V6-4] new stage current: ' + cardRow(await service.snapshot(devA, stage2.boardId)))
+    console.log('[V6-4] ended stage:         ' + cardRow(ended))
+    console.log('[V6-4] switched back:       ' + cardRow(back))
+  })
+
+  it('e) carries the roster, the headcount and the master seat into the new stage', async () => {
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    // Materialize the current stage's roster (2 pairs by deployment default;
+    // raising the cap is what creates the member rows).
+    const raised = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    expect((raised.members ?? []).map(member => member.id)).toEqual(['W1', 'W2', 'W3'])
+    const rosterBefore = await service.snapshot(devA, 'default')
+    expect((rosterBefore.members ?? []).length).toBeGreaterThan(0)
+    const stage2 = await service.createStageRemote(devA, {})
+    const rosterAfter = await service.snapshot(devA, stage2.boardId)
+    // The same slots, numbers, partners and capacity — nothing to rebuild.
+    expect((rosterAfter.members ?? []).map(member => [member.id, member.partnerId, member.role]))
+      .toEqual((rosterBefore.members ?? []).map(member => [member.id, member.partnerId, member.role]))
+    expect((rosterAfter.members ?? []).length).toBeGreaterThan(0)
+    expect(rosterAfter.capacity).toEqual(rosterBefore.capacity)
+    // The seat travelled with the same session: no re-claim needed.
+    expect((await service.listBoards(devA)).find(board => board.boardId === stage2.boardId)!.masterAgentId).toBe(devA.id)
+    // And the carried roster is mutable on the new stage: the named archive
+    // would fail if the new board had no W1 to hand out.
+    const lowered = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W1' })
+    expect(lowered.capacity?.worker).toBe(2)
+    expect((lowered.members ?? []).find(member => member.id === 'W1')?.status).toBe('archived')
+  })
+
+  it('④ read tools are stage-scoped: taskboard_list follows the current stage', async () => {
+    const { service, devA, ctx } = await harness()
+    const onStage1 = await createTicket(service, 'stage 1 card')
+    const stage2 = await service.createStageRemote(devA, {})
+    const onStage2 = await service.createRemote(devA, {
+      title: 'stage 2 card', description: 'd', priority: 'normal', dependsOn: [],
+    })
+    const listStage = async (args: { boardId?: string }): Promise<string> => {
+      const result = await ctx.tools.execute({
+        callId: ToolCallId('tool-list-' + (args.boardId ?? 'current-stage')),
+        name: 'taskboard_list',
+        arguments: args,
+        agent: devA,
+        signal: new AbortController().signal,
+      })
+      expect(result.isError).toBe(false)
+      return (result as { content: { type: string; text: string }[] }).content.map(block => block.text).join('\n')
+    }
+    // No stage named: only the CURRENT stage's cards come back.
+    const currentText = await listStage({})
+    expect(currentText).toContain(onStage2.id)
+    expect(currentText).not.toContain(onStage1.id)
+    // A named stage reads that stage instead.
+    const stage1Text = await listStage({ boardId: 'default' })
+    expect(stage1Text).toContain(onStage1.id)
+    expect(stage1Text).not.toContain(onStage2.id)
+    // The same scoping holds for the raw rows the tool renders from.
+    expect((await service.listRows(null, false, devA.id, 'compact', stage2.boardId)).map(row => row.id)).toEqual([onStage2.id])
+    expect((await service.listRows(null, false, devA.id, 'compact', 'default')).map(row => row.id)).toEqual([onStage1.id])
+  })
+
+  it('C) keeps dependsOn inside one stage unless the cross-stage edge is declared with a reason', async () => {
+    const { service, devA } = await harness()
+    const onStage1 = await createTicket(service, 'stage 1 card')
+    await service.createStageRemote(devA, {})
+    await expect(service.createRemote(devA, {
+      title: 'cross', description: 'd', priority: 'normal', dependsOn: [onStage1.id],
+    })).rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
+    const declared = await service.createRemote(devA, {
+      title: 'cross', description: 'd', priority: 'normal', dependsOn: [onStage1.id],
+      crossStageReason: 'stage 1 owns the interface this card builds on',
+    })
+    expect(declared.crossStageReason).toBe('stage 1 owns the interface this card builds on')
+    expect(declared.dependsOn).toEqual([onStage1.id])
+  })
+
+  it('G/H/I) migrates an explicit card batch keeping Done, history and dependencies', async () => {
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    const doneCard = await createTicket(service, 'done card')
+    await service.moveAsMaster(devA, { ticketId: doneCard.id, column: 'done', beforeTicketId: null, afterTicketId: null })
+    const dependent = await createTicket(service, 'dependent card', [doneCard.id])
+    const target = await service.createStageRemote(devA, {})
+    // A dependency may not be left behind on the other stage.
+    await expect(service.migrateTicketsRemote(devA, { ticketIds: [dependent.id], targetBoardId: target.boardId }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT' })
+    const receipt = await service.migrateTicketsRemote(devA, {
+      ticketIds: [doneCard.id, dependent.id], targetBoardId: target.boardId,
+    })
+    expect(receipt).toEqual({ targetBoardId: target.boardId, moved: [doneCard.id, dependent.id], fromBoardIds: ['default'] })
+    const migrated = (await service.snapshot(devA, target.boardId)).tickets
+    expect(migrated.map(ticket => [ticket.id, ticket.column]).sort()).toEqual([[doneCard.id, 'done'], [dependent.id, 'backlog']].sort())
+    const movedDone = migrated.find(ticket => ticket.id === doneCard.id)!
+    expect(movedDone.dependsOn).toEqual([])
+    expect(movedDone.history.map(row => row.kind)).toEqual(expect.arrayContaining(['create', 'move', 'stage-move']))
+    expect(migrated.find(ticket => ticket.id === dependent.id)!.dependsOn).toEqual([doneCard.id])
+    // Nothing is duplicated: the source stage no longer lists the cards.
+    expect((await service.snapshot(devA, 'default')).tickets).toEqual([])
+    // An ended stage refuses to receive cards.
+    await expect(service.migrateTicketsRemote(devA, { ticketIds: [doneCard.id], targetBoardId: 'default' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+  })
+
+  it('survives a restart: stages, names and the current stage are durable', async () => {
+    const first = await harness()
+    await first.service.claimMaster('default', first.devA)
+    await createTicket(first.service, 'stage 1 card')
+    const stage2 = await first.service.createStageRemote(first.devA, { name: '第二期' })
+    await first.ctx.fiber.dispose()
+    const second = await harness({ root: first.root })
+    const stages = await second.service.listStages(second.devA)
+    expect(stages.map(stage => [stage.boardId, stage.stageName, stage.stageIndex, stage.active]))
+      .toEqual([['default', '阶段 1', 1, false], [stage2.boardId, '第二期', 2, true]])
+    expect(stages.find(stage => stage.boardId === 'default')!.archivedAt).toEqual(expect.any(Number))
+  })
+})
