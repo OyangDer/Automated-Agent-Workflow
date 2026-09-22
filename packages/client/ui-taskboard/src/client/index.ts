@@ -26,7 +26,10 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { BoardSnapshot, RestoreMemberRequest, SetRosterCapacityRequest } from '@deepseek-ai/dsh-taskboard/client'
+import type {
+  BoardSnapshot, CreateStageRequest, MigrateTicketsRequest, MigrateTicketsResult, RestoreMemberRequest,
+  SetRosterCapacityRequest, StageView,
+} from '@deepseek-ai/dsh-taskboard/client'
 import {
   COMPACTION_CEILING_NS, createCompactionCeilingFace,
   type CompactionCeilingFace, type CompactionCeilingSection,
@@ -81,6 +84,9 @@ interface BoardSource {
   archiveBoard(boardId: string): Promise<BoardView>
   setRosterCapacity(request: SetRosterCapacityRequest): Promise<BoardSnapshot>
   restoreMember(request: RestoreMemberRequest): Promise<BoardSnapshot>
+  switchStage(boardId: string): Promise<StageView>
+  createStage(request: CreateStageRequest): Promise<StageView>
+  migrateTickets(request: MigrateTicketsRequest): Promise<MigrateTicketsResult>
 }
 
 /**
@@ -132,6 +138,7 @@ export function apply(ctx: ClientContext): void {
       // this session once another workspace adopted it).
       boardId: 'default',
       boards: [],
+      stages: [],
       snapshot: null,
       workspaceId: workspaceOf(sessionId),
       // The pre-fetch fallback reads as project-shared.
@@ -155,9 +162,17 @@ export function apply(ctx: ClientContext): void {
      * degrades to an empty snapshot while keeping the fetched board list,
      * so the selector never loses the boards it already knows about.
      */
-    const fetchBoardState = async (boardId: string): Promise<{ boardId: string; boards: BoardView[]; snapshot: BoardSnapshot }> => {
+    const fetchBoardState = async (
+      boardId: string,
+    ): Promise<{ boardId: string; boards: BoardView[]; stages: StageView[]; snapshot: BoardSnapshot }> => {
       const boards = unwrap(await ctx.remote.taskboard.listBoards(sessionId)) as BoardView[]
-      const target = pickBoardTarget(boardId, boards)
+      const stages = unwrap(await ctx.remote.taskboard.listStages(sessionId)) as StageView[]
+      // V6-4: on the first load the host's CURRENT stage is what every read and
+      // defaulted write resolves to, so open that stage instead of the legacy
+      // 'default' placeholder, which may be an ended stage 1.
+      const activeStage = stages.find(stage => stage.active)
+      const requested = current.boards.length === 0 && activeStage !== undefined ? activeStage.boardId : boardId
+      const target = pickBoardTarget(requested, boards)
       let snapshot: BoardSnapshot
       if (boards.length === 0) {
         snapshot = { boardId: target, name: target, tickets: [] }
@@ -168,7 +183,7 @@ export function apply(ctx: ClientContext): void {
           snapshot = { boardId: target, name: target, tickets: [] }
         }
       }
-      return { boardId: target, boards, snapshot }
+      return { boardId: target, boards, stages, snapshot }
     }
 
     /** Refetch the active board's state and republish it. */
@@ -182,6 +197,7 @@ export function apply(ctx: ClientContext): void {
         current = {
           boardId: next.boardId,
           boards: next.boards,
+          stages: next.stages,
           snapshot: next.snapshot,
           workspaceId: workspaceOf(sessionId),
           scope: active?.scope ?? 'project',
@@ -258,6 +274,27 @@ export function apply(ctx: ClientContext): void {
       return adoptRoster(next)
     }
 
+    /** V6-4: make one stage current and open it; an archived one re-activates. */
+    const switchStage = async (boardId: string): Promise<StageView> => {
+      const stage = unwrap(await ctx.remote.taskboard.switchStage(sessionId, { boardId }))
+      await selectBoard(stage.boardId)
+      return stage
+    }
+
+    /** V6-4: start the next stage and open it; the name is optional. */
+    const createStage = async (request: CreateStageRequest): Promise<StageView> => {
+      const stage = unwrap(await ctx.remote.taskboard.createStage(sessionId, request))
+      await selectBoard(stage.boardId)
+      return stage
+    }
+
+    /** V6-4 G/H/I: migrate one explicit batch, then refetch both stages' state. */
+    const migrateTickets = async (request: MigrateTicketsRequest): Promise<MigrateTicketsResult> => {
+      const result = unwrap(await ctx.remote.taskboard.migrateTickets(sessionId, request))
+      void refresh()
+      return result
+    }
+
     return {
       board: {
         getSnapshot: () => current,
@@ -272,6 +309,9 @@ export function apply(ctx: ClientContext): void {
       archiveBoard,
       setRosterCapacity,
       restoreMember,
+      switchStage,
+      createStage,
+      migrateTickets,
     }
   }
 
@@ -308,6 +348,9 @@ export function apply(ctx: ClientContext): void {
         archiveBoard: boardId => source.archiveBoard(boardId),
         setRosterCapacity: request => source.setRosterCapacity(request),
         restoreMember: request => source.restoreMember(request),
+        switchStage: boardId => source.switchStage(boardId),
+        createStage: request => source.createStage(request),
+        migrateTickets: request => source.migrateTickets(request),
         hooks: { board: source.board },
         ...(ceiling === undefined ? {} : { compaction: ceiling }),
       }

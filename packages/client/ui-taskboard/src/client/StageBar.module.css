@@ -1,0 +1,306 @@
+/* V6-4: the development-stage bar. One stage is one board; this strip makes
+   the CURRENT stage obvious, opens the stage list (switch / review history),
+   offers "new stage", and drives the explicit card migration. Design tokens
+   mirror Board.module.css so the strip reads as part of the same surface. */
+.stageBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  font-size: 12px;
+}
+
+.stageBar[data-archived='true'] {
+  border-bottom-color: var(--dsw-alias-state-warn-primary);
+}
+
+.stageTitle {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.stageCurrent {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border: 0.5px solid var(--dsw-alias-brand-primary);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+  white-space: nowrap;
+}
+
+.stageCurrentLabel {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+}
+
+.stageIndex {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--dsw-font-mono);
+}
+
+.stageName {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.stageBadge {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary-inverted);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.stageReadonlyBadge {
+  padding: 0 6px;
+  border: 0.5px dashed var(--dsw-alias-state-warn-primary);
+  border-radius: 8px;
+  color: var(--dsw-alias-state-warn-primary);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.stageActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.stageAction {
+  background: transparent;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.stageAction:hover {
+  border-color: var(--dsw-alias-interactive-bg-hover-solid);
+}
+
+.stageAction:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.stagePrimary {
+  background: var(--dsw-alias-button-primary-fill);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary-inverted);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.stagePrimary:hover {
+  background: var(--dsw-alias-button-primary-hover);
+}
+
+.stagePrimary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.stageSecondary {
+  background: transparent;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+/* The stage list: one row per stage with its index, name, census and the
+   markers that say "current" or "archived, read-only". */
+.stageList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-basis: 100%;
+  margin: 0;
+  padding: 4px 0 0;
+  list-style: none;
+}
+
+.stageRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.stageRow[data-current='true'] {
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.stageRow[data-archived='true'] {
+  opacity: 0.85;
+}
+
+.stageRowIndex {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--dsw-font-mono);
+  font-size: 11px;
+}
+
+.stageRowName {
+  color: var(--dsw-alias-label-primary);
+}
+
+.stageRowCensus {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+}
+
+.stageRowSwitch {
+  margin-left: auto;
+  background: transparent;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.stageRowSwitch:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.stageForm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-basis: 100%;
+  padding-top: 2px;
+}
+
+.stageInput {
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+  background: var(--dsw-alias-bg-base);
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+}
+
+/* The migration picker: an explicit multi-select batch plus the target stage.
+   Nothing moves until the user confirms. */
+.stageMigrate {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-basis: 100%;
+  padding: 4px 0 0;
+}
+
+.stageMigrateHint {
+  flex-basis: 100%;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.stageMigrateCards {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.stageMigrateCard {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 320px;
+  padding: 1px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.stageMigrateCard[data-selected='true'] {
+  border-color: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary);
+}
+
+.stageMigrateCardTitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stageMigrateCardColumn {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+
+.stageTargetLabel {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+}
+
+.stageTargetSelect {
+  background: var(--dsw-alias-bg-base);
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 4px 8px;
+  max-width: 220px;
+}
+
+.stageReceipt {
+  flex-basis: 100%;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.stageError {
+  flex-basis: 100%;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.stageReadonlyNotice {
+  flex-basis: 100%;
+  color: var(--dsw-alias-state-warn-primary, #b7791f);
+  font-size: 11px;
+  line-height: 16px;
+}

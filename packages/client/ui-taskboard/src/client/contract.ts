@@ -5,9 +5,9 @@
  */
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
-  BoardSnapshot, BoardView as HostBoardView, CreateTicketRequest, EditTicketRequest, MoveTicketRequest,
-  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, RestoreMemberRequest,
-  SetRosterCapacityRequest, TicketView,
+  BoardSnapshot, BoardView as HostBoardView, CreateStageRequest, CreateTicketRequest, EditTicketRequest,
+  MigrateTicketsRequest, MigrateTicketsResult, MoveTicketRequest, RemoveTicketRequest, RemoveTicketResult,
+  RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest, StageView, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { CompactionCeilingFace } from './compaction-threshold.ts'
 
@@ -38,6 +38,12 @@ export interface BoardState {
   boardId: string
   /** Every board row (active and archived), for the header selector. */
   boards: BoardView[]
+  /**
+   * The workspace's development stages (V6-4) with their card census, oldest
+   * first. Absent when the host serves no stage API: the tab then renders
+   * exactly the board it did before stages existed.
+   */
+  stages?: StageView[]
   /** The active board's ticket snapshot; null until the first load lands. */
   snapshot: BoardSnapshot | null
   /**
@@ -101,6 +107,19 @@ export interface TaskboardInjected {
    * taking cards again. Returns the fresh board snapshot.
    */
   restoreMember(request: RestoreMemberRequest): Promise<BoardSnapshot>
+  /**
+   * V6-4: make one stage current. Switching to an ended (archived) stage
+   * re-activates it — the explicit "switch back" that re-opens that history
+   * for edits; the source refetches the board state afterwards.
+   */
+  switchStage(boardId: string): Promise<StageView>
+  /** V6-4: start the next empty stage (name optional) and open it. */
+  createStage(request: CreateStageRequest): Promise<StageView>
+  /**
+   * V6-4 G/H/I: move an explicit batch of cards to one target stage in a single
+   * operation; the returned receipt names exactly what moved and from where.
+   */
+  migrateTickets(request: MigrateTicketsRequest): Promise<MigrateTicketsResult>
   /** Live board state source; the renderer binds it into useBoard. */
   hooks: { board: HostObservable<BoardState> }
   /**

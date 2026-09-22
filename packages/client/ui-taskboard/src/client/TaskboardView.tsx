@@ -19,6 +19,7 @@ import {
 import { createTaskboardStore } from './stores.ts'
 import { CompactionCeilingRow } from './CompactionCeilingRow.tsx'
 import { RosterControls } from './RosterControls.tsx'
+import { StageBar } from './StageBar.tsx'
 import { TicketCard } from './TicketCard.tsx'
 import { TicketDetail } from './TicketDetail.tsx'
 import { NewTicketForm } from './NewTicketForm.tsx'
@@ -54,10 +55,22 @@ interface DropTarget {
 export function TaskboardView({
   useBoard, useStore, actions, create, move, edit, remove, requestReview,
   selectBoard, createBoard, archiveBoard, setRosterCapacity, restoreMember,
+  switchStage, createStage, migrateTickets,
   t, dragAutoScroll, compaction,
 }: TaskboardViewProps) {
   const boardState = useBoard(state => state)
   const board = boardState.snapshot
+  /*
+   * V6-4: the workspace's development stages arrive with the board state. The
+   * rendered board's own row (or its stage row) says whether it has ended, so
+   * the strip can mark it read-only before the host refuses a command.
+   */
+  const stages = boardState.stages ?? []
+  const currentStage = stages.find(stage => stage.boardId === boardState.boardId)
+  const currentArchivedAt = currentStage === undefined
+    ? boardState.boards.find(item => item.boardId === boardState.boardId)?.archivedAt ?? null
+    : currentStage.archivedAt
+  const currentArchived = currentArchivedAt !== null
   const selectedId = useStore(state => state.selectedId)
   const [formOpen, setFormOpen] = useState(false)
   const [newBoardOpen, setNewBoardOpen] = useState(false)
@@ -383,6 +396,23 @@ export function TaskboardView({
           </button>
         </div>
       </header>
+      {/*
+        V6-4: the development-stage strip — which stage is current, the stage
+        list (an archived stage stays selectable for review and reads as
+        read-only), "new stage", and the explicit batch migration.
+      */}
+      {stages.length > 0 && (
+        <StageBar
+          stages={stages}
+          currentBoardId={boardState.boardId}
+          tickets={board?.tickets ?? []}
+          currentArchived={currentArchived}
+          switchStage={switchStage}
+          createStage={createStage}
+          migrateTickets={migrateTickets}
+          t={t}
+        />
+      )}
       {newBoardOpen && (
         <form
           className={css.newBoardForm}
