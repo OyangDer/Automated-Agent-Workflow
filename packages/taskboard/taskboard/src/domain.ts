@@ -32,6 +32,7 @@ export type TaskboardErrorCode =
   | 'TASKBOARD_MASTER_HELD'
   | 'TASKBOARD_REVIEWER_PRESENT'
   | 'TASKBOARD_AGENT_REQUIRED'
+  | 'TASKBOARD_MEMBER_BUSY'
 
 /** Rejected domain mutation with a stable machine-readable code. */
 export class TaskboardError extends Error {

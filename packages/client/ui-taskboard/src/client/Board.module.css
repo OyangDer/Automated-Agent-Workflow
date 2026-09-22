@@ -152,6 +152,97 @@
   white-space: nowrap;
 }
 
+/* V6-3: the headcount controls — the per-role count with its +/- buttons, the
+   named-member picker a lowering opens, the archived members and their
+   restore button, and the board's refusal text. */
+.rosterControls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.rosterRole {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 4px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+}
+
+.rosterRoleName {
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+
+.rosterCount {
+  min-width: 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.rosterStep {
+  border: none;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 16px;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.rosterStep:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.rosterPick {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 1px 6px;
+  border: 0.5px dashed var(--dsw-alias-state-warn-primary);
+  border-radius: 10px;
+}
+
+.rosterPickLabel {
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+
+.rosterPickMember {
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--dsw-font-mono);
+  font-size: 11px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.rosterArchived {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.rosterChip[data-status='archived'] {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.rosterError {
+  font-size: 11px;
+  color: var(--dsw-alias-state-error-primary);
+}
+
 .title {
   font-size: 15px;
   line-height: 22px;

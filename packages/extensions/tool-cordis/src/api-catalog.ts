@@ -2463,6 +2463,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'The taskboard service (ctx.taskboard): storage-backed tickets and boards, the master seat, workflow transitions, the browser Remote surface, and the model-facing tools.',
     methods: [
       {
+        signature: 'async drainQueue(boardId: string): Promise<number>',
+        description: 'Drain one board\'s queue, first-come-first-served (requirement: 不饿死). Runs whenever a member frees up (a card reaches Done, a card is returned to Not started) and from the periodic reconciliation, so a queued card moves on its own as soon as a member is free — but only while a live master session exists to parent the wake/spawn; otherwise the card stays visibly queued instead of disappearing.',
+        parameters: [{ name: 'boardId', description: 'the board whose queue is drained.' }],
+        returns: 'how many queued cards this pass dispatched.',
+      },
+      {
         signature: 'async submitReviewVerdict( agent: Agent, ticketId: string, verdict: \'approve\' | \'reject\', summary: string, problems: readonly string[], ): Promise<TicketView>',
         description: 'Report one reviewer verdict from a continuable reviewer session (V3-28). A durable reviewer child cannot carry an outputSchema — structured output is a one-shot-only subagent capability — so instead of the structured-output capture it calls the taskboard_review_verdict tool, which lands the same { verdict, summary, problems } report through the one landing path. The reviewer still never decides the card: the master resolves it with taskboard_resolve_review.',
         parameters: [{ name: 'agent', description: 'the reviewer session agent.' }, { name: 'ticketId', description: 'the In testing ticket under review.' }, { name: 'verdict', description: '\'approve\' or \'reject\'.' }, { name: 'summary', description: 'what the reviewer inspected and concluded.' }, { name: 'problems', description: 'concrete rework items (empty when approving).' }],
@@ -2472,7 +2478,13 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'async reconcileLostWorkers(): Promise<number>',
         description: 'One worker-liveness reconciliation pass: every In progress/running card whose worker is lost — absent from the live agent registry (restart / hard death) or registered but idle with no activity past the configured timeout — is recovered through recoverLostWorker: auto-redispatch while the per-card budget lasts, block with a master notice once exhausted. Shared by the startup scan and the periodic scanner.\n\nLiveness authority research (service dependency surface): the agent registry is the exact "is this session\'s agent alive right now" authority — agents.get(id) returns the live Agent or undefined; presence means live (an idle agent is still alive, only an unregistered session is lost), which is precisely the restart scenario where the in-memory run settlement callbacks are gone. The session event log supplies the activity tail for the idle-staleness arm. The subagent seam\'s listChildren / listDescendants are parent-rooted tree listings that throw without a mounted projection registry + session store, and the session store tracks persisted sessions rather than live agent loops — neither is a general flat liveness probe, so the registry is used directly, and a missing registry (never in the host, where \'agents\' is an injected dependency) degrades to a silent skip without blocking anything.\n\nIdempotent by construction and coexistent with the settlement callback: only running cards are considered, and the guarded recovery re-checks column/status/worker identity atomically on the committed record, so a card the settlement callback already recovered (or whose worker came back) is returned untouched — exactly one recovery ever lands per card.',
         parameters: [],
-        returns: 'how many cards this pass recovered (redispatched or blocked).',
+        returns: 'how many cards this pass recovered (continued, parked 待处理, or blocked).',
+      },
+      {
+        signature: 'async reconcileQueues(): Promise<number>',
+        description: 'V6-1: one queue-drain pass over every board — the safety net that keeps a queued card from waiting forever when a member freed up without a card event firing in this process (another session closed a card, a restart landed, ...). FIFO order is preserved by drainQueue; a board with no queued card costs one map lookup.',
+        parameters: [],
+        returns: 'how many queued cards this pass dispatched.',
       },
       {
         signature: 'async reconcileStaleReviewers(): Promise<number>',
@@ -2509,6 +2521,18 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Archive one board through the Remote boundary. A board the caller cannot see is denied as not found (no existence leak).',
         parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the board to archive.' }],
         returns: 'the archived board.',
+      },
+      {
+        signature: '@Remote(\'setRosterCapacity\') async setRosterCapacityRemote(agent: Agent, request: SetRosterCapacityRequest): Promise<BoardSnapshot>',
+        description: 'Change one role\'s roster headcount through the Remote boundary (V6-3). Raising the cap creates the members the extra slots need — numbered and immediately dispatchable. Lowering it is accepted only together with archiveMemberId: the user NAMES the member to archive, because the board must never pick a member by itself, and one step archives exactly one member. The archive is refused while that member holds a live card (In progress/running or In testing), so no member is ever archived with work in flight. Archiving keeps the record — number, partner, module 履历 and short summary all survive — and only removes the member from dispatch; use restoreMember to bring it back. The new headcount is stored on the board record, so it survives a restart.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; the board must be visible to it.' }, { name: 'request', description: 'the role, the new cap, and the member named on a lowering.' }],
+        returns: 'the board\'s fresh snapshot (members, caps and tickets).',
+      },
+      {
+        signature: '@Remote(\'restoreMember\') async restoreMemberRemote(agent: Agent, request: RestoreMemberRequest): Promise<BoardSnapshot>',
+        description: 'Restore one archived member through the Remote boundary (V6-3): the record comes back exactly as it was archived — same number, partner, module 履历 and summary — and takes cards again. When the role\'s headcount is already full the restore raises it, because a restored member the cap would exclude forever would not be usable.',
+        parameters: [{ name: 'agent', description: 'the calling session agent; the board must be visible to it.' }, { name: 'request', description: 'the board and the archived member to bring back.' }],
+        returns: 'the board\'s fresh snapshot (members, caps and tickets).',
       },
       {
         signature: '@Remote(\'create\') createRemote(agent: Agent, request: CreateTicketRequest): Promise<TicketView>',
@@ -3937,7 +3961,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'AssignTicketResult',
-    declaration: 'export interface AssignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'unavailable\' | \'failed\';\n    workerAgentId: string | null;\n}',
+    declaration: 'export interface AssignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'continued\' | \'queued\' | \'unavailable\' | \'failed\';\n    workerAgentId: string | null;\n}',
   },
   {
     name: 'AssistantMessage',
@@ -4041,7 +4065,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'BoardSnapshot',
-    declaration: 'export interface BoardSnapshot {\n    boardId: string;\n    name: string;\n    tickets: TicketView[];\n    notices?: BoardNotice[];\n}',
+    declaration: 'export interface BoardSnapshot {\n    boardId: string;\n    name: string;\n    tickets: TicketView[];\n    notices?: BoardNotice[];\n    members?: MemberView[];\n    capacity?: {\n        worker: number;\n        reviewer: number;\n    };\n}',
   },
   {
     name: 'Branded',
@@ -4872,6 +4896,18 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ManualCompactAgentContext extends CompactionAgentContext {\n    runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;\n}',
   },
   {
+    name: 'MemberRecord',
+    declaration: 'export interface MemberRecord {\n    id: string;\n    boardId: string;\n    role: MemberRole;\n    partnerId: string;\n    sessionId: string;\n    summary: string;\n    modules: string[];\n    recentTickets: string[];\n    archivedAt: number | null;\n    createdAt: number;\n    updatedAt: number;\n}',
+  },
+  {
+    name: 'MemberRole',
+    declaration: 'export type MemberRole = typeof TASKBOARD_MEMBER_ROLES[number];',
+  },
+  {
+    name: 'MemberView',
+    declaration: 'export interface MemberView extends MemberRecord {\n    status: \'idle\' | \'busy\' | \'archived\';\n    currentTicketId: string | null;\n}',
+  },
+  {
     name: 'Message',
     declaration: 'export interface Message {\n    readonly id: MessageId;\n    readonly role: \'system\' | \'user\' | \'assistant\';\n    readonly content: ContentBlock[];\n    readonly source: MessageSource;\n}',
   },
@@ -5149,7 +5185,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ReassignTicketResult',
-    declaration: 'export interface ReassignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'continued\' | \'unavailable\' | \'failed\' | null;\n    workerAgentId: string | null;\n}',
+    declaration: 'export interface ReassignTicketResult {\n    ticket: TicketView;\n    worker: \'spawned\' | \'continued\' | \'queued\' | \'unavailable\' | \'failed\' | null;\n    workerAgentId: string | null;\n}',
   },
   {
     name: 'RedactedSecret',
@@ -5238,6 +5274,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RestoredSessionOptions',
     declaration: 'export interface RestoredSessionOptions {\n    readonly seed: SessionEvent[];\n    readonly meta: SessionHeader;\n    readonly inheritedEventCount: SessionLogOffset;\n    readonly eventState: SessionSeedEventState;\n}',
+  },
+  {
+    name: 'RestoreMemberRequest',
+    declaration: 'export interface RestoreMemberRequest {\n    boardId?: string;\n    memberId: string;\n}',
   },
   {
     name: 'ResumeAgentOptions',
@@ -5816,6 +5856,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface SessionWireHeader {\n    readonly version: number;\n    readonly id: SessionId;\n    readonly createdAt: number;\n    readonly cwd?: string;\n    readonly parentSession?: SessionId;\n    readonly isSeeded: boolean;\n    readonly origin?: \'subagent\';\n    readonly delegationDepth?: number;\n    readonly agentPreset?: string;\n}',
   },
   {
+    name: 'SetRosterCapacityRequest',
+    declaration: 'export interface SetRosterCapacityRequest {\n    boardId?: string;\n    role: MemberRole;\n    count: number;\n    archiveMemberId?: string;\n}',
+  },
+  {
     name: 'SettingsApplies',
     declaration: 'export type SettingsApplies = \'live\' | \'restart\';',
   },
@@ -6320,6 +6364,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface TicketHistoryEntry {\n    at: number;\n    kind: string;\n    detail: string;\n}',
   },
   {
+    name: 'TicketQueue',
+    declaration: 'export interface TicketQueue {\n    reason: string;\n    enqueuedAt: number;\n    position: number;\n}',
+  },
+  {
     name: 'TicketReview',
     declaration: 'export interface TicketReview {\n    outcome: \'approved\' | \'rejected\';\n    feedback: string;\n    reviewer: TicketAssignee;\n    attempt: number;\n    at: number;\n}',
   },
@@ -6329,7 +6377,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketRow',
-    declaration: 'export interface TicketRow {\n    id: string;\n    title: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId: string | null;\n    failure: TicketFailure | null;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReviewOutcome: \'approved\' | \'rejected\' | null;\n    filesScope: string;\n    dependsOn: string[];\n    description?: string;\n    devNotes?: string;\n    reviewOutcome?: {\n        verdict: string;\n        summary: string;\n        problems: string[];\n    } | null;\n}',
+    declaration: 'export interface TicketRow {\n    id: string;\n    title: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId: string | null;\n    workerMemberId: string | null;\n    reviewerMemberId: string | null;\n    queue: TicketQueue | null;\n    failure: TicketFailure | null;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReviewOutcome: \'approved\' | \'rejected\' | null;\n    filesScope: string;\n    dependsOn: string[];\n    description?: string;\n    devNotes?: string;\n    reviewOutcome?: {\n        verdict: string;\n        summary: string;\n        problems: string[];\n    } | null;\n}',
   },
   {
     name: 'TicketType',
@@ -6337,7 +6385,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'TicketView',
-    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    failure: TicketFailure | null;\n    autoRetries: number;\n    reviewerRetries?: number | undefined;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
+    declaration: 'export interface TicketView {\n    id: string;\n    title: string;\n    description: string;\n    column: ColumnId;\n    priority: Priority;\n    boardId: string;\n    type: TicketType;\n    status: TicketWorkerStatus;\n    workerAgentId?: string | undefined;\n    workerSessionId?: string | undefined;\n    workerMemberId?: string | undefined;\n    reviewerMemberId?: string | undefined;\n    queue?: TicketQueue | null | undefined;\n    failure: TicketFailure | null;\n    autoRetries: number;\n    reviewerRetries?: number | undefined;\n    createdAt: number;\n    updatedAt: number;\n    position: number;\n    assignee: TicketAssignee | null;\n    reviewer: TicketAssignee | null;\n    reviewAttempts: number;\n    lastReview: TicketReview | null;\n    reviewOutcome: TicketReviewOutcome | null;\n    devNotes: string;\n    targetBranch: string;\n    filesScope: string;\n    dependsOn: string[];\n    history: TicketHistoryEntry[];\n}',
   },
   {
     name: 'TicketWorkerStatus',

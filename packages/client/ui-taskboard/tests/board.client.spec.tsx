@@ -8,7 +8,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
-import type { TicketView } from '@deepseek-ai/dsh-taskboard/client'
+import type {
+  BoardSnapshot, MemberRole, MemberView, RestoreMemberRequest, SetRosterCapacityRequest, TicketView,
+} from '@deepseek-ai/dsh-taskboard/client'
 import type { BoardScope, BoardView } from '../src/client/contract.ts'
 import { TaskboardView, type TaskboardViewProps } from '../src/client/TaskboardView.tsx'
 import { zh } from '../src/client/locales.ts'
@@ -63,12 +65,18 @@ interface StubProps {
   masterClaimedAt?: number | null
   /** When the active board's master lease expires; derived when omitted. */
   masterExpiresAt?: number | null
+  /** The active board's roster (V6-3 headcount controls). */
+  members?: MemberView[]
+  /** The active board's effective headcount per role. */
+  capacity?: { worker: number; reviewer: number }
   selectedId?: string | null
   create?: (request: unknown) => Promise<TicketView>
   move?: (request: unknown) => Promise<TicketView>
   selectBoard?: (boardId: string) => Promise<void>
   createBoard?: (name: string, scope?: BoardScope) => Promise<BoardView>
   archiveBoard?: (boardId: string) => Promise<BoardView>
+  setRosterCapacity?: (request: SetRosterCapacityRequest) => Promise<BoardSnapshot>
+  restoreMember?: (request: RestoreMemberRequest) => Promise<BoardSnapshot>
 }
 
 /**
@@ -93,12 +101,17 @@ function propsOf({
   board, boards = [], boardId = 'default', workspaceId = '', scope, ownerSessionId,
   masterAgentId, masterClaimedAt, masterExpiresAt,
   selectedId = null, create, move, selectBoard, createBoard, archiveBoard,
+  members, capacity, setRosterCapacity, restoreMember,
 }: StubProps): TaskboardViewProps {
   const active = boards.find(item => item.boardId === boardId)
   const state = {
     boardId,
     boards,
-    snapshot: { boardId, name: boardId, tickets: board },
+    snapshot: {
+      boardId, name: boardId, tickets: board,
+      ...(members === undefined ? {} : { members }),
+      ...(capacity === undefined ? {} : { capacity }),
+    },
     workspaceId,
     scope: scope ?? active?.scope ?? 'project',
     ownerSessionId: ownerSessionId !== undefined ? ownerSessionId : (active?.ownerSessionId ?? null),
@@ -121,6 +134,8 @@ function propsOf({
     createBoard: createBoard ?? (async (name: string, picked: BoardScope = 'session') =>
       boardRow('board-new', name, picked === 'session' ? '' : 'workspace-1', picked)),
     archiveBoard: archiveBoard ?? (async () => boardRow('default', 'default')),
+    setRosterCapacity: setRosterCapacity ?? (async () => state.snapshot),
+    restoreMember: restoreMember ?? (async () => state.snapshot),
     hooks: { board: { getSnapshot: () => state, subscribe: () => () => {} } },
     t,
   } as unknown as TaskboardViewProps
@@ -636,6 +651,44 @@ describe('TaskboardView', () => {
       fireEvent.dragEnd(cardEl as HTMLElement, { dataTransfer: dragTransfer() })
       vi.useRealTimers()
     }
+  })
+
+  it('renders the V6-3 headcount controls over the board roster and lowers only on a named member', () => {
+    const rosterMember = (id: string, role: MemberRole, overrides: Partial<MemberView> = {}): MemberView => ({
+      id,
+      boardId: 'default',
+      role,
+      partnerId: (role === 'worker' ? 'R' : 'W') + id.slice(1),
+      sessionId: '',
+      summary: id + ' summary',
+      modules: [],
+      recentTickets: [],
+      archivedAt: null,
+      createdAt: 1,
+      updatedAt: 1,
+      status: 'idle',
+      currentTicketId: null,
+      ...overrides,
+    })
+    const setRosterCapacity = vi.fn(async (_request: SetRosterCapacityRequest) => (
+      { boardId: 'default', name: 'default', tickets: [] } as BoardSnapshot
+    ))
+    render(createElement(TaskboardView, propsOf({
+      board: [],
+      members: [
+        rosterMember('W1', 'worker'), rosterMember('W2', 'worker'), rosterMember('R1', 'reviewer'),
+        rosterMember('W3', 'worker', { archivedAt: 7, status: 'archived' }),
+      ],
+      capacity: { worker: 2, reviewer: 1 },
+      setRosterCapacity,
+    })))
+
+    expect(screen.getByTestId('roster-worker-count').textContent).toBe('2')
+    expect(screen.getByTestId('roster-archived-W3').textContent).toContain('已归档')
+    fireEvent.click(screen.getByTestId('roster-worker-decrease'))
+    expect(setRosterCapacity).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId('roster-archive-W2'))
+    expect(setRosterCapacity).toHaveBeenCalledWith({ boardId: 'default', role: 'worker', count: 1, archiveMemberId: 'W2' })
   })
 
 })

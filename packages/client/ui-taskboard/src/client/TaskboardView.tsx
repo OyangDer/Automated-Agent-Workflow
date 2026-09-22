@@ -18,6 +18,7 @@ import {
 } from './dragScroll.ts'
 import { createTaskboardStore } from './stores.ts'
 import { CompactionCeilingRow } from './CompactionCeilingRow.tsx'
+import { RosterControls } from './RosterControls.tsx'
 import { TicketCard } from './TicketCard.tsx'
 import { TicketDetail } from './TicketDetail.tsx'
 import { NewTicketForm } from './NewTicketForm.tsx'
@@ -52,7 +53,8 @@ interface DropTarget {
 
 export function TaskboardView({
   useBoard, useStore, actions, create, move, edit, remove, requestReview,
-  selectBoard, createBoard, archiveBoard, t, dragAutoScroll, compaction,
+  selectBoard, createBoard, archiveBoard, setRosterCapacity, restoreMember,
+  t, dragAutoScroll, compaction,
 }: TaskboardViewProps) {
   const boardState = useBoard(state => state)
   const board = boardState.snapshot
@@ -109,13 +111,18 @@ export function TaskboardView({
   const ticketCount = board?.tickets.length ?? 0
 
   /**
-   * The board's roster (V6-1) and its current pair count. Pairs are the unit
-   * of the fixed headcount, so the count is the number of worker members (or
-   * of reviewer members when only those exist yet).
+   * The board's roster (V6-1): the active members and, separately, the
+   * archived ones (V6-3). The pair count is the effective headcount the host
+   * reports — min(worker cap, reviewer cap) — and falls back to the member
+   * count on an older host that serves no capacity.
    */
   const roster = board?.members ?? []
-  const pairCount = roster.filter(member => member.role === 'worker').length
-    || roster.filter(member => member.role === 'reviewer').length
+  const capacity = board?.capacity
+  const activeRoster = roster.filter(member => member.archivedAt === null)
+  const pairCount = capacity === undefined
+    ? (activeRoster.filter(member => member.role === 'worker').length
+      || activeRoster.filter(member => member.role === 'reviewer').length)
+    : Math.min(capacity.worker, capacity.reviewer)
 
   /**
    * Master-seat banner state for the active board: vacant, held (with a
@@ -406,18 +413,28 @@ export function TaskboardView({
       */}
       {compaction !== undefined && <CompactionCeilingRow ceiling={compaction} t={t} />}
       {/*
-        V6-1 visualization base: the board's fixed roster — member id, role,
-        fixed partner, derived load and the SHORT work summary the master
-        matches on. It is a read-only strip: dispatching stays with the master
-        (taskboard_assign) and the queue is drained by the board itself.
+        V6-1/V6-3 visualization base: the board's fixed roster — member id,
+        role, fixed partner, derived load and the SHORT work summary the master
+        matches on — plus the headcount controls: raising a count creates the
+        member, lowering it asks WHICH member to archive (the board never picks
+        one), and an archived member keeps its record behind a restore button.
+        Dispatching still stays with the master (taskboard_assign).
       */}
-      {roster.length > 0 && (
+      {(roster.length > 0 || capacity !== undefined) && (
         <div className={css.roster} data-testid="taskboard-roster">
           <span className={css.rosterTitle}>
             {t('roster.title')}
             <span className={css.rosterCapacity}>{t('roster.capacity').replace('{count}', String(pairCount))}</span>
           </span>
-          {roster.map(member => (
+          <RosterControls
+            members={roster}
+            capacity={capacity}
+            boardId={boardState.boardId}
+            setRosterCapacity={setRosterCapacity}
+            restoreMember={restoreMember}
+            t={t}
+          />
+          {activeRoster.map(member => (
             <span key={member.id} className={css.rosterChip} data-status={member.status}>
               <b className={css.rosterId}>{member.id}</b>
               <span className={css.rosterPartner}>{'↔ ' + member.partnerId}</span>

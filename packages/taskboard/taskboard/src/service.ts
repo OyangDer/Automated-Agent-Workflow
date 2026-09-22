@@ -36,11 +36,11 @@ import {
   TASKBOARD_COLUMNS, TASKBOARD_MEMBER_ROLES, TASKBOARD_PRIORITIES, TASKBOARD_TYPES, TASKBOARD_WORKER_STATUSES,
 } from './types.ts'
 import type {
-  ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardSnapshot, BoardView, ColumnId,
+  ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardRosterConfig, BoardSnapshot, BoardView, ColumnId,
   CreateBoardRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MemberRecord, MemberRole,
   MemberView, MoveTicketRequest, PreflightReport, Priority, RemoveTicketRequest, RemoveTicketResult,
-  RequestReviewRequest, TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure, TicketQueue,
-  TicketType, TicketView, TicketWorkerStatus,
+  RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest, TaskboardChanged, TaskboardOperation,
+  TicketAssignee, TicketFailure, TicketQueue, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
 import {
   foldMemberHistory, matchMember, memberIndex, memberTag, partnerMemberId,
@@ -143,6 +143,10 @@ const memberSchema = zod.object({
   summary: zod.string().default(''),
   modules: zod.array(zod.string()).default([]),
   recentTickets: zod.array(zod.string()).default([]),
+  // V6-3: archive is not deletion — the record survives with its number,
+  // partner, 履历 and summary; only dispatch skips it. Default null so records
+  // written before the field existed read back as active.
+  archivedAt: zod.number().nullable().default(null),
   createdAt: zod.number(),
   updatedAt: zod.number(),
 })
@@ -178,6 +182,12 @@ const boardSchema = zod.object({
     workerEffort: zod.string().optional(),
     reviewerModel: zod.string().optional(),
     reviewerEffort: zod.string().optional(),
+  }).default({}),
+  // V6-3: the per-board roster headcount. Absent fields inherit the host
+  // config, so a legacy board record keeps exactly the V6-1 behaviour.
+  rosterConfig: zod.object({
+    workerCapacity: zod.number().optional(),
+    reviewerCapacity: zod.number().optional(),
   }).default({}),
   archivedAt: zod.number().nullable().default(null),
 })
@@ -402,6 +412,9 @@ export interface Config {
    * first-served) instead of spawning yet another agent. The default is
    * deliberately conservative (2): one card per pair, so two pairs cover a
    * normal phase step without the unbounded fan-out of an uncapped board.
+   * V6-3: this is the HOST default — a board whose record carries
+   * rosterConfig.workerCapacity runs under that number instead, so the user
+   * can raise or lower one board's headcount from the office view.
    */
   workerCapacity?: number
   /**
@@ -409,6 +422,8 @@ export interface Config {
    * board may create. Pairing is structural (W<n> <-> R<n>), so the usable
    * pair count is min(workerCapacity, reviewerCapacity); with both defaults at
    * 2 a board runs at most two pairs, each owning one card until Done.
+   * V6-3: like workerCapacity this is the HOST default, overridden per board
+   * by rosterConfig.reviewerCapacity.
    */
   reviewerCapacity?: number
   /**
@@ -635,6 +650,18 @@ function resolveCapacity(value: number): number {
     throw new Error('taskboard: workerCapacity/reviewerCapacity must be a positive safe integer')
   }
   return value
+}
+
+/**
+ * Validate one roster role at the durable boundary (V6-3).
+ * @param value - the requested role.
+ * @returns the role, when it is one of the two roster roles.
+ */
+function resolveMemberRole(value: unknown): MemberRole {
+  if (typeof value !== 'string' || !(TASKBOARD_MEMBER_ROLES as readonly string[]).includes(value)) {
+    throw new TaskboardError('roster role must be "worker" or "reviewer"', 'TASKBOARD_INVALID_INPUT')
+  }
+  return value as MemberRole
 }
 
 /** Column ids as a runtime set for cheap membership checks. */
@@ -972,6 +999,52 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * One board's effective roster headcount per role (V6-3): the board record's
+   * rosterConfig wins, an absent field falls back to the host config. The pair
+   * is the conservative pair count (min of the two) the queue-drain bound and
+   * the roster tool report.
+   * @param boardId - the board whose headcount is read.
+   * @returns the worker cap, the reviewer cap and their minimum.
+   */
+  private async capacityOf(boardId: string): Promise<{ worker: number; reviewer: number; pair: number }> {
+    const board = (await this.boards()).get(boardId)
+    const override: BoardRosterConfig | undefined = board?.rosterConfig
+    const worker = override?.workerCapacity ?? this.resolved.workerCapacity
+    const reviewer = override?.reviewerCapacity ?? this.resolved.reviewerCapacity
+    return { worker, reviewer, pair: Math.min(worker, reviewer) }
+  }
+
+  /**
+   * The records of one role that DISPATCH may use: the non-archived ones
+   * (V6-3). An archived member keeps its number, 履历 and summary but never
+   * takes a card until it is restored.
+   * @param records - every record of the board (any role).
+   * @param role - the role to keep.
+   * @returns the active records of that role, in board order.
+   */
+  private static activeMembers(records: readonly MemberRecord[], role: MemberRole): MemberRecord[] {
+    return records.filter(member => member.role === role && member.archivedAt === null)
+  }
+
+  /**
+   * The member indices one board's records already claim. Archived members
+   * keep their number, so their index stays occupied and is never recycled: a
+   * newly created member always carries a number this board has not used.
+   * @param records - the board's records of one role.
+   * @returns the claimed indices.
+   */
+  private static occupiedIndices(records: readonly MemberRecord[]): Set<number> {
+    return new Set(records.map(member => memberIndex(member.id)))
+  }
+
+  /** The lowest member index no occupied slot claims. */
+  private static lowestFreeIndex(occupied: ReadonlySet<number>): number {
+    let index = 0
+    while (occupied.has(index)) index += 1
+    return index
+  }
+
+  /**
    * The board's roster as the wire serves it: every member with its short
    * work summary, derived load and held card. This is the ONLY member data
    * the master ever reads (user decision A) — never a member's full context.
@@ -987,7 +1060,8 @@ export class TaskboardService extends TypertRemoteService {
     const members = await this.boardMembers(boardId)
     const titles = new Map(tickets.map(ticket => [ticket.id, ticket.title]))
     const views = members.map((member) => {
-      const heldTicketId = held.get(member.id) ?? null
+      const archived = member.archivedAt !== null
+      const heldTicketId = archived ? null : held.get(member.id) ?? null
       return {
         ...member,
         summary: renderMemberSummary(
@@ -995,7 +1069,9 @@ export class TaskboardService extends TypertRemoteService {
           member.recentTickets.map(id => titles.get(id) ?? id),
           heldTicketId,
         ),
-        status: heldTicketId === null ? 'idle' as const : 'busy' as const,
+        // V6-3: an archived member reports its own state — the office view shows
+        // 已归档 and never renders it as a free member waiting for work.
+        status: archived ? 'archived' as const : heldTicketId === null ? 'idle' as const : 'busy' as const,
         currentTicketId: heldTicketId,
       }
     })
@@ -1023,6 +1099,8 @@ export class TaskboardService extends TypertRemoteService {
       summary: renderMemberSummary([], [], null),
       modules: [],
       recentTickets: [],
+      // V6-3: a freshly created member is active.
+      archivedAt: null,
       createdAt: now,
       updatedAt: now,
     }
@@ -1108,16 +1186,20 @@ export class TaskboardService extends TypertRemoteService {
     const boardId = ticket.boardId
     const tickets = await this.boardTickets(boardId)
     const held = TaskboardService.heldCards(tickets)
-    const records = (await this.boardMembers(boardId)).filter(member => member.role === 'worker')
-    const cap = this.resolved.pairCapacity
+    const all = (await this.boardMembers(boardId)).filter(member => member.role === 'worker')
+    // V6-3: only ACTIVE members are candidates; the cap counts them, while an
+    // archived member's number stays occupied and is never recycled.
+    const records = TaskboardService.activeMembers(all, 'worker')
+    const cap = (await this.capacityOf(boardId)).worker
     const idle = records.filter(member => !held.has(member.id))
     const chosen = matchMember(idle, ticket, ticket.workerMemberId)
     if (chosen !== null) return { member: chosen }
     if (records.length < cap) {
-      const used = new Set(records.map(member => memberIndex(member.id)))
-      let index = 0
-      while (index < cap && used.has(index)) index += 1
-      if (index < cap) return { member: await this.ensureMember(boardId, 'worker', index) }
+      return {
+        member: await this.ensureMember(
+          boardId, 'worker', TaskboardService.lowestFreeIndex(TaskboardService.occupiedIndices(all)),
+        ),
+      }
     }
     const busy = records
       .filter(member => held.has(member.id))
@@ -1138,8 +1220,10 @@ export class TaskboardService extends TypertRemoteService {
     const boardId = ticket.boardId
     const tickets = await this.boardTickets(boardId)
     const held = TaskboardService.heldCards(tickets)
-    const records = (await this.boardMembers(boardId)).filter(member => member.role === 'reviewer')
-    const cap = this.resolved.pairCapacity
+    const all = (await this.boardMembers(boardId)).filter(member => member.role === 'reviewer')
+    // V6-3: an archived reviewer takes no seat (its number stays occupied).
+    const records = TaskboardService.activeMembers(all, 'reviewer')
+    const cap = (await this.capacityOf(boardId)).reviewer
     const preferredIndex = workerMemberId === undefined ? 0 : memberIndex(workerMemberId)
     const preferred = records.find(member => member.id === reviewerMemberId(preferredIndex))
     if (preferred !== undefined) {
@@ -1157,8 +1241,15 @@ export class TaskboardService extends TypertRemoteService {
       const chosen = idle.find(member => memberIndex(member.id) === preferredIndex) ?? idle[0]
       if (chosen !== undefined) return { member: chosen }
     }
-    if (records.length < cap && preferredIndex < cap) {
-      return { member: await this.ensureMember(boardId, 'reviewer', preferredIndex) }
+    if (records.length < cap) {
+      // The lowest free number IS the fixed partner's slot whenever that
+      // number is unused, so the pair stays structural in the normal case and
+      // only drifts after the user archived the partner's own number.
+      return {
+        member: await this.ensureMember(
+          boardId, 'reviewer', TaskboardService.lowestFreeIndex(TaskboardService.occupiedIndices(all)),
+        ),
+      }
     }
     const busy = records
       .filter(member => held.has(member.id))
@@ -1357,8 +1448,10 @@ export class TaskboardService extends TypertRemoteService {
     const master = await this.liveMaster(boardId)
     if (master === undefined) return 0
     let dispatched = 0
-    // Bounded by the pair cap: each pass can start at most one card per slot.
-    for (let guard = 0; guard <= this.resolved.pairCapacity; guard += 1) {
+    // Bounded by the board's headcount: each pass can start at most one card
+    // per slot (V6-3: the per-board caps, not the host defaults).
+    const headcount = await this.capacityOf(boardId)
+    for (let guard = 0; guard <= headcount.worker + headcount.reviewer; guard += 1) {
       const tickets = await this.boardTickets(boardId)
       const next = TaskboardService.queuedOrder(tickets)[0]
       if (next === undefined) break
@@ -3184,12 +3277,16 @@ export class TaskboardService extends TypertRemoteService {
     // derived load and held card) — the server-side data the office view
     // renders, with no member context on the wire.
     const roster = await this.rosterOf(board)
+    const capacity = await this.capacityOf(board)
     return {
       boardId: board,
       name: boardRow.name,
       tickets,
       notices: boardRow.notices ?? [],
       members: roster.views,
+      // V6-3: the office view renders the headcount controls from this, so what
+      // the user raises or lowers is exactly the cap dispatch runs under.
+      capacity: { worker: capacity.worker, reviewer: capacity.reviewer },
     }
   }
 
@@ -3342,6 +3439,165 @@ export class TaskboardService extends TypertRemoteService {
       ...(reviewerEffort === undefined ? {} : { reviewerEffort }),
     }
     return this.mutateBoard(boardId, currentBoard => ({ ...currentBoard, modelConfig }))
+  }
+
+  /** The rosterConfig field carrying one role's headcount. */
+  private static capacityKey(role: MemberRole): 'workerCapacity' | 'reviewerCapacity' {
+    return role === 'worker' ? 'workerCapacity' : 'reviewerCapacity'
+  }
+
+  /** Persist one board's headcount for one role on its board record (V6-3). */
+  private async writeRosterCapacity(boardId: string, role: MemberRole, count: number): Promise<void> {
+    const key = TaskboardService.capacityKey(role)
+    await this.mutateBoard(boardId, board => ({
+      ...board,
+      rosterConfig: { ...(board.rosterConfig ?? {}), [key]: count },
+    }))
+  }
+
+  /**
+   * Change one role's roster headcount through the Remote boundary (V6-3).
+   * Raising the cap creates the members the extra slots need — numbered and
+   * immediately dispatchable. Lowering it is accepted only together with
+   * archiveMemberId: the user NAMES the member to archive, because the board
+   * must never pick a member by itself, and one step archives exactly one
+   * member. The archive is refused while that member holds a live card (In
+   * progress/running or In testing), so no member is ever archived with work in
+   * flight. Archiving keeps the record — number, partner, module 履历 and short
+   * summary all survive — and only removes the member from dispatch; use
+   * restoreMember to bring it back. The new headcount is stored on the board
+   * record, so it survives a restart.
+   * @param agent - the calling session agent; the board must be visible to it.
+   * @param request - the role, the new cap, and the member named on a lowering.
+   * @returns the board's fresh snapshot (members, caps and tickets).
+   */
+  @Remote('setRosterCapacity')
+  async setRosterCapacityRemote(agent: Agent, request: SetRosterCapacityRequest): Promise<BoardSnapshot> {
+    const boardId = request.boardId ?? 'default'
+    await this.assertBoardAccessible(boardId, agent)
+    await this.ensureBoard(boardId)
+    const role = resolveMemberRole(request.role)
+    const count = resolveCapacity(request.count)
+    const named = request.archiveMemberId ?? ''
+    const capacity = await this.capacityOf(boardId)
+    const cap = role === 'worker' ? capacity.worker : capacity.reviewer
+    const all = (await this.boardMembers(boardId)).filter(member => member.role === role)
+    const active = TaskboardService.activeMembers(all, role)
+
+    if (count > cap) {
+      if (named !== '') {
+        throw new TaskboardError(
+          'raising the ' + role + ' headcount creates members; it names no member to archive (got "' + named
+            + '" — lowering the headcount is what archives one)',
+          'TASKBOARD_INVALID_INPUT',
+        )
+      }
+      // One fresh member per added slot, each carrying a number this board has
+      // never used: an archived member keeps its own, so numbers are not
+      // recycled under it.
+      const occupied = TaskboardService.occupiedIndices(all)
+      for (let slot = active.length; slot < count; slot += 1) {
+        const index = TaskboardService.lowestFreeIndex(occupied)
+        occupied.add(index)
+        await this.ensureMember(boardId, role, index)
+      }
+      await this.writeRosterCapacity(boardId, role, count)
+      return this.snapshot(agent, boardId)
+    }
+
+    if (count < cap) {
+      if (count !== cap - 1) {
+        throw new TaskboardError(
+          'the ' + role + ' headcount can only be lowered one slot at a time (from ' + String(cap) + ' to '
+            + String(count) + '); archive one member per step and name it in archiveMemberId',
+          'TASKBOARD_INVALID_INPUT',
+        )
+      }
+      if (named === '') {
+        throw new TaskboardError(
+          'lowering the ' + role + ' headcount requires archiveMemberId: name the member to archive — the board never picks one',
+          'TASKBOARD_INVALID_INPUT',
+        )
+      }
+      const target = all.find(member => member.id === named)
+      if (target === undefined) {
+        throw new TaskboardError(
+          'board "' + boardId + '" has no ' + role + ' member "' + named + '"',
+          'TASKBOARD_INVALID_INPUT',
+        )
+      }
+      if (target.archivedAt !== null) {
+        throw new TaskboardError('member "' + target.id + '" is already archived', 'TASKBOARD_INVALID_INPUT')
+      }
+      const holding = TaskboardService.heldCards(await this.boardTickets(boardId)).get(target.id)
+      if (holding !== undefined) {
+        throw new TaskboardError(
+          'refusing to archive ' + memberTag(target.id) + ': it is executing card "' + holding
+            + '" — let that card finish, or reassign it, before archiving this member',
+          'TASKBOARD_MEMBER_BUSY',
+        )
+      }
+      const table = await this.members()
+      await table.update(
+        TaskboardService.memberKey(boardId, target.id),
+        member => ({ ...member, archivedAt: Date.now(), updatedAt: Date.now() }),
+      )
+      await this.writeRosterCapacity(boardId, role, count)
+      return this.snapshot(agent, boardId)
+    }
+
+    // count === cap: an unchanged headcount with a named member is a
+    // contradiction, not a silent archive.
+    if (named !== '') {
+      throw new TaskboardError(
+        'the ' + role + ' headcount is unchanged at ' + String(cap) + '; archive member "' + named
+          + '" by lowering the headcount, or raise it to add a slot',
+        'TASKBOARD_INVALID_INPUT',
+      )
+    }
+    return this.snapshot(agent, boardId)
+  }
+
+  /**
+   * Restore one archived member through the Remote boundary (V6-3): the record
+   * comes back exactly as it was archived — same number, partner, module 履历
+   * and summary — and takes cards again. When the role's headcount is already
+   * full the restore raises it, because a restored member the cap would exclude
+   * forever would not be usable.
+   * @param agent - the calling session agent; the board must be visible to it.
+   * @param request - the board and the archived member to bring back.
+   * @returns the board's fresh snapshot (members, caps and tickets).
+   */
+  @Remote('restoreMember')
+  async restoreMemberRemote(agent: Agent, request: RestoreMemberRequest): Promise<BoardSnapshot> {
+    const boardId = request.boardId ?? 'default'
+    await this.assertBoardAccessible(boardId, agent)
+    await this.ensureBoard(boardId)
+    const table = await this.members()
+    const member = table.get(TaskboardService.memberKey(boardId, request.memberId))
+    if (member === undefined) {
+      throw new TaskboardError(
+        'board "' + boardId + '" has no member "' + request.memberId + '"',
+        'TASKBOARD_INVALID_INPUT',
+      )
+    }
+    if (member.archivedAt === null) {
+      throw new TaskboardError('member "' + member.id + '" is not archived', 'TASKBOARD_INVALID_INPUT')
+    }
+    const capacity = await this.capacityOf(boardId)
+    const cap = member.role === 'worker' ? capacity.worker : capacity.reviewer
+    const all = (await this.boardMembers(boardId)).filter(candidate => candidate.role === member.role)
+    const active = TaskboardService.activeMembers(all, member.role)
+    await table.update(
+      TaskboardService.memberKey(boardId, member.id),
+      restored => ({ ...restored, archivedAt: null, updatedAt: Date.now() }),
+    )
+    // Bringing a member back must leave it dispatchable: when the cap is
+    // already full the restore lifts it by one instead of restoring a member
+    // that could never take a card.
+    const lifted = Math.max(cap, active.length + 1)
+    if (lifted !== cap) await this.writeRosterCapacity(boardId, member.role, lifted)
+    return this.snapshot(agent, boardId)
   }
 
   /**
@@ -5165,6 +5421,10 @@ export class TaskboardService extends TypertRemoteService {
             boardId: { type: 'string', required: true },
             /** The effective fixed pair count (min of the two configured caps). */
             capacity: { type: 'number', required: true },
+            /** V6-3: the board's effective worker headcount. */
+            workerCapacity: { type: 'number', required: true },
+            /** V6-3: the board's effective reviewer headcount. */
+            reviewerCapacity: { type: 'number', required: true },
             members: {
               type: 'array', required: true,
               items: {
@@ -5174,7 +5434,9 @@ export class TaskboardService extends TypertRemoteService {
                   role: { type: 'string', required: true, enum: [...TASKBOARD_MEMBER_ROLES] },
                   partnerId: { type: 'string', required: true },
                   sessionId: { type: 'string', required: true },
-                  status: { type: 'string', required: true, enum: ['idle', 'busy'] },
+                  status: { type: 'string', required: true, enum: ['idle', 'busy', 'archived'] },
+                  /** V6-3: true when the member is archived and takes no card. */
+                  archived: { type: 'boolean', required: true },
                   currentTicketId: {
                     oneOf: [{ type: 'string' }, { type: 'null' }] as const, required: true,
                   },
@@ -5189,14 +5451,26 @@ export class TaskboardService extends TypertRemoteService {
         render: (_args, value: {
           boardId: string
           capacity: number
-          members: { id: string; role: string; partnerId: string; status: string; currentTicketId: string | null; summary: string }[]
+          workerCapacity: number
+          reviewerCapacity: number
+          members: {
+            id: string
+            role: string
+            partnerId: string
+            status: string
+            archived: boolean
+            currentTicketId: string | null
+            summary: string
+          }[]
         }) => [{
           type: 'text' as const,
-          text: 'roster board=' + value.boardId + ' capability=' + String(value.capacity) + ' pair(s)\n'
+          text: 'roster board=' + value.boardId + ' capability=' + String(value.capacity) + ' pair(s)'
+            + ' (worker headcount ' + String(value.workerCapacity) + ', reviewer headcount ' + String(value.reviewerCapacity) + ')\n'
             + (value.members.length === 0
               ? '(no member created yet — the first dispatch creates W1/R1)'
               : value.members.map(member => '- ' + member.id + ' (' + member.role + ', partner ' + member.partnerId + ', '
-                + member.status + (member.currentTicketId === null ? '' : ' on ' + member.currentTicketId) + '): ' + member.summary).join('\n')),
+                + member.status + (member.archived ? ' — 已归档, takes no card' : '')
+                + (member.currentTicketId === null ? '' : ' on ' + member.currentTicketId) + '): ' + member.summary).join('\n')),
         }],
       },
       execute: async (args: { boardId?: string }, exec) => {
@@ -5204,15 +5478,21 @@ export class TaskboardService extends TypertRemoteService {
         const boardId = args.boardId ?? 'default'
         await this.assertBoardAccessible(boardId, agent)
         const roster = await this.rosterOf(boardId)
+        const capacity = await this.capacityOf(boardId)
         return {
           boardId,
-          capacity: this.resolved.pairCapacity,
+          capacity: capacity.pair,
+          workerCapacity: capacity.worker,
+          reviewerCapacity: capacity.reviewer,
           members: roster.views.map(member => ({
             id: member.id,
             role: member.role,
             partnerId: member.partnerId,
             sessionId: member.sessionId,
             status: member.status,
+            // V6-3: the master sees who is archived (takes no card) without
+            // ever reading a member's context.
+            archived: member.archivedAt !== null,
             currentTicketId: member.currentTicketId,
             summary: member.summary,
             modules: member.modules,

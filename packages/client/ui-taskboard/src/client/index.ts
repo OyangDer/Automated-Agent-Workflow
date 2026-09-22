@@ -26,7 +26,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { BoardSnapshot } from '@deepseek-ai/dsh-taskboard/client'
+import type { BoardSnapshot, RestoreMemberRequest, SetRosterCapacityRequest } from '@deepseek-ai/dsh-taskboard/client'
 import {
   COMPACTION_CEILING_NS, createCompactionCeilingFace,
   type CompactionCeilingFace, type CompactionCeilingSection,
@@ -79,6 +79,8 @@ interface BoardSource {
   selectBoard(boardId: string): Promise<void>
   createBoard(name: string, scope?: BoardScope): Promise<BoardView>
   archiveBoard(boardId: string): Promise<BoardView>
+  setRosterCapacity(request: SetRosterCapacityRequest): Promise<BoardSnapshot>
+  restoreMember(request: RestoreMemberRequest): Promise<BoardSnapshot>
 }
 
 /**
@@ -230,6 +232,32 @@ export function apply(ctx: ClientContext): void {
       return archived
     }
 
+    /**
+     * Adopt one roster mutation's fresh snapshot (V6-3): the returned snapshot
+     * is the host's post-mutation state, so the roster and the headcount update
+     * at once; the background refetch then reconciles anything else that moved.
+     */
+    const adoptRoster = (snapshot: BoardSnapshot): BoardSnapshot => {
+      if (snapshot.boardId === current.boardId) {
+        current = { ...current, snapshot }
+        publish()
+      }
+      void refresh()
+      return snapshot
+    }
+
+    /** Change one role's headcount (a lowering names the member to archive). */
+    const setRosterCapacity = async (request: SetRosterCapacityRequest): Promise<BoardSnapshot> => {
+      const next = unwrap(await ctx.remote.taskboard.setRosterCapacity(sessionId, request))
+      return adoptRoster(next)
+    }
+
+    /** Bring one archived member back; it takes cards again. */
+    const restoreMember = async (request: RestoreMemberRequest): Promise<BoardSnapshot> => {
+      const next = unwrap(await ctx.remote.taskboard.restoreMember(sessionId, request))
+      return adoptRoster(next)
+    }
+
     return {
       board: {
         getSnapshot: () => current,
@@ -242,6 +270,8 @@ export function apply(ctx: ClientContext): void {
       selectBoard,
       createBoard,
       archiveBoard,
+      setRosterCapacity,
+      restoreMember,
     }
   }
 
@@ -276,6 +306,8 @@ export function apply(ctx: ClientContext): void {
         selectBoard: boardId => source.selectBoard(boardId),
         createBoard: (name, scope) => source.createBoard(name, scope),
         archiveBoard: boardId => source.archiveBoard(boardId),
+        setRosterCapacity: request => source.setRosterCapacity(request),
+        restoreMember: request => source.restoreMember(request),
         hooks: { board: source.board },
         ...(ceiling === undefined ? {} : { compaction: ceiling }),
       }

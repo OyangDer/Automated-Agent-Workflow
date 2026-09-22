@@ -4695,3 +4695,202 @@ describe('V6-1 fixed headcount, matching dispatch and fixed pairs', () => {
     expect(w1?.sessionId).toBe('worker-child-2')
   })
 })
+
+describe('V6-3 roster headcount changes, named archiving and restore', () => {
+  /** One board's roster as the snapshot serves it. */
+  const rosterOf = async (service: TaskboardService, agent: Agent) =>
+    (await service.snapshot(agent, 'default')).members ?? []
+
+  /** Dispatch one fresh card and return its worker member id. */
+  const dispatch = async (
+    service: TaskboardService, agent: Agent, title: string, filesScope = '',
+  ): Promise<string> => {
+    const card = await service.createAsMaster(agent, {
+      title, description: 'describe ' + title, priority: 'normal', dependsOn: [], filesScope,
+    })
+    await scheduleToNotStarted(service, agent, card)
+    const assigned = await service.assign(agent, card.id)
+    return assigned.ticket.workerMemberId ?? ''
+  }
+
+  it('a) raising a headcount creates the new member, numbered and immediately dispatchable', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    // 2 -> 3 worker slots: W3 appears at once, idle and paired with R3.
+    const raisedWorker = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    expect(raisedWorker.capacity).toEqual({ worker: 3, reviewer: 2 })
+    expect((raisedWorker.members ?? []).find(member => member.id === 'W3'))
+      .toMatchObject({ role: 'worker', partnerId: 'R3', status: 'idle', archivedAt: null })
+    // The reviewer side is the same control.
+    const raisedReviewer = await service.setRosterCapacityRemote(devA, { role: 'reviewer', count: 3 })
+    expect(raisedReviewer.capacity).toEqual({ worker: 3, reviewer: 3 })
+    expect((raisedReviewer.members ?? []).find(member => member.id === 'R3'))
+      .toMatchObject({ role: 'reviewer', status: 'idle', archivedAt: null })
+    // And the new slot is usable end to end: the third card goes to W3 and its
+    // review seat is W3's fixed partner R3.
+    const cards = []
+    for (const title of ['slot a', 'slot b', 'slot c']) cards.push(await createTicket(service, title))
+    for (const card of cards) await scheduleToNotStarted(service, devA, card)
+    expect((await service.assign(devA, cards[0]!.id)).ticket.workerMemberId).toBe('W1')
+    expect((await service.assign(devA, cards[1]!.id)).ticket.workerMemberId).toBe('W2')
+    const third = await service.assign(devA, cards[2]!.id)
+    expect(third.worker).toBe('spawned')
+    expect(third.ticket.workerMemberId).toBe('W3')
+    const reported = await service.report(workerChild, cards[2]!.id, 'third slot done')
+    expect(reported.ticket.reviewerMemberId).toBe('R3')
+  })
+
+  it('b) lowering a headcount refuses to pick a member itself: the member must be named, one step at a time', async () => {
+    const { service, devA } = await harness()
+    await service.claimMaster('default', devA)
+    await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+
+    // No name: refused, and nothing moved (no silent archive, no auto-pick).
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 2 }))
+      .rejects.toMatchObject({
+        code: 'TASKBOARD_INVALID_INPUT',
+        message: expect.stringContaining('archiveMemberId'),
+      })
+    expect((await service.snapshot(devA)).capacity).toEqual({ worker: 3, reviewer: 2 })
+    expect((await rosterOf(service, devA)).filter(member => member.role === 'worker').map(member => member.id))
+      .toEqual(['W1', 'W2', 'W3'])
+
+    // More than one slot at a time: refused.
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 1, archiveMemberId: 'W3' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT', message: expect.stringContaining('one slot at a time') })
+    // A name that is not a member of that role: refused.
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'R1' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT', message: expect.stringContaining('no worker member') })
+    // A raise never names a member to archive either.
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 4, archiveMemberId: 'W3' }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_INVALID_INPUT', message: expect.stringContaining('raising the worker headcount') })
+
+    // The named member is the one archived, and the headcount drops with it.
+    const lowered = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W3' })
+    expect(lowered.capacity).toEqual({ worker: 2, reviewer: 2 })
+    expect((lowered.members ?? []).find(member => member.id === 'W3'))
+      .toMatchObject({ status: 'archived', archivedAt: expect.any(Number) })
+  })
+
+  it('c) an archived member keeps its number, 履历 and summary, and takes no card', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    // W1 builds a module履历 first.
+    const parser = await service.createAsMaster(devA, {
+      title: 'parser card', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/parser/src',
+    })
+    await scheduleToNotStarted(service, devA, parser)
+    expect((await service.assign(devA, parser.id)).ticket.workerMemberId).toBe('W1')
+    await service.report(workerChild, parser.id, 'parser done')
+    await service.resolveReview(devA, parser.id, 'approve', 'ok', [])
+    const before = (await rosterOf(service, devA)).find(member => member.id === 'W1')
+    expect(before?.modules).toContain('parser')
+
+    const lowered = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W1' })
+    const archived = (lowered.members ?? []).find(member => member.id === 'W1')
+    expect(archived).toMatchObject({
+      status: 'archived',
+      partnerId: 'R1',
+      modules: before?.modules,
+      recentTickets: [parser.id],
+      summary: before?.summary,
+    })
+    expect(archived?.archivedAt).toEqual(expect.any(Number))
+    expect(archived?.summary).toContain('parser')
+
+    // Dispatch skips it: a card whose scope matches W1's 履历 goes elsewhere.
+    const matched = await dispatch(service, devA, 'parser lexer', 'packages/parser/src/lexer.ts')
+    expect(matched).not.toBe('W1')
+    expect(['W2', 'W3']).toContain(matched)
+    // A later raise does not recycle the archived number either: it mints W4.
+    const raised = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    expect((raised.members ?? []).find(member => member.id === 'W1')?.status).toBe('archived')
+    expect((raised.members ?? []).some(member => member.id === 'W4')).toBe(true)
+  })
+
+  it('d) restoring a member brings back its 履历 and it takes cards again (lifting a full headcount)', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    const parser = await service.createAsMaster(devA, {
+      title: 'parser card', description: '', priority: 'normal', dependsOn: [], filesScope: 'packages/parser/src',
+    })
+    await scheduleToNotStarted(service, devA, parser)
+    await service.assign(devA, parser.id)
+    await service.report(workerChild, parser.id, 'parser done')
+    await service.resolveReview(devA, parser.id, 'approve', 'ok', [])
+    await service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W1' })
+
+    const restored = await service.restoreMemberRemote(devA, { memberId: 'W1' })
+    const w1 = (restored.members ?? []).find(member => member.id === 'W1')
+    expect(w1).toMatchObject({ status: 'idle', archivedAt: null, partnerId: 'R1' })
+    expect(w1?.modules).toContain('parser')
+    expect(w1?.summary).toContain('parser')
+    // W2/W3 stayed active, so the cap is lifted back instead of restoring a
+    // member the headcount would exclude forever.
+    expect(restored.capacity).toEqual({ worker: 3, reviewer: 2 })
+    // Dispatchable again: a parser card matches W1's 履历.
+    expect(await dispatch(service, devA, 'parser lexer', 'packages/parser/src/lexer.ts')).toBe('W1')
+  })
+
+  it('e) archiving a member that is executing a card is refused, naming that card', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    await service.setRosterCapacityRemote(devA, { role: 'worker', count: 3 })
+    await service.setRosterCapacityRemote(devA, { role: 'reviewer', count: 3 })
+    const card = await createTicket(service, 'busy member card')
+    await scheduleToNotStarted(service, devA, card)
+    expect((await service.assign(devA, card.id)).ticket.workerMemberId).toBe('W1')
+
+    // The worker holding a running card cannot be archived.
+    await expect(service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W1' }))
+      .rejects.toMatchObject({
+        code: 'TASKBOARD_MEMBER_BUSY',
+        message: expect.stringContaining(card.id),
+      })
+    expect((await service.snapshot(devA)).capacity).toEqual({ worker: 3, reviewer: 3 })
+    expect((await rosterOf(service, devA)).find(member => member.id === 'W1'))
+      .toMatchObject({ status: 'busy', archivedAt: null, currentTicketId: card.id })
+
+    // The reviewer holding the seat of an In testing card is protected too.
+    const reported = await service.report(workerChild, card.id, 'done')
+    expect(reported.ticket.reviewerMemberId).toBe('R1')
+    await expect(service.setRosterCapacityRemote(devA, { role: 'reviewer', count: 2, archiveMemberId: 'R1' }))
+      .rejects.toMatchObject({
+        code: 'TASKBOARD_MEMBER_BUSY',
+        message: expect.stringContaining(card.id),
+      })
+
+    // Once the card reaches Done the same archive goes through.
+    await service.resolveReview(devA, card.id, 'approve', 'ok', [])
+    const archived = await service.setRosterCapacityRemote(devA, { role: 'worker', count: 2, archiveMemberId: 'W1' })
+    expect((archived.members ?? []).find(member => member.id === 'W1')?.status).toBe('archived')
+  })
+
+  it('f) the headcount and the archived member survive a restart (fresh process, same storage root)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskboard-roster-restart-'))
+    const first = await harness({ root })
+    await first.service.claimMaster('default', first.devA)
+    await first.service.setRosterCapacityRemote(first.devA, { role: 'worker', count: 4 })
+    expect((await first.service.snapshot(first.devA)).capacity).toEqual({ worker: 4, reviewer: 2 })
+    const archived = await first.service.setRosterCapacityRemote(
+      first.devA, { role: 'worker', count: 3, archiveMemberId: 'W2' },
+    )
+    expect((archived.members ?? []).find(member => member.id === 'W2')?.status).toBe('archived')
+    // The whole process goes away: the domain is closed and every plugin is disposed.
+    await first.ctx.fiber.dispose()
+
+    const second = await harness({ root })
+    const reloaded = await second.service.snapshot(second.devA)
+    expect(reloaded.capacity).toEqual({ worker: 3, reviewer: 2 })
+    const members = reloaded.members ?? []
+    // Exactly the four slots the raise created and the one archive: the
+    // reviewer roster was never touched by this flow.
+    expect(members.map(member => member.id).sort()).toEqual(['W1', 'W2', 'W3', 'W4'])
+    expect(members.find(member => member.id === 'W2'))
+      .toMatchObject({ status: 'archived', partnerId: 'R2', archivedAt: expect.any(Number) })
+    expect(members.filter(member => member.status === 'idle').map(member => member.id).sort())
+      .toEqual(['W1', 'W3', 'W4'])
+  })
+})

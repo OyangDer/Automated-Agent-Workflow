@@ -73,14 +73,25 @@ export interface MemberRecord {
   modules: string[]
   /** Recently finished ticket ids, newest first (capped). */
   recentTickets: string[]
+  /**
+   * When the member was archived (V6-3); null while the member is active.
+   * Archive is never a delete: the record — number, partner, module履历 and
+   * summary — is kept, the member is skipped by every dispatch, and the user
+   * can restore it later. Absent on records written before the field existed
+   * and read back as null.
+   */
+  archivedAt: number | null
   createdAt: number
   updatedAt: number
 }
 
 /** One roster member as the wire serves it: the durable record plus derived load. */
 export interface MemberView extends MemberRecord {
-  /** Derived load: busy holds a card that has not reached Done yet. */
-  status: 'idle' | 'busy'
+  /**
+   * Derived load: `busy` holds a card that has not reached Done yet,
+   * `archived` is excluded from dispatch (V6-3) and `idle` is ready for a card.
+   */
+  status: 'idle' | 'busy' | 'archived'
   /** The card the member currently holds (In progress or In testing); null when idle. */
   currentTicketId: string | null
 }
@@ -322,8 +333,27 @@ export interface BoardView {
    * records means the host config governs every spawn.
    */
   modelConfig?: BoardModelConfig
+  /**
+   * Per-board roster headcount overrides (V6-3); an absent field falls back to
+   * the host config's workerCapacity/reviewerCapacity. Kept on the board record
+   * so the headcount survives a restart and every session sees the same one.
+   */
+  rosterConfig?: BoardRosterConfig
   /** When the board was archived; null while active. */
   archivedAt: number | null
+}
+
+/**
+ * Per-board roster headcount (V6-3): how many WORKER and how many REVIEWER
+ * members this board keeps. Both fall back to the host config when absent, and
+ * the headcount is a cap, not a fixture — a slot is materialized as a member
+ * when the user raises the cap and needs a free member.
+ */
+export interface BoardRosterConfig {
+  /** Max worker members on this board; absent inherits the host config. */
+  workerCapacity?: number | undefined
+  /** Max reviewer members on this board; absent inherits the host config. */
+  reviewerCapacity?: number | undefined
 }
 
 /** Whole-board snapshot returned by the Remote API. */
@@ -340,6 +370,12 @@ export interface BoardSnapshot {
    * view reads, with no member context on the wire.
    */
   members?: MemberView[]
+  /**
+   * The board's effective roster headcount per role (V6-3); absent on old
+   * hosts. The office view reads it for the headcount controls, so what the
+   * user raises or lowers is the cap dispatch actually runs under.
+   */
+  capacity?: { worker: number; reviewer: number }
 }
 
 /**
@@ -478,6 +514,33 @@ export interface CreateBoardRequest {
 /** User archives a board through the Remote API. */
 export interface ArchiveBoardRequest {
   boardId: string
+}
+
+/**
+ * User changes one role's roster headcount (V6-3). Raising the cap creates the
+ * missing member(s) — numbered and immediately dispatchable. Lowering it is
+ * only accepted together with {@link archiveMemberId}: the user names which
+ * member to archive, because the system must never pick a member itself.
+ */
+export interface SetRosterCapacityRequest {
+  boardId?: string
+  /** Which roster the headcount belongs to. */
+  role: MemberRole
+  /** The role's new cap; must be a positive integer. */
+  count: number
+  /**
+   * The member of this role to archive, named by the user. Required exactly
+   * when `count` is below the role's current cap (one step at a time), and
+   * refused when that member currently holds a card.
+   */
+  archiveMemberId?: string
+}
+
+/** User restores one archived roster member (V6-3); it takes cards again. */
+export interface RestoreMemberRequest {
+  boardId?: string
+  /** The archived member to bring back. */
+  memberId: string
 }
 
 /** Result of a removal. */

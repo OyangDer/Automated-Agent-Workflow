@@ -145,6 +145,18 @@ The taskboard service (ctx.taskboard): storage-backed tickets and boards, the ma
 
 ```ts cordis-catalog
 /**
+ * Drain one board's queue, first-come-first-served (requirement: 不饿死).
+ * Runs whenever a member frees up (a card reaches Done, a card is returned
+ * to Not started) and from the periodic reconciliation, so a queued card
+ * moves on its own as soon as a member is free — but only while a live
+ * master session exists to parent the wake/spawn; otherwise the card stays
+ * visibly queued instead of disappearing.
+ * @param boardId - the board whose queue is drained.
+ * @returns how many queued cards this pass dispatched.
+ */
+async drainQueue(boardId: string): Promise<number>
+
+/**
  * Report one reviewer verdict from a continuable reviewer session (V3-28).
  * A durable reviewer child cannot carry an outputSchema — structured output
  * is a one-shot-only subagent capability — so instead of the
@@ -189,9 +201,19 @@ async submitReviewVerdict( agent: Agent, ticketId: string, verdict: 'approve' | 
  * column/status/worker identity atomically on the committed record, so a
  * card the settlement callback already recovered (or whose worker came
  * back) is returned untouched — exactly one recovery ever lands per card.
- * @returns how many cards this pass recovered (redispatched or blocked).
+ * @returns how many cards this pass recovered (continued, parked 待处理, or blocked).
  */
 async reconcileLostWorkers(): Promise<number>
+
+/**
+ * V6-1: one queue-drain pass over every board — the safety net that keeps a
+ * queued card from waiting forever when a member freed up without a card
+ * event firing in this process (another session closed a card, a restart
+ * landed, ...). FIFO order is preserved by {@link drainQueue}; a board with
+ * no queued card costs one map lookup.
+ * @returns how many queued cards this pass dispatched.
+ */
+async reconcileQueues(): Promise<number>
 
 /**
  * One reviewer-staleness reconciliation pass: every In testing card that
@@ -300,6 +322,36 @@ async reconcileMasterSeats(): Promise<number>
  * @returns the archived board.
  */
 @Remote('archiveBoard') async archiveBoardRemote(agent: Agent, request: ArchiveBoardRequest): Promise<BoardView>
+
+/**
+ * Change one role's roster headcount through the Remote boundary (V6-3).
+ * Raising the cap creates the members the extra slots need — numbered and
+ * immediately dispatchable. Lowering it is accepted only together with
+ * archiveMemberId: the user NAMES the member to archive, because the board
+ * must never pick a member by itself, and one step archives exactly one
+ * member. The archive is refused while that member holds a live card (In
+ * progress/running or In testing), so no member is ever archived with work in
+ * flight. Archiving keeps the record — number, partner, module 履历 and short
+ * summary all survive — and only removes the member from dispatch; use
+ * restoreMember to bring it back. The new headcount is stored on the board
+ * record, so it survives a restart.
+ * @param agent - the calling session agent; the board must be visible to it.
+ * @param request - the role, the new cap, and the member named on a lowering.
+ * @returns the board's fresh snapshot (members, caps and tickets).
+ */
+@Remote('setRosterCapacity') async setRosterCapacityRemote(agent: Agent, request: SetRosterCapacityRequest): Promise<BoardSnapshot>
+
+/**
+ * Restore one archived member through the Remote boundary (V6-3): the record
+ * comes back exactly as it was archived — same number, partner, module 履历
+ * and summary — and takes cards again. When the role's headcount is already
+ * full the restore raises it, because a restored member the cap would exclude
+ * forever would not be usable.
+ * @param agent - the calling session agent; the board must be visible to it.
+ * @param request - the board and the archived member to bring back.
+ * @returns the board's fresh snapshot (members, caps and tickets).
+ */
+@Remote('restoreMember') async restoreMemberRemote(agent: Agent, request: RestoreMemberRequest): Promise<BoardSnapshot>
 
 /**
  * Create one ticket in Backlog through the Remote boundary. The target

@@ -709,6 +709,8 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   RemoveTicketRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   RemoveTicketResult: 'taskboard removal receipt is owned by packages/taskboard/taskboard/src/types.ts',
   RequestReviewRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  SetRosterCapacityRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  RestoreMemberRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   CompleteTicketResult: 'taskboard completion receipt is owned by packages/taskboard/taskboard/src/service.ts',
   TicketRow: 'taskboard list row is owned by packages/taskboard/taskboard/src/service.ts',
   Priority: 'taskboard priority enum is owned by packages/taskboard/taskboard/src/types.ts',

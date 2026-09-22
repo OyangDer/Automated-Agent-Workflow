@@ -6,7 +6,8 @@
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
   BoardSnapshot, BoardView as HostBoardView, CreateTicketRequest, EditTicketRequest, MoveTicketRequest,
-  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, TicketView,
+  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, RestoreMemberRequest,
+  SetRosterCapacityRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { CompactionCeilingFace } from './compaction-threshold.ts'
 
@@ -89,6 +90,17 @@ export interface TaskboardInjected {
   createBoard(name: string, scope?: BoardScope): Promise<BoardView>
   /** Archive a board; archiving the active board switches to the default one. */
   archiveBoard(boardId: string): Promise<BoardView>
+  /**
+   * Change one role's roster headcount (V6-3). Raising it creates the new
+   * member; lowering it must name the member to archive, because the board
+   * never picks one itself. Returns the fresh board snapshot.
+   */
+  setRosterCapacity(request: SetRosterCapacityRequest): Promise<BoardSnapshot>
+  /**
+   * Restore one archived roster member (V6-3) — same number,履历 and summary,
+   * taking cards again. Returns the fresh board snapshot.
+   */
+  restoreMember(request: RestoreMemberRequest): Promise<BoardSnapshot>
   /** Live board state source; the renderer binds it into useBoard. */
   hooks: { board: HostObservable<BoardState> }
   /**
