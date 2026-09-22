@@ -402,7 +402,10 @@ const openRoots: string[] = []
 
 afterEach(async () => {
   vi.restoreAllMocks()
-  await Promise.all(openRoots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+  // Windows releases the storage handles a moment after the fiber is disposed,
+  // so a bare rmdir can lose the race with EPERM/EBUSY; the retry budget keeps
+  // the restart cases from flaking under a loaded parallel run.
+  await Promise.all(openRoots.splice(0).map(root => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })))
 })
 
 /** A throwaway unowned agent for ticket creation that does not care about the caller. */
@@ -4930,7 +4933,9 @@ describe('V6-4 development stages: one board per stage, switchable, read-only hi
     expect((await service.snapshot(devA, stage2.boardId)).tickets.map(ticket => ticket.id)).toEqual([onStage2.id])
     // The stage it succeeded keeps exactly what it had, and is now ended.
     const stage1 = (await service.listStages(devA)).find(stage => stage.boardId === 'default')!
-    expect(stage1).toMatchObject({ active: false, archivedAt: expect.any(Number), total: 1 })
+    expect(stage1.active).toBe(false)
+    expect(stage1.total).toBe(1)
+    expect(typeof stage1.archivedAt).toBe('number')
     expect(stage1.counts).toEqual({ backlog: 1, not_started: 0, in_progress: 0, in_testing: 0, done: 0 })
   })
 
@@ -4945,8 +4950,12 @@ describe('V6-4 development stages: one board per stage, switchable, read-only hi
       title: 'late card', description: 'd', priority: 'normal', dependsOn: [], boardId: 'default',
     })).rejects.toMatchObject({
       code: 'TASKBOARD_STAGE_ARCHIVED',
-      message: expect.stringContaining('switch back to that stage explicitly'),
     })
+    // The refusal names the way out, so a caller knows to switch back or
+    // start a new stage rather than hunt for a hidden bypass.
+    await expect(service.createAsMaster(devA, {
+      title: 'late card', description: 'd', priority: 'normal', dependsOn: [], boardId: 'default',
+    })).rejects.toThrow('switch back to that stage explicitly')
     await expect(service.moveAsMaster(devA, {
       ticketId: card.id, column: 'in_progress', beforeTicketId: null, afterTicketId: null,
     })).rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
@@ -4968,6 +4977,49 @@ describe('V6-4 development stages: one board per stage, switchable, read-only hi
     console.log('[V6-4] new stage current: ' + cardRow(await service.snapshot(devA, stage2.boardId)))
     console.log('[V6-4] ended stage:         ' + cardRow(ended))
     console.log('[V6-4] switched back:       ' + cardRow(back))
+  })
+
+  it('d) an ended stage keeps its cards intact: update, edit, delete and move are all refused', async () => {
+    const { service, devA, ctx } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'stage 1 card')
+    await service.createStageRemote(devA, {})
+    const before = await service.viewTicket(card.id)
+    // ① the first-class tool, exactly the path a master would take.
+    const probe = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-archived'),
+      name: 'taskboard_update',
+      arguments: { ticketId: card.id, title: 'PROBE REWRITTEN TITLE' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(probe.isError).toBe(true)
+    const probeText = (probe as { content: { type: string; text: string }[] }).content.map(block => block.text).join('\n')
+    expect(probeText).toContain('archived')
+    // ② the Remote card paths: edit, delete and the user's drag.
+    await expect(service.editRemote(devA, {
+      ticketId: card.id, title: 'PROBE REWRITTEN TITLE', description: 'probe', priority: 'normal', dependsOn: [],
+    })).rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+    await expect(service.removeRemote(devA, { ticketId: card.id }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+    await expect(service.moveRemote(devA, {
+      ticketId: card.id, column: 'in_progress', beforeTicketId: null, afterTicketId: null,
+    })).rejects.toMatchObject({ code: 'TASKBOARD_STAGE_ARCHIVED' })
+    // The card is byte for byte what it was: no title rewritten, no deletion,
+    // no history row recording a probe.
+    expect(await service.viewTicket(card.id)).toEqual(before)
+    expect((await service.snapshot(devA, 'default')).tickets.map(ticket => ticket.id)).toEqual([card.id])
+    // ③ the explicit switch back re-opens the stage, so the same edit lands.
+    await service.switchStageRemote(devA, { boardId: 'default' })
+    const reopened = await ctx.tools.execute({
+      callId: ToolCallId('tool-update-reactivated'),
+      name: 'taskboard_update',
+      arguments: { ticketId: card.id, title: 'stage 1 card, corrected' },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(reopened.isError).toBe(false)
+    expect((await service.viewTicket(card.id)).title).toBe('stage 1 card, corrected')
   })
 
   it('e) carries the roster, the headcount and the master seat into the new stage', async () => {

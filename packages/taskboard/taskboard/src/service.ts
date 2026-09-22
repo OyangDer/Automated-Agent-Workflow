@@ -3546,6 +3546,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
+    await this.assertStageWritable(current.boardId, 'moving a card on it')
     const sourceColumn = current.column
     const position = this.positionBetween(table, request.column, request.beforeTicketId, request.afterTicketId)
     // V6-1: a deliberate move is the user's (or master's) explicit state
@@ -4124,6 +4125,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
+    await this.assertStageWritable(current.boardId, 'editing a card on it')
     this.validateDependencies(table, request.ticketId, request.dependsOn, {
       boardId: current.boardId,
       crossStageReason: request.crossStageReason,
@@ -4161,6 +4163,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     const boardId = TaskboardService.boardContextOf(request.boardId, current)
+    await this.assertStageWritable(current.boardId, 'deleting a card from it')
     // The card is gone: its in-flight run handle is released with it (the
     // worker session itself keeps running, as removal always behaved).
     this.runHandles.delete(request.ticketId)
@@ -4189,6 +4192,7 @@ export class TaskboardService extends TypertRemoteService {
     }
     await this.assertBoardAccessible(current.boardId, agent)
     TaskboardService.boardContextOf(request.boardId, current)
+    await this.assertStageWritable(current.boardId, 'assigning a reviewer on it')
     if (current.column !== 'in_testing') {
       throw new TaskboardError('ticket "' + current.id + '" is not In testing', 'TASKBOARD_INVALID_TRANSITION')
     }
@@ -5526,6 +5530,10 @@ export class TaskboardService extends TypertRemoteService {
       }
       return this.updateOwn(agent, ticketId, edit.title, edit.description, edit.devNotes)
     }
+    // V6-4 B/D: this branch REWRITES card content, so it is refused on an ended
+    // stage exactly like every other master command. (The review probe that
+    // rewrote a title on an archived stage reached the card through here.)
+    await this.assertStageWritable(current.boardId, 'editing a card on it')
     return this.mutate(ticketId, 'edit', (ticket) => {
       const title = typeof edit.title === 'string' && edit.title.trim() !== '' ? edit.title.trim() : ticket.title
       const description = typeof edit.description === 'string' ? edit.description : ticket.description
@@ -5562,6 +5570,11 @@ export class TaskboardService extends TypertRemoteService {
     description: string | undefined,
     devNotes: string | undefined,
   ): Promise<TicketView> {
+    // V6-4 B/D: an edit is an edit — a card on an ended stage keeps its content
+    // byte for byte. The terminal workflow steps (report/fail/complete/verdict)
+    // stay available because they are how already-dispatched work lands.
+    const known = (await this.tickets()).get(ticketId)
+    if (known !== undefined) await this.assertStageWritable(known.boardId, 'editing a card on it')
     return this.mutate(ticketId, 'edit', (current) => {
       if (current.assignee === null || current.assignee.agentId !== agent.id) {
         throw new TaskboardError('only the assignee may update the ticket', 'TASKBOARD_NOT_OWNER')
