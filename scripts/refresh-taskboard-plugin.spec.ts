@@ -9,11 +9,14 @@ import {
   DEFAULT_PROFILE,
   ledgerHash,
   locateCandidate,
+  locatePnpmOnPath,
   parseSums,
   performRollback,
   readProfileManifest,
+  resolveInstallInvocation,
   runRefresh,
   verifyArtifacts,
+  type PackageManagerInvocation,
   type RefreshIo,
   type RefreshOptions,
 } from './refresh-taskboard-plugin.ts'
@@ -146,12 +149,28 @@ function seedProfile(root: string, mode: 'installed' | 'linked'): ProfileFixture
   return { home, profileDir, before: readFileSync(join(profileDir, 'package.json'), 'utf8') }
 }
 
+/** The command line an invocation will actually run, for assertions. */
+function invocationLine(invocation: PackageManagerInvocation): string {
+  return invocation.command + ' ' + invocation.args.join(' ')
+}
+
+/** The stub install the fake surface resolves unless a test says otherwise. */
+const STUB_INVOCATION: PackageManagerInvocation = {
+  command: 'pnpm',
+  args: ['install'],
+  shell: false,
+  display: 'pnpm install',
+  origin: 'test stub',
+}
+
 /** A RefreshIo that records everything and never touches the network. */
 interface FakeIo extends RefreshIo {
   /** Every line the run logged. */
   lines: string[]
   /** Every profile directory an install ran in. */
   installCalls: string[]
+  /** Every invocation an install was handed. */
+  installInvocations: PackageManagerInvocation[]
   /** Every build output directory requested. */
   buildCalls: string[]
 }
@@ -159,24 +178,30 @@ interface FakeIo extends RefreshIo {
 function fakeIo(options: {
   confirm?: boolean
   installStatus?: number
+  invocation?: PackageManagerInvocation
   onInstall?: (profileDir: string) => void
   onBuild?: (out: string) => void
 } = {}): FakeIo {
   const lines: string[] = []
   const installCalls: string[] = []
+  const installInvocations: PackageManagerInvocation[] = []
   const buildCalls: string[] = []
+  const invocation = options.invocation ?? STUB_INVOCATION
   return {
     lines,
     installCalls,
+    installInvocations,
     buildCalls,
     log: (line) => {
       lines.push(line)
     },
     confirm: async () => options.confirm !== false,
-    install: (profileDir) => {
+    resolveInstall: () => invocation,
+    install: (profileDir, resolved) => {
       installCalls.push(profileDir)
+      installInvocations.push(resolved)
       options.onInstall?.(profileDir)
-      return { status: options.installStatus ?? 0, output: 'ok' }
+      return { status: options.installStatus ?? 0, command: resolved.display, output: 'ok' }
     },
     build: (out) => {
       buildCalls.push(out)
@@ -246,6 +271,103 @@ describe('artifact ledger', () => {
     writePackage(packageDir, { name: HOST, version: VERSION }, 'taskboard')
     expect(() => locateCandidate(packageDir)).toThrow(/holds no \.tgz artifact/)
     expect(() => locateCandidate(join(root, 'missing'))).toThrow(/is not a directory/)
+  })
+})
+
+describe('package manager resolution', () => {
+  it('uses npm_execpath only when it is pnpm', () => {
+    const invocation = resolveInstallInvocation(
+      { npm_execpath: 'C:/pnpm/pnpm.cjs', npm_config_user_agent: 'pnpm/12.4.2 npm/? node/v24 win32 x64' },
+      () => undefined,
+    )
+    expect(invocation.command).toBe(process.execPath)
+    expect(invocation.args).toEqual(['C:/pnpm/pnpm.cjs', 'install'])
+    expect(invocation.display).toBe('pnpm install')
+    expect(invocation.origin).toContain('pnpm lifecycle')
+  })
+
+  it('never runs npm when npm started the script', () => {
+    const located = join('C:', 'tools', 'pnpm.cmd')
+    const invocation = resolveInstallInvocation(
+      { npm_execpath: 'C:/node/npm-cli.js', npm_config_user_agent: 'npm/10.9.0 node/v24 win32 x64' },
+      () => located,
+    )
+    expect(invocationLine(invocation)).toContain(located)
+    expect(invocationLine(invocation)).not.toContain('npm-cli.js')
+    expect(invocation.display).toBe('pnpm install')
+    expect(invocation.origin).toContain('is not pnpm and is not used')
+  })
+
+  it('ignores a contradictory user agent that claims pnpm over an npm execpath', () => {
+    const invocation = resolveInstallInvocation(
+      { npm_execpath: 'C:/node/npm-cli.js', npm_config_user_agent: 'pnpm/12.0.0 node/v24' },
+      () => 'pnpm',
+    )
+    expect(invocationLine(invocation)).toContain('pnpm')
+    expect(invocationLine(invocation)).not.toContain('npm-cli.js')
+  })
+
+  it('folds a Windows .cmd shim into one shell command line', () => {
+    const located = join('C:', 'tools', 'pnpm.cmd')
+    const invocation = resolveInstallInvocation({ npm_execpath: 'C:/node/npm-cli.js' }, () => located)
+    if (process.platform === 'win32') {
+      expect(invocation.shell).toBe(true)
+      expect(invocation.args).toEqual([])
+      expect(invocation.command).toContain(located)
+      expect(invocation.command).toContain('install')
+      return
+    }
+    expect(invocation.shell).toBe(false)
+    expect(invocation.args).toEqual(['install'])
+  })
+
+  it('refuses with an actionable message instead of installing with npm', () => {
+    const refuse = (): PackageManagerInvocation =>
+      resolveInstallInvocation({ npm_execpath: 'C:/node/npm-cli.js' }, () => undefined)
+    expect(refuse).toThrow(/cannot find pnpm on PATH/)
+    expect(refuse).toThrow(/does not implement the link: protocol/)
+    expect(refuse).toThrow(/npm_execpath points at C:\/node\/npm-cli\.js/)
+  })
+
+  it('locates pnpm on PATH and reports none when PATH carries no pnpm', () => {
+    const root = fixture('dsh-refresh-pnpm-')
+    writeText(join(root, 'pnpm.cmd'), '@echo off' + String.fromCharCode(10))
+    expect(locatePnpmOnPath({ PATH: root }, 'win32')).toBe(join(root, 'pnpm.cmd'))
+    expect(locatePnpmOnPath({ PATH: join(root, 'empty') }, 'win32')).toBeUndefined()
+    expect(locatePnpmOnPath({ PATH: root }, 'linux')).toBeUndefined()
+  })
+
+  it('logs the resolved command rather than a hardcoded pnpm line', async () => {
+    const root = fixture('dsh-refresh-log-')
+    const { candidate } = readyCandidate(root)
+    const profile = seedProfile(root, 'installed')
+    const invocation: PackageManagerInvocation = {
+      command: 'C:/tools/pnpm.cmd',
+      args: ['install'],
+      shell: true,
+      display: 'pnpm install (C:/tools/pnpm.cmd)',
+      origin: 'resolved for the test',
+    }
+    const io = fakeIo({ invocation })
+    expect(await runRefresh(options(profile.home, candidate, { apply: true }), io)).toBe(0)
+    expect(io.installInvocations).toEqual([invocation])
+    expect(io.lines.some(line => line.includes('install: running pnpm install (C:/tools/pnpm.cmd)'))).toBe(true)
+    expect(io.lines.some(line => line === 'install: pnpm install (C:/tools/pnpm.cmd) succeeded')).toBe(true)
+  })
+
+  it('refuses before any write when no pnpm can be resolved', async () => {
+    const root = fixture('dsh-refresh-nopnpm-')
+    const { candidate } = readyCandidate(root)
+    const profile = seedProfile(root, 'installed')
+    const io = fakeIo()
+    io.resolveInstall = () => {
+      throw new Error('cannot find pnpm on PATH; npm does not implement the link: protocol')
+    }
+    await expect(runRefresh(options(profile.home, candidate, { apply: true }), io)).rejects.toThrow(/cannot find pnpm/)
+    expect(readFileSync(join(profile.profileDir, 'package.json'), 'utf8')).toBe(profile.before)
+    expect(existsSync(join(profile.home, 'artifacts'))).toBe(false)
+    expect(existsSync(join(profile.home, 'backups'))).toBe(false)
+    expect(io.installCalls).toEqual([])
   })
 })
 

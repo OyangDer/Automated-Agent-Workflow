@@ -44,7 +44,12 @@ dependencies its manifest declares. `scripts/refresh-taskboard-plugin.ts` instal
    other dependency, bundle layer, and field is preserved; `dsh.profile.bundles` is
    never edited, because this deployment mounts the two packages through its own
    `cordis.patch.yml` and adding them to the bundle list would mount each twice.
-6. Runs `pnpm install` in the profile directory.
+6. Runs `pnpm install` in the profile directory. The package manager is resolved
+   explicitly: an `npm_execpath` that names npm — or names anything other than pnpm —
+   is ignored and pnpm is located on PATH instead, and a refresh **refuses before
+   writing anything** when no pnpm exists. npm rejects the `link:` protocol this
+   deployment's profile declares (`EUNSUPPORTEDPROTOCOL`), so degrading to npm would fail on
+   the real profile while the log claimed pnpm.
 7. Resolves each installed plugin's runtime dependency closure from the profile
    (`zod`, `@deepseek-ai/schemastery`, `clsx`, ...). A missing, unreadable, or
    wrong-version dependency **refuses the switch and restores the profile files from
@@ -86,4 +91,6 @@ The spec covers the ledger (including the two-README.md collision that a basenam
 would miss), a tampered artifact, the `link:`-shaped candidate refusal, the dry-run and
 abort gates, the full apply, the missing-dependency refusal and rollback, the
 archive-overwrite refusal, the build path, and a rollback pack whose file must be
-deleted because it did not exist before the switch.
+deleted because it did not exist before the switch. It also pins the package-manager
+resolution: an `npm_execpath` naming npm must yield pnpm (never npm), a contradictory
+user agent cannot force npm, and a machine with no pnpm refuses before any write.

@@ -36,7 +36,10 @@
  *    script never edits dsh.profile.bundles: this deployment mounts the two
  *    packages through the profile's cordis.patch.yml, and adding them to the
  *    bundle list as well would mount each one twice.
- * 6. Run pnpm install in the profile directory.
+ * 6. Run pnpm install in the profile directory. The package manager is
+ *    resolved explicitly: an `npm_execpath` that names npm (or names anything
+ *    other than pnpm) is ignored and pnpm is located on PATH, and when no pnpm
+ *    exists the refresh refuses before writing instead of silently running npm.
  * 7. Resolve every installed plugin's runtime dependency closure from the
  *    profile. A missing or unreadable dependency refuses the switch and
  *    restores the profile files from step 4 (then reinstalls), so a broken
@@ -75,7 +78,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, resolve, sep } from 'node:path'
+import { basename, delimiter, dirname, join, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -440,14 +443,32 @@ export interface RefreshPlan {
   restartCommand: string
   /** Temporary build directory to clean up afterwards, when --build ran. */
   buildDir: string | undefined
+  /** The install command resolved for this machine. */
+  installInvocation: PackageManagerInvocation
 }
 
 /** Result of one child-process invocation. */
 export interface CommandResult {
   /** Process exit status. */
   status: number
+  /** The command line that actually ran, exactly as the log reports it. */
+  command: string
   /** Combined standard output and standard error. */
   output: string
+}
+
+/** The package-manager invocation a refresh decided to run. */
+export interface PackageManagerInvocation {
+  /** Executable to spawn. */
+  command: string
+  /** Arguments for that executable. */
+  args: string[]
+  /** Whether the spawn needs a shell (a Windows .cmd/.bat shim). */
+  shell: boolean
+  /** The command line a human reads in the log, e.g. `pnpm install`. */
+  display: string
+  /** Why this invocation was chosen, including any ignored execpath. */
+  origin: string
 }
 
 /** Everything a refresh does outside its own file work; injected so specs stay hermetic. */
@@ -456,8 +477,10 @@ export interface RefreshIo {
   log(line: string): void
   /** Ask the operator to confirm a write; resolves false to abort. */
   confirm(question: string): Promise<boolean>
-  /** Run pnpm install in a profile directory. */
-  install(profileDir: string): CommandResult
+  /** Resolve the install command for this machine; refuses instead of degrading to npm. */
+  resolveInstall(): PackageManagerInvocation
+  /** Run the resolved install in a profile directory. */
+  install(profileDir: string, invocation: PackageManagerInvocation): CommandResult
   /** Emit a fresh standalone tree into out. */
   build(out: string, noBuild: boolean): void
   /** The current checkout's short commit sha. */
@@ -566,6 +589,10 @@ export function buildPlan(options: RefreshOptions, io: RefreshIo): RefreshPlan {
       'no profile at ' + profileDir + '; run dsh plugin --profile ' + options.profile + ' add once to initialize it',
     )
   }
+  // Resolve the installer before anything is built or written: an
+  // unresolvable (or npm-only) package manager must refuse here, not after the
+  // profile has been rewritten.
+  const installInvocation = io.resolveInstall()
   const buildDir = options.candidate === undefined ? emitCandidate(io, options) : undefined
   const candidate = locateCandidate(options.candidate ?? buildDir ?? '')
   const artifacts = verifyArtifacts(candidate.tarballs, readFileSync(candidate.sumsPath, 'utf8'))
@@ -606,6 +633,7 @@ export function buildPlan(options: RefreshOptions, io: RefreshIo): RefreshPlan {
     manifest,
     restartCommand: 'dsh --profile ' + options.profile,
     buildDir,
+    installInvocation,
   }
 }
 
@@ -639,7 +667,8 @@ export function formatPlan(plan: RefreshPlan, options: RefreshOptions): string {
   }
   lines.push(
     '  bundle layers  : unchanged — ' + mountNote(plan),
-    '  install        : pnpm install in ' + plan.profileDir,
+    '  install        : ' + plan.installInvocation.display + ' in ' + plan.profileDir,
+    '                   ' + plan.installInvocation.origin,
     '  self-check     : runtime dependency closure of ' + String(plan.artifacts.length) + ' plugin(s)',
     '  restart        : ' + plan.restartCommand + '   (a running host keeps the old code until it restarts)',
     '  on failure     : restore the rollback pack above and re-run pnpm install',
@@ -976,9 +1005,19 @@ export function performRollback(dir: string, io: RefreshIo): number {
       io.log('rollback: removed ' + target + ' (absent before the switch)')
     }
   }
-  const installed = io.install(pack.profileDir)
+  let invocation: PackageManagerInvocation
+  try {
+    invocation = io.resolveInstall()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    io.log('rollback: ' + message)
+    io.log('rollback: profile files restored, but the reinstall needs pnpm; follow ' + join(pack.dir, 'ROLLBACK.md'))
+    return 1
+  }
+  io.log('rollback: running ' + invocation.display + '  [' + invocation.origin + ']')
+  const installed = io.install(pack.profileDir, invocation)
   if (installed.status !== 0) {
-    io.log('rollback: pnpm install exited ' + String(installed.status) + '; finish by hand per ' + join(pack.dir, 'ROLLBACK.md'))
+    io.log('rollback: ' + installed.command + ' exited ' + String(installed.status) + '; finish by hand per ' + join(pack.dir, 'ROLLBACK.md'))
     io.log(installed.output.trim())
     return 1
   }
@@ -1034,14 +1073,15 @@ export async function runRefresh(options: RefreshOptions, io: RefreshIo): Promis
     if (options.faultSkipInstall) {
       io.log('fault-injection (drill only): --fault-skip-install skipped the install, so the new closure is absent')
     } else {
-      const installed = io.install(plan.profileDir)
+      io.log('install: running ' + plan.installInvocation.display + '  [' + plan.installInvocation.origin + ']')
+      const installed = io.install(plan.profileDir, plan.installInvocation)
       if (installed.status !== 0) {
-        io.log('install: pnpm install exited ' + String(installed.status))
+        io.log('install: ' + installed.command + ' exited ' + String(installed.status))
         io.log(installed.output.trim())
         io.log('REFUSED: the install failed; rolling back to the pack taken before the switch')
         return refuseWithRollback(plan.backupDir, io)
       }
-      io.log('install: pnpm install succeeded')
+      io.log('install: ' + installed.command + ' succeeded')
     }
     const closure = runtimeClosure(
       plan.profileDir,
@@ -1063,28 +1103,111 @@ export async function runRefresh(options: RefreshOptions, io: RefreshIo): Promis
 }
 
 /**
- * Run pnpm install in a profile directory.
+ * Fold an executable and its arguments into one shell command line. A Windows
+ * `.cmd` shim needs a shell, and Node warns (DEP0190) about unescaped arguments
+ * passed beside `shell: true`, so the shim is quoted and carries the arguments.
+ * @param executable - the shim to run.
+ * @param args - its arguments.
+ * @returns the quoted command line.
+ */
+function shellLine(executable: string, args: readonly string[]): string {
+  return ['"' + executable + '"', ...args].join(' ')
+}
+
+/**
+ * Find pnpm on PATH without spawning anything.
+ * @param env - the environment whose PATH is searched.
+ * @param platform - the platform whose executable names are probed.
+ * @returns the absolute pnpm executable, or undefined when PATH carries none.
+ */
+export function locatePnpmOnPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const pathValue = env.PATH ?? env.Path ?? ''
+  const names = platform === 'win32' ? ['pnpm.cmd', 'pnpm.exe', 'pnpm.bat', 'pnpm'] : ['pnpm']
+  for (const entry of pathValue.split(delimiter)) {
+    const directory = entry.trim().replace(/^"|"$/gu, '')
+    if (directory === '') continue
+    for (const name of names) {
+      const candidate = join(directory, name)
+      if (existsSync(candidate) && statSync(candidate).isFile()) return candidate
+    }
+  }
+  return undefined
+}
+
+/**
+ * Resolve the install command for a profile, and never let npm stand in for pnpm.
+ *
+ * `npm_execpath` is set by npm as well as pnpm, so it is trusted only when it
+ * cannot be npm: its basename must not start with `npm`, and either that
+ * basename mentions pnpm or `npm_config_user_agent` starts with `pnpm/`. An
+ * npm-provided execpath is never used: npm rejects the `link:` protocol the real
+ * profile declares (EUNSUPPORTEDPROTOCOL), so degrading to npm would fail on the
+ * user's profile while the log claimed pnpm. When no pnpm can be found the
+ * refresh refuses with this message instead of installing with npm.
+ * @param env - the lifecycle environment to read.
+ * @param locate - how pnpm is located on PATH.
+ * @returns the invocation to run.
+ */
+export function resolveInstallInvocation(
+  env: NodeJS.ProcessEnv = process.env,
+  locate: (env: NodeJS.ProcessEnv) => string | undefined = locatePnpmOnPath,
+): PackageManagerInvocation {
+  const entrypoint = env.npm_execpath
+  const userAgent = env.npm_config_user_agent ?? ''
+  const entrypointName = entrypoint === undefined || entrypoint === '' ? '' : basename(entrypoint).toLowerCase()
+  const npmEntrypoint = entrypointName.startsWith('npm')
+  const pnpmLifecycle = entrypointName !== '' && !npmEntrypoint
+    && (entrypointName.includes('pnpm') || userAgent.startsWith('pnpm/'))
+  if (pnpmLifecycle && entrypoint !== undefined) {
+    const origin = 'npm_execpath from a pnpm lifecycle (' + entrypoint + ')'
+    if (/\.[cm]?js$/iu.test(entrypoint)) {
+      return { command: process.execPath, args: [entrypoint, 'install'], shell: false, display: 'pnpm install', origin }
+    }
+    // A .cmd shim takes the whole line, so no argument sits beside a shell.
+    return { command: shellLine(entrypoint, ['install']), args: [], shell: true, display: 'pnpm install', origin }
+  }
+  const found = locate(env)
+  if (found === undefined) {
+    const startedByNpm = entrypointName === ''
+      ? ''
+      : '; npm_execpath points at ' + String(entrypoint) + ', so npm started this script'
+    throw new Error(
+      'cannot find pnpm on PATH' + startedByNpm + '. npm does not implement the link: protocol this profile'
+      + ' declares (EUNSUPPORTEDPROTOCOL), so the refresh refuses instead of installing with npm: install pnpm,'
+      + ' or start the refresh through pnpm (pnpm exec tsx scripts/refresh-taskboard-plugin.ts ...)',
+    )
+  }
+  const ignored = npmEntrypoint
+    ? '; npm_execpath (' + String(entrypoint) + ') is not pnpm and is not used'
+    : ''
+  const origin = 'pnpm on PATH at ' + found + ignored
+  if (process.platform === 'win32' && /\.(cmd|bat)$/iu.test(found)) {
+    // A .cmd shim takes the whole line, so no argument sits beside a shell.
+    return { command: shellLine(found, ['install']), args: [], shell: true, display: 'pnpm install', origin }
+  }
+  return { command: found, args: ['install'], shell: false, display: 'pnpm install', origin }
+}
+
+/**
+ * Run the resolved profile install.
  * @param profileDir - the absolute profile directory.
+ * @param invocation - the invocation resolved before the switch started.
  * @returns the combined result.
  */
-export function runProfileInstall(profileDir: string): CommandResult {
-  const entrypoint = process.env.npm_execpath
-  const launchedByPnpm = entrypoint !== undefined && entrypoint !== ''
-  // A Windows pnpm is a .cmd shim and needs a shell; the whole command goes in
-  // as one string so Node does not warn about unescaped arguments beside it.
-  const needsShell = !launchedByPnpm && process.platform === 'win32'
-  const command = launchedByPnpm ? process.execPath : needsShell ? 'pnpm install' : 'pnpm'
-  const args = launchedByPnpm ? [entrypoint, 'install'] : needsShell ? [] : ['install']
+export function runProfileInstall(profileDir: string, invocation: PackageManagerInvocation): CommandResult {
   // An interactive purge confirmation would block an unattended refresh; the
   // rollback pack is the recovery path for a purge that turns out to be wrong.
-  const result = spawnSync(command, args, {
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: profileDir,
     encoding: 'utf8',
-    shell: needsShell,
+    shell: invocation.shell,
     env: { ...process.env, npm_config_confirm_modules_purge: 'false' },
   })
   if (result.error !== undefined) throw result.error
-  return { status: result.status ?? 1, output: result.stdout + result.stderr }
+  return { status: result.status ?? 1, command: invocation.display, output: result.stdout + result.stderr }
 }
 
 /**
@@ -1146,6 +1269,7 @@ export function defaultIo(): RefreshIo {
         readline.close()
       }
     },
+    resolveInstall: () => resolveInstallInvocation(),
     install: runProfileInstall,
     build: buildStandalone,
     gitSha: currentGitSha,
@@ -1180,6 +1304,10 @@ Why link: is refused
   file:<artifact>.tgz is the supported form: pnpm installs the tarball's
   declared dependencies with it, and this script re-checks the resulting
   runtime closure before it reports success.
+
+The install always runs pnpm: an npm-provided npm_execpath is ignored (npm
+rejects the link: protocol this deployment's profile declares), pnpm is
+resolved from PATH instead, and a refresh refuses when no pnpm can be found.
 
 Sequence
   build -> verify sha256 against SHA256SUMS -> archive into a new
