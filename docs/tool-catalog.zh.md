@@ -33,7 +33,7 @@
 | `@deepseek-ai/dsh-tool-fs-search` | `glob`、`grep` | `ctx.tools`、`ctx.subprocess`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | glob 和 grep 是无条件可用的发现工具，通过 ctx.subprocess spawn 随包提供的 ripgrep 二进制文件（`@vscode/ripgrep`），并作为普通前台调用运行，绝不作为后台任务；无需在宿主机安装 `rg`，也不经过 shell 层。本目录使用 `sampleOverCapGlobResults: true`；部署必须显式选择该行为。结果超过上限时，会通过可选的 ctx.spillStore 后端保存完整的格式化列表；在共置部署中，如果后端公开本地路径，返回的定位信息可供后续读取／搜索。 |
 | `@deepseek-ai/dsh-tool-terminal` | `terminal_close`、`terminal_list`、`terminal_open`、`terminal_read`、`terminal_send`、`terminal_signal` | `ctx.tools`、`ctx.terminals`、`ctx.systemPrompt`、`ctx.jobs at call time for run_in_background` | `tool/call`、`tool/result` | - | 这 6 个终端工具需要选择启用，用于补充一次性 bash／文件系统工具。`terminal_send(run_in_background: true)` 会注册到 `ctx.jobs`；schema 不包含 TUI、具名按键序列、BEL、调整尺寸、自动启动和跨 agent 共享。 |
 | `@deepseek-ai/dsh-tool-goal` | `create_goal`、`get_goal`、`update_goal` | `ctx.tools`、`ctx.agents`、`ctx.goals`、`ctx.systemPrompt`、`a calling Agent in an authorized open turn` | `tool/call`、`goal/change for mutations`、`tool/result` | - | create、edit、pause 和 resume 要求直接来自人类的根权限；complete 和 blocked 也接受确切的当前 Goal Round。blocked 的默认下限是 3 个获准的 Round。 |
-| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_roster`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
+| `@deepseek-ai/dsh-taskboard` | `taskboard_approve`, `taskboard_assign`, `taskboard_board_config`, `taskboard_claim`, `taskboard_claim_master`, `taskboard_claim_review`, `taskboard_complete`, `taskboard_create`, `taskboard_fail`, `taskboard_handover`, `taskboard_list`, `taskboard_migrate`, `taskboard_move`, `taskboard_notices`, `taskboard_pause`, `taskboard_plan`, `taskboard_reassign`, `taskboard_reject`, `taskboard_release_master`, `taskboard_report`, `taskboard_resolve_review`, `taskboard_review_verdict`, `taskboard_roster`, `taskboard_stage_list`, `taskboard_stage_new`, `taskboard_stage_switch`, `taskboard_update`, `taskboard_view` | `ctx.tools`, `ctx.storageDomain`, `ctx.systemPrompt`, `ctx.agents`, `a calling Agent for claim/complete/review tools` | `taskboard/changed`, `storage-domain ticket records` | - | The twenty-eight taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates. |
 | `@deepseek-ai/dsh-schedule` | `schedule_create`、`schedule_delete`、`schedule_list` | `ctx.tools`、`ctx.sessions`、Session 持久化、未来创建的 live 根 Agent | `tool/call`、`schedule/change create or delete`、`tool/result` | - | 仅在选择启用的 Schedule 插件加载后创建的 live 根 Agent scope 内注册。版本 1 接受 after_seconds、显式绝对 at 和有界固定速率 every_seconds，并披露 session-local 交付；管理读取与变更必须通过共享的 Session 持久化 barrier。 |
 | `@deepseek-ai/dsh-tool-lsp` | `lsp` | `ctx.tools`、`ctx.lsp`、`ctx.systemPrompt` | `tool/call`、`tool/result` | - | lsp 工具将提供方选择和语言服务器子进程置于 ctx.lsp 之后，因此其模型可见 schema 在更换提供方时保持稳定。运行时要求已注册提供方，例如 `@deepseek-ai/dsh-lsp-stdio`；如果没有提供方，查询会返回结构化 `LSP_UNAVAILABLE` 错误，而不会改变 schema。 |
 | `@deepseek-ai/dsh-tool-ralph` | `ralph` | `ctx.tools`、`ctx.workflowEngine`、`ctx.subagents`、`ctx.systemPrompt`、`a calling Agent (exec.agent parents every fresh round)` | `tool/call`、`tool/result`、`workflow and child session events during execution` | - | 固定的前台工作流会在每个 Round 启动一个全新的结构化子级；模型只能选择不可变目标和可选的 Round 上限。 |
@@ -1332,7 +1332,7 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
   "properties": {
     "boardId": {
       "type": "string",
-      "description": "The board to create the ticket on. Omit for the default board."
+      "description": "The stage (board) to create the ticket on. Omit for the CURRENT stage."
     },
     "title": {
       "type": "string",
@@ -1376,6 +1376,10 @@ Create a taskboard ticket on a board's Backlog (master only): the plan you agree
     "filesScope": {
       "type": "string",
       "description": "Declared file scope: the ABSOLUTE paths (files or directories, e.g. \"C:/repo/packages/x/src\") this card affects. The master uses it when dispatching to judge parallel safety and soft dependencies between cards; it also locates the card's repo, so a scope written only as relative paths makes the dispatch fall back to the master cwd (V3-33)."
+    },
+    "crossStageReason": {
+      "type": "string",
+      "description": "V6-4 C: only for a dependsOn entry that lives on ANOTHER stage. Dependencies default to the same stage; declaring one across stages is refused unless this reason is given, and the reason is recorded on the card."
     }
   },
   "required": [
@@ -1461,8 +1465,41 @@ List taskboard tickets. Tickets come back sorted by implementation order (positi
         "compact",
         "full"
       ]
+    },
+    "boardId": {
+      "type": "string",
+      "description": "The stage (board) to read. Omit for the CURRENT stage: reads never span stages unless one is named explicitly."
     }
   }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_migrate`
+
+把一批显式指定的看板卡片迁移到另一个阶段（V6-4 G/H，仅 master 可调用）。卡片保留其所在列（包括 Done）、描述、devNotes、审核结果、历史、依赖以及 worker／reviewer 身份；回执会逐一列出被迁移的每张卡片和目标阶段——绝不会有隐式迁移。依赖不得被留在其他阶段（V6-4 C），已归档的阶段拒绝接收卡片。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "ticketIds": {
+      "type": "array",
+      "description": "The cards to migrate, by ticket id.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "targetBoardId": {
+      "type": "string",
+      "description": "The stage receiving the cards (see taskboard_stage_list)."
+    }
+  },
+  "required": [
+    "ticketIds",
+    "targetBoardId"
+  ]
 }
 ```
 
@@ -1802,6 +1839,58 @@ Read one board's fixed roster (V6-1): every member's id, role, fixed partner, de
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
+### `taskboard_stage_list`
+
+列出开发阶段（V6-4）：一个阶段 = 一个看板，按由旧到新排列。每一行给出阶段名称、其从 1 开始的序号、是否为**当前**阶段（`taskboard_list` 及一切默认写入所解析到的阶段）、是否为拒绝命令的已结束（已归档）阶段，以及该阶段的卡片统计。读取绝不跨阶段：要用 boardId 指定阶段才能读取另一个阶段。
+
+```json
+{
+  "type": "object",
+  "properties": {}
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_stage_new`
+
+开启下一个开发阶段（V6-4，仅 master 可调用）：一个全新的**空**看板成为当前阶段，而被它接替的阶段随之归档——仍可完整读取，但不再接受命令。团队会一并带过去（roster 成员及其历史、编制人数、模型配置与 master 席位），因此无需重新创建任何人。先调用 `taskboard_stage_list` 查看当前阶段的进展。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Stage display name. Omit for \"阶段 <n>\"."
+    }
+  }
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
+### `taskboard_stage_switch`
+
+将某个开发阶段设为当前阶段（V6-4，仅 master 可调用）：此后所有读取和默认写入都解析到该阶段；切回已结束的阶段会看到它结束时的全部卡片、Done 列和历史。切到**已归档**阶段会将其重新激活——正是这次显式切回才使阶段重新接受编辑。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "boardId": {
+      "type": "string",
+      "description": "The stage to make current (see taskboard_stage_list)."
+    }
+  },
+  "required": [
+    "boardId"
+  ]
+}
+```
+
+Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
+
 ### `taskboard_update`
 
 Update a taskboard ticket. An assignee edits its own card (title, description, devNotes); the master of the card's board may additionally correct planning metadata on ANY card of that board — title, description, filesScope and devNotes — including cards already dispatched to someone else, so a planning typo in a frozen filesScope is fixable in place (V3-40). Omitted fields stay unchanged. Every master correction appends one history row naming the master and each changed field's old -> new summary; a correction that changes nothing is recorded too, never silently. Worker-side ownership is unchanged: an agent that is neither the assignee nor the board master is refused with TASKBOARD_NOT_OWNER, and only the master may change filesScope (a non-master, including the assignee, gets TASKBOARD_NOT_MASTER).
@@ -1860,7 +1949,7 @@ Read one full taskboard ticket: description, assignee, review state, rejection f
 
 Source: [`packages/taskboard/taskboard/src/service.ts`](../packages/taskboard/taskboard/src/service.ts)
 
-The twenty-four taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.
+The twenty-eight taskboard tools drive the five-column workflow: list/view, dependency-gated claim, master-seat claim/release/handover with structured notes, dispatch (assign) with a top-level-session guard, pause, per-board worker/reviewer model+effort config (taskboard_board_config), report/fail with master-inbox notices, complete into In testing with automatic reviewer spawning, the review-seat fallback claim, approve, reject with rework feedback, the reviewer in-band verdict report (taskboard_review_verdict) that a continuable report-mode reviewer uses instead of structured output, resolve-review, and own-ticket updates.
 
 <a id="deepseek-aidsh-schedule"></a>
 
