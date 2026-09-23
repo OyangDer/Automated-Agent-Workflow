@@ -9,7 +9,7 @@
 // restart, nothing is released inside the staleness window, the pass then
 // releases it as *stale* (the record kept the seat, the clock freed it), and
 // taskboard_claim_review takes it afterwards.
-import { mkdirSync, symlinkSync } from 'node:fs'
+import { mkdirSync, readdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -139,6 +139,21 @@ describe('web e2e: Taskboard review seat', () => {
     const host = scaffold.ctx as unknown as { taskboard: TaskboardHostPort }
     const claimer = seatedBy
     if (claimer === undefined) throw new Error('boot 1 recorded no seating session')
+    // Diagnostic: is the reviewer's durable record visible to the exact seam the
+    // taskboard judges with, before any assertion consumes it?
+    const seam = scaffold.ctx.get('sessionPersistence') as {
+      stat?: (id: never) => Promise<unknown>
+      inspect?: (id: never) => Promise<{ events: readonly unknown[] }>
+    } | undefined
+    const record = seam?.stat === undefined ? undefined : await seam.stat(reviewerAgentId as never)
+    const inspection = seam?.inspect === undefined
+      ? 'no inspect seam'
+      : await seam.inspect(reviewerAgentId as never)
+        .then(value => 'events=' + String(value.events.length), (error: unknown) => 'error=' + String(error))
+    console.log('[v612 diag] stat=' + String(record !== undefined) + ' ' + inspection)
+    const sessionFiles = readdirSync(SESSIONS)
+    console.log('[v612 diag] record=' + String(record !== undefined) + ' rootFiles=' + String(sessionFiles.length)
+      + ' sample=' + sessionFiles.slice(0, 3).join(',') + ' reviewer=' + reviewerAgentId)
     // The restart shape: the holder's process is gone, its stored record is not.
     expect(scaffold.ctx.agents.get(reviewerAgentId as never)).toBeUndefined()
     const survived = await host.taskboard.viewTicket(ticketId)

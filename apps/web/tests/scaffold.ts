@@ -900,7 +900,9 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
       }
       try {
         stopObservingSessions()
-        failures.push(...await cleanupScaffoldWorld(ctx, workspaceCwd, persistenceRoot))
+        failures.push(...await cleanupScaffoldWorld(
+          ctx, workspaceCwd, persistenceRoot, options.persistenceRoot !== undefined,
+        ))
       } finally {
         restoreCredentialEnvironment()
         restoreSkillRootEnvironment()
