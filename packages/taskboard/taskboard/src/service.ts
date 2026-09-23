@@ -273,7 +273,7 @@ interface SessionInspectionLike {
 /** The read face of one stored session, as `open` hands it out. */
 interface SessionHandleLike {
   readonly header: { readonly createdAt: number }
-  read(): Promise<{ readonly events: readonly { readonly time: number }[] }>
+  read(offset?: number, length?: number): Promise<{ readonly events: readonly { readonly time: number }[] }>
   [Symbol.asyncDispose](): Promise<void>
 }
 
@@ -2944,7 +2944,15 @@ export class TaskboardService extends TypertRemoteService {
     try {
       const handle = await persistence.open(sessionId as SessionId, 'read')
       try {
-        const { events } = await handle.read()
+        // Tail only: `stat`'s event count locates the last event when the seam
+        // offers one, so a long log is never read in full to find its end.
+        const snapshot = typeof persistence.stat === 'function'
+          ? await persistence.stat(sessionId as SessionId).catch(() => undefined)
+          : undefined
+        const eventCount = (snapshot as { eventCount?: unknown } | undefined)?.eventCount
+        const { events } = typeof eventCount === 'number' && eventCount > 0
+          ? await handle.read(eventCount - 1, 1)
+          : await handle.read()
         // A log with no events proves existence but not silence, so the seat is
         // kept — the same fail-closed reading as a seam that cannot answer.
         return events[events.length - 1]?.time
