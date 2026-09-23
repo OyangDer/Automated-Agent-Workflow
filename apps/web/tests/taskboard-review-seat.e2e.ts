@@ -51,6 +51,7 @@ interface TaskboardHostPort {
 /** Both durable roots are shared by the two boots (outside the owned temp roots). */
 const HOME = join(tmpdir(), 'v612-home-' + String(process.pid))
 const SESSIONS = join(tmpdir(), 'v612-sessions-' + String(process.pid))
+const STORAGE = join(tmpdir(), 'v612-storage-' + String(process.pid))
 
 /**
  * Link the two plugin packages into the profile the scaffold is about to boot.
@@ -78,17 +79,20 @@ describe('web e2e: Taskboard review seat', () => {
   let tripwire: ReturnType<typeof watchConsole>
   let ticketId = ''
   let reviewerAgentId = ''
+  /** The session that seated the reviewer; reused as the claimer after the restart. */
+  let seatedBy: unknown
 
   beforeAll(async () => {
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
     mkdirSync(SESSIONS, { recursive: true })
+    mkdirSync(STORAGE, { recursive: true })
     linkPluginLayers(HOME)
     // Boot 1: seat a reviewer through the real path, then dispose the Host.
     scaffold = await launchWebScaffold({
       extraOverlayPath: OVERLAY, extraInstallAnchors: INSTALL_ANCHORS,
-      harnessHome: HOME, persistenceRoot: SESSIONS,
+      harnessHome: HOME, persistenceRoot: SESSIONS, storageRoot: STORAGE,
     })
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
@@ -105,20 +109,24 @@ describe('web e2e: Taskboard review seat', () => {
     await host.taskboard.moveAsMaster(agent, {
       ticketId, column: 'in_testing', beforeTicketId: null, afterTicketId: null,
     })
+    seatedBy = agent
     await host.taskboard.requestReviewRemote(agent, { ticketId })
     reviewerAgentId = (await host.taskboard.viewTicket(ticketId)).reviewer?.agentId ?? ''
     if (reviewerAgentId === '') throw new Error('the real seating path seated no reviewer')
+    // Both sessions must be durable before the Host goes away: the reviewer's
+    // stored record is the half of the blind spot that keeps the seat.
     await scaffold.ctx.sessions.flush(agent.session)
+    const reviewerSession = scaffold.ctx.agents.get(reviewerAgentId as never)?.session
+    if (reviewerSession !== undefined) await scaffold.ctx.sessions.flush(reviewerSession)
     await scaffold.close()
     // Boot 2: same home and session root, a fresh live registry.
     linkPluginLayers(HOME)
     scaffold = await launchWebScaffold({
       extraOverlayPath: OVERLAY, extraInstallAnchors: INSTALL_ANCHORS,
-      harnessHome: HOME, persistenceRoot: SESSIONS,
+      harnessHome: HOME, persistenceRoot: SESSIONS, storageRoot: STORAGE,
     })
-    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
-    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
-    await connectFreshWorkspace(page, scaffold.workspaceCwd)
+    // Boot 2 needs no browser: the scenario is asserted through the Host (the
+    // real service), and the board it reads is the one boot 1 left behind.
   }, 300_000)
 
   afterAll(async () => {
@@ -129,8 +137,8 @@ describe('web e2e: Taskboard review seat', () => {
   it('releases a seat whose holder survived only as a stored session, then lets claim_review take it', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-taskboard-review-seat'))
     const host = scaffold.ctx as unknown as { taskboard: TaskboardHostPort }
-    const claimer = scaffold.ctx.agents.list()[0]
-    if (claimer === undefined) throw new Error('the second host created no Agent')
+    const claimer = seatedBy
+    if (claimer === undefined) throw new Error('boot 1 recorded no seating session')
     // The restart shape: the holder's process is gone, its stored record is not.
     expect(scaffold.ctx.agents.get(reviewerAgentId as never)).toBeUndefined()
     const survived = await host.taskboard.viewTicket(ticketId)
