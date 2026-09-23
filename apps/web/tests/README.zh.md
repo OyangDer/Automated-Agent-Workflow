@@ -37,3 +37,32 @@ harness 的用途，且这两个包本来就在 Host 图中。chat 场景则在 
 `conversationContextKey`，而不 import 其 Client owner。
 
 没有任何机制强制这条规则；靠 review 守住它。
+
+## 任务板界面验收
+
+交付物是「任务板界面可点」的卡片，必须在报告里附上这条命令的真跑输出：
+
+```sh
+pnpm exec tsx scripts/taskboard-ui-acceptance.ts
+```
+
+该命令本身不构建：先跑 `pnpm run build`（`pnpm run test:web` 会先构建再跑整条 lane）。
+它按两个已发布插件层启动真实组合，用真实 Chromium 驱动
+[`taskboard-roster.e2e.ts`](taskboard-roster.e2e.ts)，并打印报告要引用的证据：界面上的人数，
+以及同一次点击前后的 Host 侧 capacity/roster。
+
+它会在花费一次浏览器启动之前检查两个前置条件，因为这两样失败得又晚又难懂：
+
+- 仓库根的 `pnpm exec playwright install chromium` 解析到 Playwright **1.58**，装的是
+  chromium **1208**；而 `apps/web` 解析到 **1.61.1**，要启动 chromium **1228**——请用
+  `cd apps/web && node node_modules/playwright/cli.js install chromium` 安装本 lane 的浏览器；
+- `apps/web/dist` 是 scaffold 提供的已构建外壳，缺失时 `support.ts` 会拒绝启动。
+
+换一张任务板界面卡时的三步复用：
+
+1. 把 `taskboard-roster.e2e.ts` 与 `taskboard-roster.overlay.yml` 复制到旁边，并保留层次
+   等价测试，使冒烟不会偏离已发布的插件层；
+2. 保留双重证据的形态——点一个控件、等待可见变化，再到 Host 服务
+   （`scaffold.ctx.taskboard`）上断言同一变化——并保留 `watchConsole` 的页面错误断言，
+   它正是发现「装配制品陈旧」的那一环；
+3. 跑 `pnpm exec tsx scripts/taskboard-ui-acceptance.ts --file <你的文件>`，并把证据行写进卡片报告。

@@ -1,0 +1,15 @@
+# The two shipped Taskboard plugin layers, verbatim: the Host board domain
+# (durable workflow, agent tools, browser Remote surface) and the browser tab.
+# A real profile activates them with
+#   dsh plugin --profile <name> add @deepseek-ai/dsh-taskboard
+#   dsh plugin --profile <name> add @deepseek-ai/dsh-client-ui-taskboard
+# and taskboard-roster.e2e.ts asserts this file still equals those two
+# cordis.patch.yml layers, so the smoke drives the shipped composition.
+
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
+
+- insert:
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'

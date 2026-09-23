@@ -24,7 +24,7 @@
 // assertConsumed for the teardown fixture-consumption check).
 import { existsSync, readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -683,6 +683,17 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
         patchReload: 'startup',
       },
     })
+    // Link each product layer into the profile the way pnpm links it: the
+    // installation fallback above covers shared dependencies only, so a layer
+    // whose patch mounts its own package by name (`dsh.bundle.patch`) would
+    // otherwise fail the boot with ERR_MODULE_NOT_FOUND. The CLI's profile
+    // boot links the same way (apps/cli/tests/web-agent-presets.e2e.ts).
+    for (const layer of extraLayers) {
+      const link = join(profileDir, 'node_modules', layer.packageName)
+      await mkdir(dirname(link), { recursive: true })
+      await rm(link, { recursive: true, force: true })
+      await symlink(layer.packageDir, link, 'junction')
+    }
     await mkdir(profileDir, { recursive: true })
     const rootConfig = join(profileDir, 'cordis.yml')
     await writeFile(rootConfig, '[]\n')
