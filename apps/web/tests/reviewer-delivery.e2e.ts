@@ -107,10 +107,16 @@ it('delivers a master message to the reviewer its card seated (V6-14)', async ()
     expect(wrongParent).not.toBe('')
     // Drain before teardown: the real seated reviewer owns an inbox projection,
     // and disposing the tree while its continuation is still settling surfaces
-    // as an unhandled rejection ("its projection registration is not active").
-    await scaffold.whenTurnSettled(10_000).catch(() => {})
-    await new Promise((resolve) => { setTimeout(resolve, 2_000) })
   } finally {
+    // Drain the continuable descendants (the reviewer this run seated, plus the
+    // worker) BEFORE the tree goes away: disposing while a continuable
+    // activation is still settling surfaces as an unhandled rejection —
+    // "agent … cannot read inbox state: its projection registration is not
+    // active" (ContinuableActivationRegistry.settlementState → SubagentInbox).
+    const subagents = (scaffold.ctx as unknown as {
+      subagents?: { drainContinuableDescendants?(parents: readonly unknown[]): Promise<void> }
+    }).subagents
+    await subagents?.drainContinuableDescendants?.(scaffold.ctx.agents.list()).catch(() => {})
     await browser.close()
     await scaffold.close()
   }
