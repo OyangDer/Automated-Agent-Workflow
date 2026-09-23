@@ -1180,7 +1180,6 @@ export class TaskboardService extends TypertRemoteService {
     }
   }
 
-  /** The board's live master agent, or undefined when the seat is empty/dead. */
   /**
    * The session a review child must hang under (V6-14): the board's live master
    * when one exists, so the master owns the reviewer it must be able to message
@@ -1194,6 +1193,7 @@ export class TaskboardService extends TypertRemoteService {
     return await this.liveMaster(ticket.boardId) ?? caller
   }
 
+  /** The board's live master agent, or undefined when the seat is empty/dead. */
   private async liveMaster(boardId: string): Promise<Agent | undefined> {
     const registry = this.agentRegistry()
     if (registry === undefined) return undefined

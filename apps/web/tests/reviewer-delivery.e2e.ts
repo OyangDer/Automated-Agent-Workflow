@@ -11,20 +11,15 @@ import { mkdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { chromium } from 'playwright'
 import { expect, it } from 'vitest'
-// Playwright is a dependency of apps/web, not of this package: reach that copy
-// by path rather than widening this package's manifest for a test-only import.
-const playwright = await import(fileURLToPath(new URL('../../../../apps/web/node_modules/playwright/index.mjs', import.meta.url))) as unknown as {
-  chromium: { launch(): Promise<{ close(): Promise<void> }> }
-}
-const chromium = playwright.chromium
-import { launchWebScaffold } from '../../../../apps/web/tests/scaffold.ts'
-import { connectFreshWorkspace, newEnglishPage } from '../../../../apps/web/tests/support.ts'
+import { launchWebScaffold } from './scaffold.ts'
+import { connectFreshWorkspace, newEnglishPage } from './support.ts'
 
 const OVERLAY = fileURLToPath(new URL('./reviewer-delivery.overlay.yml', import.meta.url))
 const ANCHORS = [
-  fileURLToPath(new URL('../package.json', import.meta.url)),
-  fileURLToPath(new URL('../../../client/ui-taskboard/package.json', import.meta.url)),
+  fileURLToPath(new URL('../../../packages/taskboard/taskboard/package.json', import.meta.url)),
+  fileURLToPath(new URL('../../../packages/client/ui-taskboard/package.json', import.meta.url)),
 ]
 const HOME = join(tmpdir(), 'v614-home-' + String(process.pid))
 
@@ -45,17 +40,18 @@ interface Host {
 }
 
 /**
- * Link the two plugin packages into the profile the scaffold boots, the way the
- * V6-12 acceptance had to: this worktree's install-anchor step leaves
- * `profiles/scaffold/node_modules` empty, so the Loader cannot import by name.
+ * Link the two plugin packages into the profile the scaffold boots: this
+ * worktree's install-anchor step leaves `profiles/scaffold/node_modules` empty,
+ * so the Loader cannot import either layer by name.
  * @param home - the harness home whose scaffold profile receives the links.
  */
 function linkPluginLayers(home: string): void {
   const target = join(home, 'profiles', 'scaffold', 'node_modules', '@deepseek-ai')
   mkdirSync(target, { recursive: true })
-  for (const [name, path] of [['dsh-taskboard', '../'], ['dsh-client-ui-taskboard', '../../../client/ui-taskboard/']] as const) {
+  for (const name of ['dsh-taskboard', 'dsh-client-ui-taskboard']) {
+    const source = fileURLToPath(new URL('../../../packages/' + (name === 'dsh-taskboard' ? 'taskboard/taskboard' : 'client/ui-taskboard'), import.meta.url))
     try {
-      symlinkSync(fileURLToPath(new URL(path, import.meta.url)), join(target, name), 'junction')
+      symlinkSync(source, join(target, name), 'junction')
     } catch {
       // Already linked.
     }
@@ -109,6 +105,11 @@ it('delivers a master message to the reviewer its card seated (V6-14)', async ()
     // belongs to the master. (The refusal copy depends on the seam's identity
     // checks, so the assertion pins "refused", not one exact sentence.)
     expect(wrongParent).not.toBe('')
+    // Drain before teardown: the real seated reviewer owns an inbox projection,
+    // and disposing the tree while its continuation is still settling surfaces
+    // as an unhandled rejection ("its projection registration is not active").
+    await scaffold.whenTurnSettled(10_000).catch(() => {})
+    await new Promise((resolve) => { setTimeout(resolve, 2_000) })
   } finally {
     await browser.close()
     await scaffold.close()
