@@ -61,7 +61,17 @@ async function mountedContributionIds(source: string): Promise<string[]> {
   return mounted
 }
 
-describe.skipIf(!existsSync(ASSEMBLY))('client remote surface: the taskboard namespace the browser mounts', () => {
+// A stale artifact and an unbuilt one are different failures, and this spec only
+// sees the first: absent, the whole block skips. Say so out loud rather than
+// passing silently, and let the build pipeline own "the assembly was built at
+// all" (`pnpm run build:lib:client` is mandatory after a remote signature
+// change, per docs/cookbook/adding-a-remote-api.md step 3).
+const ASSEMBLY_BUILT = existsSync(ASSEMBLY)
+if (!ASSEMBLY_BUILT) {
+  console.warn('[V6-10] assembly bundle not built, skipping the surface check: ' + ASSEMBLY)
+}
+
+describe.skipIf(!ASSEMBLY_BUILT)('client remote surface: the taskboard namespace the browser mounts', () => {
   it('carries every verb the tab calls', async () => {
     const ids = await mountedContributionIds(readFileSync(ASSEMBLY, 'utf8'))
     expect(ids.length).toBeGreaterThan(0)
