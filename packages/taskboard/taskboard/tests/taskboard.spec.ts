@@ -1365,6 +1365,34 @@ describe('TaskboardService workflow', () => {
     expect((await service.viewTicket(card.id)).reviewer).toBeNull()
   })
 
+  it('still judges silence when the seam has no inspect and only open (V6-12)', async () => {
+    // The shipped JSONL backend exposes create/open/flush/stat/list — no inspect.
+    // The earlier cases ride the fake's inspect, which the real service does not
+    // have; this one models the shipped surface so the guard cannot pass on a
+    // seam production never provides.
+    const persistence = fakeSessionPersistence()
+    const log = [{ type: 'session/header', seq: 0, time: Date.now() - 60_000, data: {} } as unknown as SessionEvent]
+    persistence.stored.set('reviewer-child-agent', log)
+    delete (persistence as unknown as { inspect?: unknown }).inspect
+    ;(persistence as unknown as { open: unknown }).open = async (id: string) => ({
+      header: { createdAt: Date.now() - 60_000 },
+      read: async () => ({ events: persistence.stored.get(id) ?? [] }),
+      [Symbol.asyncDispose]: async () => {},
+    })
+    const { service, devA, workerChild, unregisterReviewer } = await harness({
+      reviewerStaleTimeoutMs: 50, sessionPersistence: persistence,
+    })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'store-shaped reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    const released = await service.viewTicket(card.id)
+    expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
+  })
+
   it('stops auto-redispatching reviewers once the per-card cap is exhausted (V3-43)', async () => {
     // An empty session store: every released seat is genuinely gone, so the
     // reconcile keeps judging seat loss — the environment that turned the

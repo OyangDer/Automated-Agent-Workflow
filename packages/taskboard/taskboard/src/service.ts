@@ -270,9 +270,26 @@ interface SessionInspectionLike {
   }[]
 }
 
+/** The read face of one stored session, as `open` hands it out. */
+interface SessionHandleLike {
+  readonly header: { readonly createdAt: number }
+  read(): Promise<{ readonly events: readonly { readonly time: number }[] }>
+  [Symbol.asyncDispose](): Promise<void>
+}
+
 interface SessionPersistenceLike {
   append(id: SessionId, events: readonly unknown[]): Promise<void>
-  inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspectionLike>
+  /**
+   * The stored log in one call. Optional: the shipped JSONL backend has no
+   * `inspect` at all (it is not part of that package's public surface), so a
+   * reader that needs the log must fall back to {@link open}.
+   */
+  inspect?(id: SessionId, signal?: AbortSignal): Promise<SessionInspectionLike>
+  /**
+   * The shipped backend's read entry point: one handle onto the stored log. The
+   * activity tail is read through it when `inspect` is absent (V6-12).
+   */
+  open?(id: SessionId, access: 'read'): Promise<SessionHandleLike>
   /**
    * The backend's canonical durable-existence probe (V3-34): the stored-session
    * snapshot, or undefined when the session holds no stored record at all.
@@ -2910,10 +2927,30 @@ export class TaskboardService extends TypertRemoteService {
    */
   private async storedActivityOf(sessionId: string): Promise<number | undefined> {
     const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-    if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
+    if (persistence === undefined) return undefined
+    // A seam that answers the question directly wins. The shipped JSONL backend
+    // has no `inspect`, so the same tail is read through an open read handle —
+    // the shape the rest of the host uses for a stored session.
+    if (typeof persistence.inspect === 'function') {
+      try {
+        const inspection = await persistence.inspect(sessionId as SessionId)
+        const tail = inspection.events[inspection.events.length - 1]
+        if (tail !== undefined) return tail.time
+      } catch {
+        // Unknown session on this seam: try the handle path below.
+      }
+    }
+    if (typeof persistence.open !== 'function') return undefined
     try {
-      const inspection = await persistence.inspect(sessionId as SessionId)
-      return inspection.events[inspection.events.length - 1]?.time
+      const handle = await persistence.open(sessionId as SessionId, 'read')
+      try {
+        const { events } = await handle.read()
+        // A log with no events proves existence but not silence, so the seat is
+        // kept — the same fail-closed reading as a seam that cannot answer.
+        return events[events.length - 1]?.time
+      } finally {
+        await handle[Symbol.asyncDispose]()
+      }
     } catch {
       return undefined
     }
