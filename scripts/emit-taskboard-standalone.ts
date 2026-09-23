@@ -12,6 +12,12 @@
  * each manifest to its publish form, assemble the published file set, pack both
  * deterministic tarballs, then audit the result for leaked workspace protocol,
  * vendored host source, and node_modules.
+ *
+ * The tree defaults to a directory outside this checkout: the documentation
+ * gates read every Markdown pair in the working tree, and the emitted README
+ * pair links the standalone repository's layout, so a tree left inside the
+ * checkout turns `pnpm run test:docs` red until it is deleted. `--out` still
+ * selects any location, including one inside the checkout.
  * @module
  */
 
@@ -27,13 +33,39 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { gzipSync, gunzipSync } from 'node:zlib'
 
 /** Repository root, derived from this script's location under `scripts/`. */
 export const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
+
+/**
+ * The default output directory for the emitted tree.
+ *
+ * It sits outside the checkout on purpose: the documentation gates walk the
+ * working tree, and an emitted README pair links the standalone repository's
+ * layout, so a tree left inside the checkout fails `pnpm run test:docs` until it
+ * is deleted. Naming the directory after the checkout keeps parallel worktrees
+ * from overwriting each other's release.
+ * @returns the absolute default output directory.
+ */
+export function defaultOutDir(): string {
+  return join(tmpdir(), 'dsh-taskboard-standalone-' + basename(REPO_ROOT))
+}
+
+/**
+ * Render a path for the log: repository-relative when it is inside the
+ * checkout, absolute otherwise (the default output directory is outside it).
+ * @param file - the path to render.
+ * @returns the human-facing path.
+ */
+function displayPath(file: string): string {
+  const shown = relative(REPO_ROOT, file)
+  return shown.startsWith('..') ? file : shown
+}
 
 /** The remote that carries the emitted tree on its `main` branch. */
 export const STANDALONE_REMOTE = 'https://github.com/OyangDer/Automated-Agent-Workflow.git'
@@ -541,7 +573,7 @@ export function parseOptions(argv: readonly string[]): EmitOptions {
     },
   })
   return {
-    out: resolve(parsed.values.out ?? join(REPO_ROOT, 'dist', 'taskboard-standalone')),
+    out: resolve(parsed.values.out ?? defaultOutDir()),
     build: !parsed.values['no-build'],
     help: parsed.values.help,
   }
@@ -552,7 +584,12 @@ Emit the standalone, DSH-free release of the Taskboard plugins.
 
   tsx scripts/emit-taskboard-standalone.ts [options]
 
-  --out <dir>   output directory (default: dist/taskboard-standalone)
+  --out <dir>   output directory (default:
+                <system temp>/dsh-taskboard-standalone-<checkout>). The default
+                sits outside this checkout on purpose: the documentation gates
+                scan the working tree, and the emitted README pair links the
+                standalone repository's layout. Pass a path inside the checkout
+                only when you intend to remove the tree again.
   --no-build    reuse the existing lib/ products instead of rebuilding
   -h, --help    print this usage
 
@@ -573,7 +610,7 @@ function main(): void {
   process.stdout.write(`emit-taskboard-standalone: wrote ${result.out}\n`)
   for (const tarball of result.tarballs) {
     process.stdout.write(
-      `emit-taskboard-standalone: ${relative(REPO_ROOT, tarball)} sha256=`
+      `emit-taskboard-standalone: ${displayPath(tarball)} sha256=`
       + `${createHash('sha256').update(readFileSync(tarball)).digest('hex')}\n`,
     )
   }

@@ -1,12 +1,14 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  REPO_ROOT,
   auditArtifact,
   collectPublishedFiles,
+  defaultOutDir,
   emit,
   packDirectory,
   parseOptions,
@@ -167,9 +169,13 @@ describe('auditArtifact', () => {
 })
 
 describe('parseOptions', () => {
-  it('defaults to building into dist/ and honours --no-build', () => {
+  it('defaults outside the checkout and honours --no-build', () => {
     expect(parseOptions([]).build).toBe(true)
-    expect(parseOptions([]).out.endsWith(join('dist', 'taskboard-standalone'))).toBe(true)
+    // The documentation gates walk the working tree, so the release tree must
+    // never default to a path inside it.
+    expect(parseOptions([]).out).toBe(defaultOutDir())
+    expect(relative(REPO_ROOT, defaultOutDir()).startsWith('..')).toBe(true)
+    expect(defaultOutDir().startsWith(tmpdir())).toBe(true)
     expect(parseOptions(['--no-build', '--out', 'somewhere']).build).toBe(false)
     expect(parseOptions(['--no-build', '--out', 'somewhere']).out).toBe(join(process.cwd(), 'somewhere'))
   })
