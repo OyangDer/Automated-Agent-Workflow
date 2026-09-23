@@ -1,0 +1,11 @@
+# V6-14 acceptance: the two shipped Taskboard plugin layers, so the reviewer a
+# card seats is spawned by the real composition and a message can be delivered
+# to it from the session that owns it.
+
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
+
+- insert:
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'

@@ -1181,6 +1181,19 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /** The board's live master agent, or undefined when the seat is empty/dead. */
+  /**
+   * The session a review child must hang under (V6-14): the board's live master
+   * when one exists, so the master owns the reviewer it must be able to message
+   * or wake. The caller is the fallback only when no live master session exists
+   * (nothing else can spawn a child on the master's behalf).
+   * @param caller - the session asking for the seat.
+   * @param ticket - the card whose board owns the master seat.
+   * @returns the parent session for the reviewer wake/spawn.
+   */
+  private async reviewParent(caller: Agent, ticket: TicketView): Promise<Agent> {
+    return await this.liveMaster(ticket.boardId) ?? caller
+  }
+
   private async liveMaster(boardId: string): Promise<Agent | undefined> {
     const registry = this.agentRegistry()
     if (registry === undefined) return undefined
@@ -4373,7 +4386,9 @@ export class TaskboardService extends TypertRemoteService {
     if ('queued' in reservation) {
       return await this.enqueueCard(current, reservation.queued, 'reviewer')
     }
-    const seat = await this.seatReviewer(agent, current, reservation.member)
+    // V6-14: the same unified parent — a viewer's re-review request must not
+    // own the child either, or the master loses the channel to it.
+    const seat = await this.seatReviewer(await this.reviewParent(agent, current), current, reservation.member)
     if (seat.ok) return seat.ticket
     if (seat.reason === 'failed') {
       await this.recordReviewerSpawnFailure(current.id, seat.errorMessage ?? 'unknown reviewer spawn fault').catch(() => {})
@@ -4994,6 +5009,11 @@ export class TaskboardService extends TypertRemoteService {
    * @returns the card plus the seat outcome in the report-tool vocabulary.
    */
   private async seatReviewerForCard(agent: Agent, ticket: TicketView): Promise<CompleteTicketResult> {
+    // V6-14: the review child hangs under the board's MASTER, not under the
+    // worker that reported the card — otherwise the master cannot send_message
+    // to (or wake) the reviewer it owns, and a stuck review has no human way
+    // back. The caller is only the fallback when no live master exists.
+    const parent = await this.reviewParent(agent, ticket)
     const reservation = await this.reserveReviewerMember(ticket, ticket.reviewerMemberId ?? ticket.workerMemberId)
     if ('queued' in reservation) {
       return {
@@ -5002,7 +5022,7 @@ export class TaskboardService extends TypertRemoteService {
         reviewerAgentId: null,
       }
     }
-    const seat = await this.seatReviewer(agent, ticket, reservation.member)
+    const seat = await this.seatReviewer(parent, ticket, reservation.member)
     if (!seat.ok) {
       if (seat.reason === 'failed' && seat.errorMessage !== undefined) {
         await this.recordReviewerSpawnFailure(ticket.id, seat.errorMessage).catch(() => {})

@@ -1393,6 +1393,44 @@ describe('TaskboardService workflow', () => {
     expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
   })
 
+  it('hangs the reviewer under the board master, not the reporting worker (V6-14)', async () => {
+    const { service, devA, workerChild, subagentsStart } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'reviewer parent card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    subagentsStart.mockClear()
+    await service.report(workerChild, card.id, 'implemented')
+    // The worker reported the card, but the review child belongs to the master —
+    // that is the parent the master can send_message to and wake.
+    // The parent rides the start request (SubagentStartRequest.parent).
+    expect(subagentsStart.mock.calls[0]?.[1]?.parent).toBe(devA)
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe('reviewer-child-agent')
+  })
+
+  it('wakes a bound reviewer as the master even when a viewer asks for the re-review (V6-14)', async () => {
+    const { service, devA, workerChild, reviewerChild, subagentsStart, subagentsSendMessage } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'reviewer wake parent card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    // Rework round: the reviewer sends the card back and the worker reports
+    // again. The bound member is free now, so the seat is WOKEN rather than
+    // spawned — and that wake must travel as the MASTER's message, or the
+    // master loses its channel to the reviewer.
+    await service.reject(reviewerChild, card.id, 'fix it')
+    subagentsStart.mockClear()
+    subagentsSendMessage.mockClear()
+    await service.report(workerChild, card.id, 'implemented again')
+    // Whichever channel the re-seat takes — waking the bound member's stored
+    // session or spawning a fresh child — the parent must be the master, never
+    // the reporting worker. Under the old code both were the worker.
+    const wakeSender = subagentsSendMessage.mock.calls[0]?.[0]
+    const spawnParent = subagentsStart.mock.calls[0]?.[1]?.parent
+    expect(wakeSender ?? spawnParent).toBe(devA)
+  })
+
   it('stops auto-redispatching reviewers once the per-card cap is exhausted (V3-43)', async () => {
     // An empty session store: every released seat is genuinely gone, so the
     // reconcile keeps judging seat loss — the environment that turned the
