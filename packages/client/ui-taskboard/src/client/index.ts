@@ -342,6 +342,7 @@ export function apply(ctx: ClientContext): void {
         edit: async request => unwrap(await ctx.remote.taskboard.edit(sessionId, request)),
         remove: async request => unwrap(await ctx.remote.taskboard.delete(sessionId, request)),
         requestReview: async request => unwrap(await ctx.remote.taskboard.requestReview(sessionId, request)),
+        releaseReview: async request => unwrap(await ctx.remote.taskboard.releaseReview(sessionId, request)),
         refresh: () => { void source.refresh() },
         selectBoard: boardId => source.selectBoard(boardId),
         createBoard: (name, scope) => source.createBoard(name, scope),

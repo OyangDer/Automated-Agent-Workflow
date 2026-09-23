@@ -7,7 +7,7 @@ import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
   BoardSnapshot, BoardView as HostBoardView, CreateStageRequest, CreateTicketRequest, EditTicketRequest,
   MigrateTicketsRequest, MigrateTicketsResult, MoveTicketRequest, RemoveTicketRequest, RemoveTicketResult,
-  RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest, StageView, TicketView,
+  ReleaseReviewRequest, RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest, StageView, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { CompactionCeilingFace } from './compaction-threshold.ts'
 
@@ -88,6 +88,11 @@ export interface TaskboardInjected {
   edit(request: EditTicketRequest): Promise<TicketView>
   remove(request: RemoveTicketRequest): Promise<RemoveTicketResult>
   requestReview(request: RequestReviewRequest): Promise<TicketView>
+  /**
+   * Free one review seat without waiting for the staleness window (V6-12): the
+   * panel's escape hatch for a seat a dead session still holds.
+   */
+  releaseReview(request: ReleaseReviewRequest): Promise<TicketView>
   /** Force a snapshot refresh (errors surface in the panel, not here). */
   refresh(): void
   /** Switch the rendered board; refetches the board list and the snapshot. */

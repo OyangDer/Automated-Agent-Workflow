@@ -713,6 +713,7 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   SetRosterCapacityRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   RestoreMemberRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   CreateStageRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
+  ReleaseReviewRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   SwitchStageRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   MigrateTicketsRequest: 'taskboard request contract is owned by packages/taskboard/taskboard/src/types.ts',
   MigrateTicketsResult: 'taskboard migration receipt is owned by packages/taskboard/taskboard/src/types.ts',

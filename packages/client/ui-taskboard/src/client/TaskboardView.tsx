@@ -53,7 +53,7 @@ interface DropTarget {
 }
 
 export function TaskboardView({
-  useBoard, useStore, actions, create, move, edit, remove, requestReview,
+  useBoard, useStore, actions, create, move, edit, remove, requestReview, releaseReview,
   selectBoard, createBoard, archiveBoard, setRosterCapacity, restoreMember,
   switchStage, createStage, migrateTickets,
   t, dragAutoScroll, compaction,
@@ -571,6 +571,7 @@ export function TaskboardView({
           onEdit={edit}
           onRemove={remove}
           onRequestReview={requestReview}
+          onReleaseReview={releaseReview}
           onMove={(target) => { void handleMove(target) }}
           onError={(message) => { setError(message) }}
         />

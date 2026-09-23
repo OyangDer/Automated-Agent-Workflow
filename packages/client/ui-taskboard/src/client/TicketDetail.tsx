@@ -6,7 +6,7 @@
 import { useState } from 'react'
 import type {
   ColumnId, EditTicketRequest, Priority, RemoveTicketRequest,
-  RemoveTicketResult, RequestReviewRequest, TicketView,
+  ReleaseReviewRequest, RemoveTicketResult, RequestReviewRequest, TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { TaskboardT } from './TicketCard.tsx'
 import css from './TicketDetail.module.css'
@@ -44,12 +44,17 @@ export interface TicketDetailProps {
   onEdit: (request: EditTicketRequest) => Promise<TicketView>
   onRemove: (request: RemoveTicketRequest) => Promise<RemoveTicketResult>
   onRequestReview: (request: RequestReviewRequest) => Promise<TicketView>
+  /**
+   * V6-12: free the review seat from the panel. Omitted by surfaces that do not
+   * own the verb; the button then does not render.
+   */
+  onReleaseReview?: (request: ReleaseReviewRequest) => Promise<TicketView>
   onMove: (column: ColumnId) => void
   onError: (message: string) => void
 }
 
 export function TicketDetail({
-  ticket, board, t, onClose, onEdit, onRemove, onRequestReview, onMove, onError,
+  ticket, board, t, onClose, onEdit, onRemove, onRequestReview, onReleaseReview, onMove, onError,
 }: TicketDetailProps) {
   const [editing, setEditing] = useState(false)
   const [armDelete, setArmDelete] = useState(false)
@@ -100,6 +105,19 @@ export function TicketDetail({
     setPending(true)
     try {
       await onRequestReview({ ticketId: ticket.id, boardId: ticket.boardId })
+    } catch (error) {
+      onError(failureMessage(error, t('error.generic')))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  /** V6-12: the panel's release, offered while a seat is actually held. */
+  const releaseReview = async (): Promise<void> => {
+    if (onReleaseReview === undefined) return
+    setPending(true)
+    try {
+      await onReleaseReview({ ticketId: ticket.id, boardId: ticket.boardId })
     } catch (error) {
       onError(failureMessage(error, t('error.generic')))
     } finally {
@@ -260,6 +278,17 @@ export function TicketDetail({
             {ticket.column === 'in_testing' && (
               <button type="button" className={css.button} disabled={pending} onClick={() => { void requestReview() }}>
                 {t('action.requestReview')}
+              </button>
+            )}
+            {ticket.column === 'in_testing' && ticket.reviewer !== null && onReleaseReview !== undefined && (
+              <button
+                type="button"
+                className={css.button}
+                disabled={pending}
+                data-testid="detail-release-review"
+                onClick={() => { void releaseReview() }}
+              >
+                {t('action.releaseReview')}
               </button>
             )}
             <button type="button" className={css.button} onClick={() => { setEditing(true) }}>{t('action.edit')}</button>

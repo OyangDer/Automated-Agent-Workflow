@@ -2512,7 +2512,7 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'async reconcileStaleReviewers(): Promise<number>',
-        description: 'One reviewer-staleness reconciliation pass: every In testing card that still has a review seat but no reviewOutcome is judged by the *shared* session-liveness rule (V3-43, sessionHoldsSeat — the same judgment the master seat uses) plus the review-start clock:\n\n- the seat is lost only when the holder session is gone for good — absent from the live agent registry *and* holding no stored session record. Registry absence alone releases nothing: a report-mode reviewer is a durable continuable child that normally lives in the session store (ready) rather than the live registry, and the old registry-only reading of that normal state as death was the V3-42 release/redispatch loop;\n- a reviewer that is *registered* but idle — no running tool — with the review pending longer than reviewerStaleTimeoutMs is judged stuck and the seat is released. Staleness never applies to a holder that is only stored (there is no live session to judge idle). On release the card history gets one \'review-release\' row, the master is notified, and a fresh reviewer is auto-redispatched when a live master session exists to spawn from; otherwise the seat is left vacant so taskboard_claim_review can take it.\n\nLoop brake (V3-43): the release/redispatch cycle is capped per card at reviewerAutoRetryLimit, mirroring the worker\'s workerAutoRetryLimit. Once the budget is spent the seat is still released, but instead of spawning yet another reviewer the card is blocked with the concrete reason and a master notice — so no future liveness fault can turn into an unbounded release/redispatch loop.\n\nReentry-safe: the guarded mutate only releases a seat that still names the same reviewer and is still In testing without an outcome, so a card another path already released (or resolved) is returned untouched.',
+        description: 'One reviewer-staleness reconciliation pass: every In testing card that still has a review seat but no reviewOutcome is judged by the *shared* session-liveness rule (V3-43, sessionHoldsSeat — the same judgment the master seat uses) plus the review-start clock:\n\n- the seat is lost only when the holder session is gone for good — absent from the live agent registry *and* holding no stored session record. Registry absence alone releases nothing: a report-mode reviewer is a durable continuable child that normally lives in the session store (ready) rather than the live registry, and the old registry-only reading of that normal state as death was the V3-42 release/redispatch loop;\n- a holder idle past reviewerStaleTimeoutMs is judged stuck and the seat is released: a *registered* holder reads its live session log, an *unregistered* holder reads its stored log (V6-12 — the arm that was missing, where "registry absent + log kept" satisfied neither judgment and held the seat forever). Silence the store cannot prove — no seam, an unknown or empty log, a fault — keeps the seat, so a durable reviewer waiting to be woken is still never mistaken for a ghost (V3-43). On release the card history gets one \'review-release\' row, the master is notified, and a fresh reviewer is auto-redispatched when a live master session exists to spawn from; otherwise the seat is left vacant so taskboard_claim_review can take it.\n\nLoop brake (V3-43): the release/redispatch cycle is capped per card at reviewerAutoRetryLimit, mirroring the worker\'s workerAutoRetryLimit. Once the budget is spent the seat is still released, but instead of spawning yet another reviewer the card is blocked with the concrete reason and a master notice — so no future liveness fault can turn into an unbounded release/redispatch loop.\n\nReentry-safe: the guarded mutate only releases a seat that still names the same reviewer and is still In testing without an outcome, so a card another path already released (or resolved) is returned untouched.',
         parameters: [],
         returns: 'how many seats this pass released.',
       },
@@ -2581,6 +2581,18 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Remove one ticket through the Remote boundary. The ticket\'s board must be visible to the caller; an invisible board is denied as not found (no existence leak).',
         parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the ticket to remove.' }],
         returns: 'the removal receipt.',
+      },
+      {
+        signature: 'async releaseReview(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView>',
+        description: 'Free one review seat explicitly (V6-12). The liveness pass now covers the "process gone, log kept" holder, but a judgment can still surprise: a reviewer the host merely unloaded looks exactly like one that died until the staleness window passes, and an operator may not want to wait — the probe\'s seats sat claimed for 25-40 minutes across two host restarts with no way out but editing storage. This is the direct route: the master (or a board viewer, through the UI) names the card and the seat is released on the spot, with one review-release history row naming who freed it.\n\nThe release is the same state change the liveness pass performs, so every existing path keeps working: with `reassign` the master gets a fresh reviewer immediately (through releaseReview\'s call into requestReview, which wakes the member\'s stored session before spawning), without it the seat stays vacant for taskboard_claim_review.',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the In testing ticket and the optional immediate replacement.' }],
+        returns: 'the ticket after the release (and the re-seat, when asked).',
+      },
+      {
+        signature: '@Remote(\'releaseReview\') async releaseReviewRemote(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView>',
+        description: 'Free one review seat through the Remote boundary (V6-12).',
+        parameters: [{ name: 'agent', description: 'the calling session agent.' }, { name: 'request', description: 'the In testing ticket and the optional immediate replacement.' }],
+        returns: 'the ticket after the release.',
       },
       {
         signature: '@Remote(\'requestReview\') async requestReviewRemote(agent: Agent, request: RequestReviewRequest): Promise<TicketView>',
@@ -5226,6 +5238,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'RedactedSecret',
     declaration: 'export interface RedactedSecret {\n    path: string[];\n    set: boolean;\n}',
+  },
+  {
+    name: 'ReleaseReviewRequest',
+    declaration: 'export interface ReleaseReviewRequest {\n    ticketId: string;\n    reassign?: boolean;\n    boardId?: string;\n}',
   },
   {
     name: 'RemoteError',

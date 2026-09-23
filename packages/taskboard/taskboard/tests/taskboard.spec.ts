@@ -1232,6 +1232,139 @@ describe('TaskboardService workflow', () => {
     expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe(reviewerChild.id)
   })
 
+  it('reclaims a reviewer seat whose holder left the registry and went silent (V6-12)', async () => {
+    const persistence = fakeSessionPersistence()
+    // A dead holder's stored log: its tail is older than the staleness window.
+    persistence.stored.set('reviewer-child-agent', [{
+      type: 'session/header', seq: 0, time: Date.now() - 60_000, data: {},
+    } as unknown as SessionEvent])
+    const { service, devA, workerChild, unregisterReviewer } = await harness({
+      reviewerStaleTimeoutMs: 50, sessionPersistence: persistence,
+    })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'ghost reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    expect((await service.viewTicket(card.id)).reviewer?.agentId).toBe('reviewer-child-agent')
+    // The process dies: the session leaves the live registry, its log survives.
+    // V6-12's blind spot was exactly this pair — V3-43 refuses registry absence
+    // as proof of death, and the idle arm required a *registered* holder, so
+    // neither judgment fired and the seat stayed claimed forever.
+    unregisterReviewer()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    const released = await service.viewTicket(card.id)
+    expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
+    // Releasing re-opens the seat, so the normal wake/rotate path can act (a
+    // live master is present here, so a fresh reviewer is already seated).
+    expect(released.reviewer).not.toBeNull()
+  })
+
+  it('keeps a registry-absent reviewer seat whose stored log is still active (V6-12)', async () => {
+    const persistence = fakeSessionPersistence()
+    persistence.stored.set('reviewer-child-agent', [{
+      type: 'session/header', seq: 0, time: Date.now(), data: {},
+    } as unknown as SessionEvent])
+    const { service, devA, workerChild, unregisterReviewer } = await harness({
+      reviewerStaleTimeoutMs: 60_000, sessionPersistence: persistence,
+    })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'durable reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    // Silence the store cannot prove past the window keeps the seat: the
+    // durable reviewer waiting to be woken is still never a ghost (V3-43).
+    expect(await service.reconcileStaleReviewers()).toBe(0)
+    const current = await service.viewTicket(card.id)
+    expect(current.reviewer?.agentId).toBe('reviewer-child-agent')
+    expect(current.history.some(row => row.kind === 'review-release')).toBe(false)
+    expect(current.reviewerRetries ?? 0).toBe(0)
+  })
+
+  it('frees the seat for claimReview once a silent holder is reclaimed (V6-12)', async () => {
+    const persistence = fakeSessionPersistence()
+    persistence.stored.set('reviewer-child-agent', [{
+      type: 'session/header', seq: 0, time: Date.now() - 60_000, data: {},
+    } as unknown as SessionEvent])
+    const { service, devA, devB, workerChild, unregisterReviewer, unregisterMaster } = await harness({
+      reviewerStaleTimeoutMs: 50, sessionPersistence: persistence,
+    })
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'claimable reviewer card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    unregisterReviewer()
+    // No live master to spawn from: the release leaves the seat vacant rather
+    // than blocking the card, which is the escape hatch the probe lacked.
+    unregisterMaster()
+    expect(await service.reconcileStaleReviewers()).toBe(1)
+    expect((await service.viewTicket(card.id)).reviewer).toBeNull()
+    const claimed = await service.claimReview(devB, card.id)
+    expect(claimed.reviewer?.agentId).toBe(devB.id)
+  })
+
+  it('frees a seat from the master tool without waiting for the staleness window (V6-12)', async () => {
+    const { ctx, service, devA, devB, workerChild, unregisterReviewer } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'tool released seat card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    // The holder is gone from the live registry; its stored log still keeps the
+    // seat under the V3-43 judgment, which is exactly when the master needs the
+    // explicit route instead of waiting out (or resetting) the store.
+    unregisterReviewer()
+    const result = await ctx.tools.execute({
+      callId: ToolCallId('v612-release-review'),
+      name: 'taskboard_release_review',
+      arguments: { ticketId: card.id },
+      agent: devA,
+      signal: new AbortController().signal,
+    })
+    expect(result.isError).toBe(false)
+    const released = await service.viewTicket(card.id)
+    expect(released.reviewer).toBeNull()
+    expect(released.history.some(row => row.kind === 'review-release')).toBe(true)
+    // The vacant seat is claimable straight away.
+    const claimed = await service.claimReview(devB, card.id)
+    expect(claimed.reviewer?.agentId).toBe(devB.id)
+  })
+
+  it('seats a fresh reviewer when the master releases with reassign (V6-12)', async () => {
+    const { service, devA, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'reassigned seat card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    const released = await service.releaseReview(devA, { ticketId: card.id, reassign: true })
+    expect(released.reviewer).not.toBeNull()
+    expect(released.history.filter(row => row.kind === 'review-release').length).toBe(1)
+  })
+
+  it('refuses a non-master re-seat while letting a board viewer free the seat (V6-12)', async () => {
+    const { service, devA, devB, workerChild } = await harness()
+    await service.claimMaster('default', devA)
+    const card = await createTicket(service, 'viewer released seat card')
+    await scheduleToNotStarted(service, devA, card)
+    await service.assign(devA, card.id)
+    await service.report(workerChild, card.id, 'implemented')
+    const before = await service.viewTicket(card.id)
+    // Only a master session can parent a reviewer spawn, so a viewer may not ask
+    // for a replacement — and the refusal leaves the seat exactly as it was.
+    await expect(service.releaseReview(devB, { ticketId: card.id, reassign: true }))
+      .rejects.toMatchObject({ code: 'TASKBOARD_NOT_MASTER' })
+    const untouched = await service.viewTicket(card.id)
+    expect(untouched.reviewer?.agentId).toBe(before.reviewer?.agentId)
+    expect(untouched.history.length).toBe(before.history.length)
+    // The plain release (the UI entry's call) is open to the board's viewers.
+    await service.releaseReview(devB, { ticketId: card.id })
+    expect((await service.viewTicket(card.id)).reviewer).toBeNull()
+  })
+
   it('stops auto-redispatching reviewers once the per-card cap is exhausted (V3-43)', async () => {
     // An empty session store: every released seat is genuinely gone, so the
     // reconcile keeps judging seat loss — the environment that turned the

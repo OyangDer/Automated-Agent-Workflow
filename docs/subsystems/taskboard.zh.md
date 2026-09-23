@@ -272,10 +272,13 @@ async reconcileQueues(): Promise<number>
  *   durable continuable child that normally lives in the session store
  *   (ready) rather than the live registry, and the old registry-only reading
  *   of that normal state as death was the V3-42 release/redispatch loop;
- * - a reviewer that is *registered* but idle — no running tool — with the
- *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
- *   the seat is released. Staleness never applies to a holder that is only
- *   stored (there is no live session to judge idle).
+ * - a holder idle past reviewerStaleTimeoutMs is judged stuck and the seat
+ *   is released: a *registered* holder reads its live session log, an
+ *   *unregistered* holder reads its stored log (V6-12 — the arm that was
+ *   missing, where "registry absent + log kept" satisfied neither judgment
+ *   and held the seat forever). Silence the store cannot prove — no seam, an
+ *   unknown or empty log, a fault — keeps the seat, so a durable reviewer
+ *   waiting to be woken is still never mistaken for a ghost (V3-43).
  * On release the card history gets one 'review-release' row, the master is
  * notified, and a fresh reviewer is auto-redispatched when a live master
  * session exists to spawn from; otherwise the seat is left vacant so
@@ -437,6 +440,35 @@ async reconcileMasterSeats(): Promise<number>
  * @returns the removal receipt.
  */
 @Remote('delete') async removeRemote(agent: Agent, request: RemoveTicketRequest): Promise<RemoveTicketResult>
+
+/**
+ * Free one review seat explicitly (V6-12). The liveness pass now covers the
+ * "process gone, log kept" holder, but a judgment can still surprise: a
+ * reviewer the host merely unloaded looks exactly like one that died until
+ * the staleness window passes, and an operator may not want to wait — the
+ * probe's seats sat claimed for 25-40 minutes across two host restarts with
+ * no way out but editing storage. This is the direct route: the master (or a
+ * board viewer, through the UI) names the card and the seat is released on
+ * the spot, with one review-release history row naming who freed it.
+ *
+ * The release is the same state change the liveness pass performs, so every
+ * existing path keeps working: with `reassign` the master gets a fresh
+ * reviewer immediately (through {@link releaseReview}'s call into
+ * requestReview, which wakes the member's stored session before spawning),
+ * without it the seat stays vacant for taskboard_claim_review.
+ * @param agent - the calling session agent.
+ * @param request - the In testing ticket and the optional immediate replacement.
+ * @returns the ticket after the release (and the re-seat, when asked).
+ */
+async releaseReview(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView>
+
+/**
+ * Free one review seat through the Remote boundary (V6-12).
+ * @param agent - the calling session agent.
+ * @param request - the In testing ticket and the optional immediate replacement.
+ * @returns the ticket after the release.
+ */
+@Remote('releaseReview') async releaseReviewRemote(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView>
 
 /**
  * (Re)assign a reviewer for one In testing ticket through the Remote

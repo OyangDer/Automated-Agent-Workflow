@@ -530,6 +530,20 @@ export interface RequestReviewRequest {
   boardId?: string
 }
 
+/**
+ * Free one review seat (V6-12) — the explicit escape hatch for a seat a dead
+ * session still holds. The board master may also ask for an immediate
+ * replacement; a board viewer's release leaves the seat vacant for
+ * taskboard_claim_review.
+ */
+export interface ReleaseReviewRequest {
+  ticketId: string
+  /** Master only: seat a fresh reviewer right away instead of leaving it vacant. */
+  reassign?: boolean
+  /** Board the ticket lives on; defaults to "default" for v1 compatibility. */
+  boardId?: string
+}
+
 /** User creates a board through the Remote API. */
 export interface CreateBoardRequest {
   name: string

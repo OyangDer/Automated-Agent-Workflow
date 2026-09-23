@@ -39,7 +39,8 @@ import type {
   ArchiveBoardRequest, BoardModelConfig, BoardNotice, BoardRosterConfig, BoardSnapshot, BoardView, ColumnId,
   CreateBoardRequest, CreateStageRequest, CreateTicketRequest, EditTicketRequest, MasterHistoryEntry, MemberRecord,
   MemberRole, MemberView, MigrateTicketsRequest, MigrateTicketsResult, MoveTicketRequest, PreflightReport, Priority,
-  RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest,
+  ReleaseReviewRequest, RemoveTicketRequest, RemoveTicketResult, RequestReviewRequest, RestoreMemberRequest,
+  SetRosterCapacityRequest,
   StageRow, StageView, SwitchStageRequest, TaskboardChanged, TaskboardOperation, TicketAssignee, TicketFailure,
   TicketQueue, TicketType, TicketView, TicketWorkerStatus,
 } from './types.ts'
@@ -2899,6 +2900,54 @@ export class TaskboardService extends TypertRemoteService {
   }
 
   /**
+   * Last durable activity of a seat holder that is absent from the live
+   * registry: the tail of its stored session log. Undefined when the store
+   * cannot answer — no `sessionPersistence` seam, an unknown session id, an
+   * empty log, or a fault — because none of those prove silence, and V6-12
+   * fails closed here on the same principle as {@link sessionHoldsSeat}.
+   * @param sessionId - the seat holder's session id.
+   * @returns the last stored event time, or undefined when unprovable.
+   */
+  private async storedActivityOf(sessionId: string): Promise<number | undefined> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
+    try {
+      const inspection = await persistence.inspect(sessionId as SessionId)
+      return inspection.events[inspection.events.length - 1]?.time
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Judge one review seat's staleness (V6-12): one clock for a registered and
+   * an unregistered holder, so "the process died, the log stayed" can no
+   * longer sit on a seat forever.
+   *
+   * A registered holder is stale once it is not running and its live session
+   * log has been silent past reviewerStaleTimeoutMs. A holder absent from the
+   * registry is stale on the same clock read from its *stored* log — exactly
+   * the dead-holder state the probe found (three reviewer seats held 25-40
+   * minutes past their last session write, surviving two host restarts).
+   * Silence the store cannot prove keeps the seat, which is what preserves the
+   * V3-43 protection for a durable reviewer waiting to be woken.
+   * @param reviewerAgent - the live holder, or undefined when unregistered.
+   * @param sessionId - the seat holder's session id.
+   * @returns whether the seat is stale and should be released.
+   */
+  private async reviewerSeatStale(reviewerAgent: Agent | undefined, sessionId: string): Promise<boolean> {
+    const timeout = this.resolved.reviewerStaleTimeoutMs
+    if (timeout <= 0) return false
+    if (reviewerAgent !== undefined) {
+      if (reviewerAgent.status === 'running') return false
+      return Date.now() - TaskboardService.lastActivityOf(reviewerAgent) > timeout
+    }
+    const stored = await this.storedActivityOf(sessionId)
+    if (stored === undefined) return false
+    return Date.now() - stored > timeout
+  }
+
+  /**
    * Wake one lost worker's durable session instead of re-spawning it (V3-28).
    * The continuation message carries the ticket identity, the acceptance
    * criteria, the recorded progress and the standing "do not roll back"
@@ -3219,10 +3268,13 @@ export class TaskboardService extends TypertRemoteService {
    *   durable continuable child that normally lives in the session store
    *   (ready) rather than the live registry, and the old registry-only reading
    *   of that normal state as death was the V3-42 release/redispatch loop;
-   * - a reviewer that is *registered* but idle — no running tool — with the
-   *   review pending longer than reviewerStaleTimeoutMs is judged stuck and
-   *   the seat is released. Staleness never applies to a holder that is only
-   *   stored (there is no live session to judge idle).
+   * - a holder idle past reviewerStaleTimeoutMs is judged stuck and the seat
+   *   is released: a *registered* holder reads its live session log, an
+   *   *unregistered* holder reads its stored log (V6-12 — the arm that was
+   *   missing, where "registry absent + log kept" satisfied neither judgment
+   *   and held the seat forever). Silence the store cannot prove — no seam, an
+   *   unknown or empty log, a fault — keeps the seat, so a durable reviewer
+   *   waiting to be woken is still never mistaken for a ghost (V3-43).
    * On release the card history gets one 'review-release' row, the master is
    * notified, and a fresh reviewer is auto-redispatched when a live master
    * session exists to spawn from; otherwise the seat is left vacant so
@@ -3255,12 +3307,12 @@ export class TaskboardService extends TypertRemoteService {
       // stored session record); a report-mode reviewer sitting in the store is
       // held, not a ghost.
       const seatLost = !await this.sessionHoldsSeat(seatedReviewer.agentId)
-      // Staleness stays narrower than liveness: only a *registered* holder can
-      // be judged stuck, and only by the idle-staleness arm.
-      const stale = !seatLost && reviewerAgent !== undefined
-        && this.resolved.reviewerStaleTimeoutMs > 0
-        && reviewerAgent.status !== 'running'
-        && Date.now() - TaskboardService.lastActivityOf(reviewerAgent) > this.resolved.reviewerStaleTimeoutMs
+      // V6-12: the idle arm covers an unregistered holder too. Registry absence
+      // alone still releases nothing (a durable reviewer waiting in the store is
+      // its normal state, V3-43), but it no longer *exempts* the holder from the
+      // clock — that exemption is what let a dead session (process gone, log
+      // kept) hold the seat forever and made the wake/rotate path unreachable.
+      const stale = !seatLost && await this.reviewerSeatStale(reviewerAgent, seatedReviewer.agentId)
       if (!seatLost && !stale) continue
       // Loop brake (V3-43): mirror the worker's workerAutoRetryLimit. Once the
       // per-card budget of automatic reviewer redispatches is spent the seat is
@@ -4174,6 +4226,82 @@ export class TaskboardService extends TypertRemoteService {
     const change: TaskboardChanged = { operation: 'remove', ticketId: request.ticketId, boardId, ticket: null }
     this.ctx.emit('taskboard/changed', change)
     return { removedId: request.ticketId }
+  }
+
+  /**
+   * Free one review seat explicitly (V6-12). The liveness pass now covers the
+   * "process gone, log kept" holder, but a judgment can still surprise: a
+   * reviewer the host merely unloaded looks exactly like one that died until
+   * the staleness window passes, and an operator may not want to wait — the
+   * probe's seats sat claimed for 25-40 minutes across two host restarts with
+   * no way out but editing storage. This is the direct route: the master (or a
+   * board viewer, through the UI) names the card and the seat is released on
+   * the spot, with one review-release history row naming who freed it.
+   *
+   * The release is the same state change the liveness pass performs, so every
+   * existing path keeps working: with `reassign` the master gets a fresh
+   * reviewer immediately (through {@link releaseReview}'s call into
+   * requestReview, which wakes the member's stored session before spawning),
+   * without it the seat stays vacant for taskboard_claim_review.
+   * @param agent - the calling session agent.
+   * @param request - the In testing ticket and the optional immediate replacement.
+   * @returns the ticket after the release (and the re-seat, when asked).
+   */
+  async releaseReview(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView> {
+    const table = await this.tickets()
+    const current = table.get(request.ticketId)
+    if (current === undefined) {
+      throw new TaskboardError('ticket "' + request.ticketId + '" does not exist', 'TASKBOARD_TICKET_NOT_FOUND')
+    }
+    await this.assertBoardAccessible(current.boardId, agent)
+    TaskboardService.boardContextOf(request.boardId, current)
+    await this.assertStageWritable(current.boardId, 'releasing a review seat on it')
+    const isMaster = await this.isMasterOfTicket(current, agent)
+    if (request.reassign === true && !isMaster) {
+      // Only a master session can parent a reviewer spawn.
+      throw new TaskboardError(
+        'only the master of board "' + current.boardId + '" may seat a fresh reviewer',
+        'TASKBOARD_NOT_MASTER',
+      )
+    }
+    if (current.column !== 'in_testing' || current.reviewer === null) {
+      throw new TaskboardError(
+        'ticket "' + current.id + '" is not In testing with a reviewer seat to release',
+        'TASKBOARD_INVALID_TRANSITION',
+      )
+    }
+    const held = current.reviewer.agentId
+    const released = await this.mutate(current.id, 'review-release', (ticket) => {
+      if (ticket.column !== 'in_testing' || ticket.reviewer === null) return ticket
+      if (ticket.reviewer.agentId !== held) return ticket
+      return appendHistory(
+        { ...ticket, reviewer: null, updatedAt: Date.now() },
+        'review-release',
+        'review seat released by ' + (isMaster ? 'the board master' : 'a board viewer') + ' (holder ' + held + ')',
+      )
+    })
+    await this.notifyMaster(released.boardId,
+      'Taskboard notice: ' + formatCompactEvent('REVIEWER_RELEASED', {
+        ticket: released.id,
+        title: released.title,
+        state: compactCardState(released),
+        scope: released.filesScope,
+        anomaly: 'review seat released on request by ' + (isMaster ? 'the board master' : 'a board viewer')
+          + ' (holder ' + held + '); re-review from the board (request review) or taskboard_claim_review',
+      }), NOTICE_KIND.reviewerReleased, released.id)
+    if (request.reassign === true) return await this.requestReviewRemote(agent, { ticketId: current.id })
+    return released
+  }
+
+  /**
+   * Free one review seat through the Remote boundary (V6-12).
+   * @param agent - the calling session agent.
+   * @param request - the In testing ticket and the optional immediate replacement.
+   * @returns the ticket after the release.
+   */
+  @Remote('releaseReview')
+  async releaseReviewRemote(agent: Agent, request: ReleaseReviewRequest): Promise<TicketView> {
+    return await this.releaseReview(agent, request)
   }
 
   /**
@@ -6708,6 +6836,46 @@ export class TaskboardService extends TypertRemoteService {
     }))
 
     this.ctx.tools.register(defineTool({
+      name: 'taskboard_release_review',
+      description: 'Free one review seat (master only, V6-12): the seat is released on the spot with a review-release history row and a master notice, so a card stuck In testing without a verdict no longer depends on a host restart or a storage edit. Pass reassign to seat a fresh reviewer immediately (the member\'s stored session is woken first); omit it to leave the seat vacant for taskboard_claim_review.',
+      parameters: {
+        ticketId: { type: 'string' as const, required: true, description: 'The In testing card whose review seat to release.' },
+        reassign: { type: 'boolean' as const, description: 'Seat a fresh reviewer immediately instead of leaving the seat vacant.' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            column: { type: 'string', required: true, enum: [...TASKBOARD_COLUMNS] },
+            reviewerAgentId: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value: { id: string; title: string; column: string; reviewerAgentId: string }) => [{
+          type: 'text' as const,
+          text: 'ticket ' + value.id + ' ("' + value.title + '") review seat released (column ' + value.column + ')'
+            + (value.reviewerAgentId === '' ? '; seat left vacant for taskboard_claim_review' : '; reviewer ' + value.reviewerAgentId),
+        }],
+      },
+      execute: async (args: { ticketId: string; reassign?: boolean }, exec) => {
+        const agent = TaskboardService.agentOf(exec)
+        const held = (await this.tickets()).get(args.ticketId)
+        if (held !== undefined) await this.assertMasterOfTicket(held, agent)
+        const value = await this.releaseReview(agent, {
+          ticketId: args.ticketId,
+          ...(args.reassign === true ? { reassign: true } : {}),
+        })
+        return {
+          id: value.id, title: value.title, column: value.column,
+          reviewerAgentId: value.reviewer?.agentId ?? '',
+        }
+      },
+      presentCall: args => ({ card: 'generic' as const, title: 'Release taskboard review seat', kind: 'other' as const, rawInput: args.ticketId }),
+    }))
+
+
+    this.ctx.tools.register(defineTool({
       name: 'taskboard_resolve_review',
       description: 'Resolve a report-mode review (master only): apply the reviewer-reported verdict for an In testing taskboard ticket. approve moves the card to Done and archives the worker session; reject returns the card for rework with the reviewer\'s problems as feedback. The master applies the verdict as reported and may not overturn a rejection. After the third consecutive reject the card is marked blocked, awaiting the user\'s decision.',
       parameters: {
@@ -7218,8 +7386,8 @@ const WORKER_DENIED_TOOLS = [
   'taskboard_review_verdict',
   'taskboard_claim', 'taskboard_list', 'taskboard_view', 'taskboard_complete',
   'taskboard_claim_review', 'taskboard_approve', 'taskboard_reject', 'taskboard_update',
-  'taskboard_assign', 'taskboard_reassign', 'taskboard_pause', 'taskboard_claim_master',
-  'taskboard_release_master',
+  'taskboard_assign', 'taskboard_reassign', 'taskboard_pause', 'taskboard_release_review',
+  'taskboard_claim_master', 'taskboard_release_master',
   'taskboard_handover', 'taskboard_create', 'taskboard_move', 'taskboard_plan',
   'taskboard_notices',
   // V6-4 stage surface: the stage list is a board read and the other three are
