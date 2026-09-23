@@ -1,0 +1,18 @@
+# V6-12 acceptance: the two shipped Taskboard plugin layers, with the liveness
+# windows shortened so a dead holder is judged inside one test run. The roster
+# smoke asserts its own overlay equals the shipped patches verbatim; this one is
+# deliberately different (config overrides) because the runaway state it
+# reproduces needs the clock compressed. The reconcile interval outlasts the
+# second boot's window-copy step, so the seat is first observed still held with
+# its stored record in place and only then released by the idle arm.
+
+- insert:
+    - id: taskboard
+      name: '@deepseek-ai/dsh-taskboard'
+      config:
+        reviewerStaleTimeoutMs: 2000
+        reconcileIntervalMs: 3000
+
+- insert:
+    - id: ui-taskboard
+      name: '@deepseek-ai/dsh-client-ui-taskboard'
