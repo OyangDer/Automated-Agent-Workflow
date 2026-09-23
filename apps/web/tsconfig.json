@@ -28,6 +28,9 @@
     "tests/startup-rpc-budget.e2e.ts",
     "tests/taskboard-roster.e2e.ts",
     "tests/taskboard-review-seat.e2e.ts",
+    // Any new host-plane e2e in this directory must be listed here or it pulls
+    // tests/scaffold.ts into this client program and breaks the aggregate.
+    "tests/reviewer-delivery.e2e.ts",
     "tests/minimal-preset.snapshot.ts",
     "tests/message-feedback-protocol.snapshot.ts",
     "tests/preset-migration.snapshot.ts",
