@@ -1,16 +1,15 @@
 # V6-12 acceptance: the two shipped Taskboard plugin layers, with the liveness
-# windows shortened so a dead holder is judged inside one test run. The roster
-# smoke asserts its own overlay equals the shipped patches verbatim; this one is
-# deliberately different (config overrides) because the runaway state it
-# reproduces needs the clock compressed. The reconcile interval outlasts the
-# second boot's window-copy step, so the seat is first observed still held with
-# its stored record in place and only then released by the idle arm.
+# window widened so the second Host observes the dead holder inside the test:
+# boot 1 seats a reviewer through the real path, the Host is disposed, and boot 2
+# comes up on the SAME harness home and session root — the reviewer's stored
+# record survives, its process does not. That is the production shape the probe
+# found, and the one the old liveness pass could not judge.
 
 - insert:
     - id: taskboard
       name: '@deepseek-ai/dsh-taskboard'
       config:
-        reviewerStaleTimeoutMs: 2000
+        reviewerStaleTimeoutMs: 30000
         reconcileIntervalMs: 3000
 
 - insert:

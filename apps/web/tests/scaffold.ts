@@ -404,14 +404,27 @@ export interface LaunchOptions {
   remoteAuthority?: string
   /** Reuse an existing harness home so a second Host can verify user settings across origins. */
   harnessHome?: string
+  /**
+   * Reuse an existing session/store root (kept on close) so a second Host can
+   * boot over the first one's durable state — the restart shape a dead-holder
+   * scenario needs.
+   */
+  persistenceRoot?: string
 }
 
 /** Dispose the booted tree and remove both owned temp roots, reporting every independent cleanup failure. */
-async function cleanupScaffoldWorld(ctx: Context, workspaceCwd: string, persistenceRoot: string): Promise<unknown[]> {
+async function cleanupScaffoldWorld(
+  ctx: Context,
+  workspaceCwd: string,
+  persistenceRoot: string,
+  keepPersistenceRoot = false,
+): Promise<unknown[]> {
   const failures: unknown[] = []
   await Promise.resolve(ctx.fiber.dispose()).catch((error: unknown) => failures.push(error))
   await rm(workspaceCwd, { recursive: true, force: true }).catch((error: unknown) => failures.push(error))
-  await rm(persistenceRoot, { recursive: true, force: true }).catch((error: unknown) => failures.push(error))
+  if (!keepPersistenceRoot) {
+    await rm(persistenceRoot, { recursive: true, force: true }).catch((error: unknown) => failures.push(error))
+  }
   return failures
 }
 
@@ -488,7 +501,10 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   Object.assign(process.env, skillRootEnvironment)
   let persistenceRoot: string
   try {
-    persistenceRoot = await mkdtemp(join(tmpdir(), 'dsh-web-e2e-sessions-'))
+    // A caller-supplied root is reused verbatim (and kept on close), which is how
+    // a smoke boots a second Host over the first one's session store — the
+    // restart shape a dead-holder scenario needs.
+    persistenceRoot = options.persistenceRoot ?? await mkdtemp(join(tmpdir(), 'dsh-web-e2e-sessions-'))
   } catch (error) {
     const failures: unknown[] = [error]
     await rm(workspaceCwd, { recursive: true, force: true }).catch((cleanupError: unknown) => failures.push(cleanupError))
@@ -804,7 +820,9 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     }
   } catch (error) {
     if (process.cwd() !== originalCwd) process.chdir(originalCwd)
-    const cleanupFailures = await cleanupScaffoldWorld(ctx, workspaceCwd, persistenceRoot)
+    const cleanupFailures = await cleanupScaffoldWorld(
+      ctx, workspaceCwd, persistenceRoot, options.persistenceRoot !== undefined,
+    )
     restoreCredentialEnvironment()
     restoreSkillRootEnvironment()
     if (cleanupFailures.length > 0) {

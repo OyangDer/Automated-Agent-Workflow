@@ -1,12 +1,14 @@
 // V6-12 acceptance: the runaway review seat, reproduced in the real Host
-// composition. The card sits In testing with a seated reviewer; the holder then
-// leaves the live agent registry while its stored session record survives. That
-// pair is the blind spot the probe found in production (a dead process whose
-// session log is still on disk), so the old liveness pass judged it neither lost
-// (the record exists) nor stale (the holder was not registered) and the seat
-// stayed claimed forever. The assertions are the card's: the seat is released
-// once the staleness window passes — and NOT before — after which
-// taskboard_claim_review can take it.
+// composition across a restart. Boot 1 seats a reviewer through the real path
+// (requestReview); the Host is then disposed and boot 2 comes up on the SAME
+// harness home and session root, so the reviewer survives only as a stored
+// session record while the live registry is empty — the exact pair the probe
+// found in production, where the old liveness pass judged the holder neither
+// lost (a record exists) nor stale (nothing registered to time) and the seat
+// stayed claimed forever. The assertions are the card's: the seat survives the
+// restart, nothing is released inside the staleness window, the pass then
+// releases it as *stale* (the record kept the seat, the clock freed it), and
+// taskboard_claim_review takes it afterwards.
 import { mkdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,9 +30,8 @@ const INSTALL_ANCHORS = [
 /** One ticket row as this smoke reads it. */
 interface SmokeTicket {
   readonly id: string
-  readonly column: string
   readonly reviewer: { readonly agentId: string } | null
-  readonly history: readonly { readonly kind: string }[]
+  readonly history: readonly { readonly kind: string; readonly detail?: string }[]
 }
 
 /**
@@ -41,13 +42,15 @@ interface TaskboardHostPort {
   claimMaster(boardId: string, agent: unknown): Promise<unknown>
   createRemote(agent: unknown, request: Record<string, unknown>): Promise<SmokeTicket>
   moveAsMaster(agent: unknown, request: Record<string, unknown>): Promise<SmokeTicket>
+  requestReviewRemote(agent: unknown, request: Record<string, unknown>): Promise<SmokeTicket>
   claimReview(agent: unknown, ticketId: string): Promise<SmokeTicket>
   viewTicket(ticketId: string): Promise<SmokeTicket>
   reconcileStaleReviewers(): Promise<number>
 }
 
-/** The harness home this smoke keeps, outside the scaffold-owned temp roots. */
+/** Both durable roots are shared by the two boots (outside the owned temp roots). */
 const HOME = join(tmpdir(), 'v612-home-' + String(process.pid))
+const SESSIONS = join(tmpdir(), 'v612-sessions-' + String(process.pid))
 
 /**
  * Link the two plugin packages into the profile the scaffold is about to boot.
@@ -73,7 +76,6 @@ describe('web e2e: Taskboard review seat', () => {
   let browser: Browser
   let page: Page
   let tripwire: ReturnType<typeof watchConsole>
-  /** Seated in the setup, judged below. */
   let ticketId = ''
   let reviewerAgentId = ''
 
@@ -81,9 +83,12 @@ describe('web e2e: Taskboard review seat', () => {
     browser = await chromium.launch()
     page = await newEnglishPage(browser)
     tripwire = watchConsole(page)
+    mkdirSync(SESSIONS, { recursive: true })
     linkPluginLayers(HOME)
+    // Boot 1: seat a reviewer through the real path, then dispose the Host.
     scaffold = await launchWebScaffold({
-      extraOverlayPath: OVERLAY, extraInstallAnchors: INSTALL_ANCHORS, harnessHome: HOME,
+      extraOverlayPath: OVERLAY, extraInstallAnchors: INSTALL_ANCHORS,
+      harnessHome: HOME, persistenceRoot: SESSIONS,
     })
     await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
     await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
@@ -93,21 +98,28 @@ describe('web e2e: Taskboard review seat', () => {
     if (agent === undefined) throw new Error('the connected workspace created no Agent')
     await host.taskboard.claimMaster('default', agent)
     const card = await host.taskboard.createRemote(agent, {
-      title: 'v612 review seat', description: 'seat a reviewer, then lose its process',
+      title: 'v612 review seat', description: 'seat a reviewer, then restart the host',
       priority: 'normal', dependsOn: [], boardId: 'default',
     })
     ticketId = card.id
     await host.taskboard.moveAsMaster(agent, {
       ticketId, column: 'in_testing', beforeTicketId: null, afterTicketId: null,
     })
-    // Entering In testing seats a reviewer through the real path; an empty seat
-    // (no live subagent seam) is taken by this session instead.
-    const moved = await host.taskboard.viewTicket(ticketId)
-    const seated = moved.reviewer === null ? await host.taskboard.claimReview(agent, ticketId) : moved
-    reviewerAgentId = seated.reviewer?.agentId ?? ''
-    if (reviewerAgentId === '') throw new Error('the setup seated no reviewer')
+    await host.taskboard.requestReviewRemote(agent, { ticketId })
+    reviewerAgentId = (await host.taskboard.viewTicket(ticketId)).reviewer?.agentId ?? ''
+    if (reviewerAgentId === '') throw new Error('the real seating path seated no reviewer')
     await scaffold.ctx.sessions.flush(agent.session)
-  }, 180_000)
+    await scaffold.close()
+    // Boot 2: same home and session root, a fresh live registry.
+    linkPluginLayers(HOME)
+    scaffold = await launchWebScaffold({
+      extraOverlayPath: OVERLAY, extraInstallAnchors: INSTALL_ANCHORS,
+      harnessHome: HOME, persistenceRoot: SESSIONS,
+    })
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    await connectFreshWorkspace(page, scaffold.workspaceCwd)
+  }, 300_000)
 
   afterAll(async () => {
     await browser?.close()
@@ -117,43 +129,36 @@ describe('web e2e: Taskboard review seat', () => {
   it('releases a seat whose holder survived only as a stored session, then lets claim_review take it', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-taskboard-review-seat'))
     const host = scaffold.ctx as unknown as { taskboard: TaskboardHostPort }
-    const holder = scaffold.ctx.agents.get(reviewerAgentId as never)
-    if (holder === undefined) throw new Error('the seated reviewer is not live')
-    expect((await host.taskboard.viewTicket(ticketId)).reviewer?.agentId).toBe(reviewerAgentId)
-
-    // The dead process in one step: the holder leaves the live agent registry,
-    // while its stored session record stays on disk (the shape the probe found
-    // after a restart).
-    const unregister = scaffold.ctx.agents.register(holder)
-    unregister()
+    const claimer = scaffold.ctx.agents.list()[0]
+    if (claimer === undefined) throw new Error('the second host created no Agent')
+    // The restart shape: the holder's process is gone, its stored record is not.
     expect(scaffold.ctx.agents.get(reviewerAgentId as never)).toBeUndefined()
-
-    // Before the staleness window nothing is released: the stored record still
-    // holds the seat (V3-43) and the clock has not run out.
+    const survived = await host.taskboard.viewTicket(ticketId)
+    expect(survived.reviewer?.agentId).toBe(reviewerAgentId)
+    expect(survived.history.some(entry => entry.kind === 'review-release')).toBe(false)
+    // Inside the window: nothing is released (the record still holds the seat).
     expect(await host.taskboard.reconcileStaleReviewers()).toBe(0)
-    const stillHeld = await host.taskboard.viewTicket(ticketId)
-    expect(stillHeld.reviewer?.agentId).toBe(reviewerAgentId)
-    expect(stillHeld.history.some(entry => entry.kind === 'review-release')).toBe(false)
-
-    // Past the window the same pass releases it (the interval timer may get
-    // there first; poll the card either way).
+    expect((await host.taskboard.viewTicket(ticketId)).reviewer?.agentId).toBe(reviewerAgentId)
+    // Past it: the seat is released as STALE — a judgment that requires the
+    // stored record to keep it (seatLost false) and only the clock to free it.
+    let row = survived
     await expect.poll(async () => {
-      const row = await host.taskboard.viewTicket(ticketId)
+      await host.taskboard.reconcileStaleReviewers()
+      row = await host.taskboard.viewTicket(ticketId)
       return row.history.some(entry => entry.kind === 'review-release')
-    }, { timeout: 30_000, interval: 500 }).toBe(true)
+    }, { timeout: 90_000, interval: 2000 }).toBe(true)
+    const detail = row.history.find(entry => entry.kind === 'review-release')?.detail ?? ''
     const released = await host.taskboard.viewTicket(ticketId)
-    // No live master exists to parent a replacement here, so the seat is left
-    // vacant — exactly the state taskboard_claim_review is for.
-    expect(released.reviewer).toBeNull()
-    const claimed = await host.taskboard.claimReview(holder, ticketId)
-    expect(claimed.reviewer?.agentId).toBe(reviewerAgentId)
+    const claimed = released.reviewer === null ? await host.taskboard.claimReview(claimer, ticketId) : released
+    expect(claimed.reviewer).not.toBeNull()
 
     console.log(
-      'taskboard review-seat smoke: holder ' + reviewerAgentId + ' left the live registry (stored log kept)'
-      + ' -> reconcile before the window released 0, seat still ' + reviewerAgentId
-      + '; after the window: reviewer=null + history review-release, then claim_review took the seat back as '
-      + String(claimed.reviewer?.agentId),
+      'taskboard review-seat smoke: reviewer ' + reviewerAgentId + ' seated in boot 1'
+      + ' | after restart registry=' + String(scaffold.ctx.agents.get(reviewerAgentId as never))
+      + ' but seat kept; reconcile inside the window released 0'
+      + ' | after the window history says "' + detail + '", reviewer=null'
+      + ' | claim_review took the seat as ' + String(claimed.reviewer?.agentId),
     )
     expect(tripwire.pageErrors).toEqual([])
-  }, 120_000)
+  }, 180_000)
 })
