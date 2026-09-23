@@ -270,15 +270,23 @@ interface SessionInspectionLike {
   }[]
 }
 
-/** The read face of one stored session, as `open` hands it out. */
+/** The read/write face of one stored session, as `open` hands it out. */
 interface SessionHandleLike {
   readonly header: { readonly createdAt: number }
   read(offset?: number, length?: number): Promise<{ readonly events: readonly { readonly time: number }[] }>
+  append(events: readonly unknown[]): Promise<void>
+  flush?(): Promise<void>
   [Symbol.asyncDispose](): Promise<void>
 }
 
 interface SessionPersistenceLike {
-  append(id: SessionId, events: readonly unknown[]): Promise<void>
+  /**
+   * Durably append to the stored log in one call. Optional: the shipped
+   * `session-persistence` seam exposes create/open/flush/stat/list and never a
+   * persistence-level `append`, so a writer must fall back to {@link open}
+   * with `'write'` (V6-15).
+   */
+  append?(id: SessionId, events: readonly unknown[]): Promise<void>
   /**
    * The stored log in one call. Optional: the shipped JSONL backend has no
    * `inspect` at all (it is not part of that package's public surface), so a
@@ -286,10 +294,12 @@ interface SessionPersistenceLike {
    */
   inspect?(id: SessionId, signal?: AbortSignal): Promise<SessionInspectionLike>
   /**
-   * The shipped backend's read entry point: one handle onto the stored log. The
-   * activity tail is read through it when `inspect` is absent (V6-12).
+   * The shipped seam's handle entry point: `'read'` observes the stored log,
+   * `'write'` owns it while the handle is open. The activity tail is read
+   * through it when `inspect` is absent (V6-12), and the inbox is delivered
+   * through it when the persistence-level `append` is absent (V6-15).
    */
-  open?(id: SessionId, access: 'read'): Promise<SessionHandleLike>
+  open?(id: SessionId, access: 'read' | 'write'): Promise<SessionHandleLike>
   /**
    * The backend's canonical durable-existence probe (V3-34): the stored-session
    * snapshot, or undefined when the session holds no stored record at all.
@@ -4633,11 +4643,13 @@ export class TaskboardService extends TypertRemoteService {
     // Persistent path: queue the notice into the master's persisted session
     // log so its next load/resume delivers it as pending input. Only reachable
     // with a session-persistence backend configured.
-    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-    if (persistence === undefined || typeof persistence.append !== 'function' || typeof persistence.inspect !== 'function') return
-    const inspected = await persistence.inspect(masterId)
-    if (inspected === undefined) return
-    const events = inspected.events
+    // V6-15: this gate used `append`/`inspect`, neither of which the shipped
+    // seam provides (its surface is create/open/flush/stat/list; `append` is a
+    // SessionHandle method) — so the delivery never happened in production. The
+    // log is now read and written through open handles, with the same
+    // fail-closed reading: anything unprovable means "do not deliver".
+    const events = await this.readStoredEvents(masterId)
+    if (events === undefined) return
     const pending = pendingInboxLengths(events)
     const message = createUserMessage({
       content: [{ type: 'text', text }],
@@ -4649,7 +4661,80 @@ export class TaskboardService extends TypertRemoteService {
       time: Date.now(),
       data: { target: 'next-turn', start: pending.nextTurn, inserted: [message] },
     }
-    await persistence.append(masterId, [splice])
+    await this.appendStoredEvents(masterId, [splice])
+  }
+
+  /**
+   * Read one stored session's log through whatever the seam actually offers
+   * (V6-15): `inspect` when a seam has it, otherwise an open read handle. The
+   * whole log is read because the caller reconstructs the pending inbox from
+   * every splice event.
+   * @param sessionId - the session whose log to read.
+   * @returns the stored events, or undefined when the log is unreadable.
+   */
+  private async readStoredEvents(sessionId: SessionId): Promise<SessionInspectionLike['events'] | undefined> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined) return undefined
+    if (typeof persistence.inspect === 'function') {
+      try {
+        return (await persistence.inspect(sessionId)).events
+      } catch {
+        this.ctx.logger.warn('taskboard: session ' + sessionId + ' inbox read failed; notice not delivered')
+        return undefined
+      }
+    }
+    if (typeof persistence.open !== 'function') return undefined
+    try {
+      const handle = await persistence.open(sessionId, 'read')
+      try {
+        return await handle.read().then(result => result.events as SessionInspectionLike['events'])
+      } finally {
+        await handle[Symbol.asyncDispose]()
+      }
+    } catch {
+      this.ctx.logger.warn('taskboard: session ' + sessionId + ' inbox read failed; notice not delivered')
+      return undefined
+    }
+  }
+
+  /**
+   * Append one batch to a stored session log through whatever the seam offers
+   * (V6-15): a direct `append` seam keeps its old path, the shipped seam takes
+   * a write handle, appends and flushes it, then releases it. A refusal (the
+   * session is owned elsewhere, unknown, or the seam faults) logs and reports
+   * false so the caller's notice is simply not delivered — never a crash.
+   * @param sessionId - the session whose log to append to.
+   * @param events - the events to append.
+   * @returns whether the batch was written.
+   */
+  private async appendStoredEvents(sessionId: SessionId, events: readonly unknown[]): Promise<boolean> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence === undefined) return false
+    if (typeof persistence.append === 'function') {
+      try {
+        await persistence.append(sessionId, events)
+        return true
+      } catch (error: unknown) {
+        this.ctx.logger.warn('taskboard: session ' + sessionId + ' inbox write failed ('
+          + (error instanceof Error ? error.message : String(error)) + '); notice not delivered')
+        return false
+      }
+    }
+    if (typeof persistence.open !== 'function') return false
+    try {
+      const handle = await persistence.open(sessionId, 'write')
+      try {
+        await handle.append(events)
+        await handle.flush?.()
+        return true
+      } finally {
+        await handle[Symbol.asyncDispose]()
+      }
+    } catch (error: unknown) {
+      this.ctx.logger.warn('taskboard: session ' + sessionId + ' inbox write failed ('
+        + (error instanceof Error ? error.message : String(error)) + '); notice not delivered')
+      return false
+    }
   }
 
   /**

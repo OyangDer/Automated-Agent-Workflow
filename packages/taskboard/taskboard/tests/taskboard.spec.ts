@@ -107,29 +107,36 @@ function workspaceStub(id: string, path: string): { id: string; path: string } {
 }
 
 /**
- * A minimal in-memory session-persistence double mirroring the coordinator's
- * append/inspect contract: append validates contiguous seq and records the
- * batch; inspect serves the stored log (rejecting unknown sessions, as the
- * real backends do). The recorded log is exactly what a resumed agent-loop
- * session replays through its Inbox projection.
+ * A minimal in-memory session-persistence double mirroring the SHIPPED seam
+ * (V6-15): create/open/flush/stat/list — no `inspect` and no persistence-level
+ * `append`, because the real `session-persistence` backend has neither (its
+ * `append` belongs to SessionHandle). `open` hands out a handle whose read
+ * serves the stored log (rejecting unknown sessions, as the real backends do)
+ * and whose append validates contiguous seq; the recorded log is exactly what a
+ * resumed agent-loop session replays through its Inbox projection.
  */
 function fakeSessionPersistence() {
   const stored = new Map<string, SessionEvent[]>()
   return {
     stored,
-    append: vi.fn(async (id: string, events: SessionEvent[]) => {
-      const log = stored.get(id) ?? []
-      for (const event of events) {
-        if (event.seq !== log.length) throw new Error('append seq mismatch')
-      }
-      log.push(...events)
-      stored.set(id, log)
-    }),
-    inspect: vi.fn(async (id: string) => {
-      const log = stored.get(id)
-      if (log === undefined) throw new Error('session "' + id + '" has no persisted log')
-      return { meta: { id }, events: [...log] }
-    }),
+    open: vi.fn(async (id: string, _access: 'read' | 'write') => ({
+      header: { id, createdAt: 1 },
+      read: async (_offset?: number, _length?: number) => {
+        const log = stored.get(id)
+        if (log === undefined) throw new Error('session "' + id + '" has no persisted log')
+        return { events: [...log] }
+      },
+      append: async (events: SessionEvent[]) => {
+        const log = stored.get(id) ?? []
+        for (const event of events) {
+          if (event.seq !== log.length) throw new Error('append seq mismatch')
+        }
+        log.push(...events)
+        stored.set(id, log)
+      },
+      flush: async () => {},
+      [Symbol.asyncDispose]: async () => {},
+    })),
     // The canonical durable-existence probe (V3-34): undefined when the session
     // holds no stored record at all, a snapshot otherwise.
     stat: vi.fn(async (id: string) => {
@@ -3839,10 +3846,11 @@ it('queues a master notice into the persisted session inbox when the master is a
   unregisterMaster()
   const blocked = await service.fail(workerChild, card.id, 'backend down')
   expect(blocked.status).toBe('blocked')
-  // One contiguous inbox splice was appended to the master's persisted log.
-  expect(persistence.append).toHaveBeenCalledTimes(1)
-  const [masterId, events] = persistence.append.mock.calls[0] as [string, SessionEvent[]]
-  expect(masterId).toBe(devA.id)
+  // One contiguous inbox splice reached the master's persisted log through a
+  // WRITE HANDLE — the shipped seam has no persistence-level append (V6-15).
+  expect(persistence.open).toHaveBeenCalledWith(devA.id, 'write')
+  const events = (persistence.stored.get(devA.id) ?? [])
+    .filter(event => event.type === 'agent/inbox/spliced')
   expect(events).toHaveLength(1)
   const splice = events[0]!
   expect(splice.type).toBe('agent/inbox/spliced')
@@ -3930,7 +3938,7 @@ it('never fails the triggering mutation when the notification path breaks', asyn
   // The master session has a persisted log, but the delivery read explodes:
   // the notice must degrade silently and leave the mutation intact.
   persistence.stored.set(SessionId('dev-agent-a'), [])
-  persistence.inspect.mockRejectedValueOnce(new Error('storage exploded'))
+  persistence.open.mockRejectedValueOnce(new Error('storage exploded'))
   const { service, devA, workerChild, unregisterMaster } = await harness({ sessionPersistence: persistence })
   await service.claimMaster('default', devA)
   const card = await createTicket(service, 'resilient card')
