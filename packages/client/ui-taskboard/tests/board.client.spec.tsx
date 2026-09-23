@@ -9,7 +9,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import type {
-  BoardSnapshot, MemberRole, MemberView, RestoreMemberRequest, SetRosterCapacityRequest, TicketView,
+  BoardSnapshot, MemberRole, MemberView, ReleaseReviewRequest, RestoreMemberRequest, SetRosterCapacityRequest,
+  TicketView,
 } from '@deepseek-ai/dsh-taskboard/client'
 import type { BoardScope, BoardView } from '../src/client/contract.ts'
 import { TaskboardView, type TaskboardViewProps } from '../src/client/TaskboardView.tsx'
@@ -77,6 +78,7 @@ interface StubProps {
   archiveBoard?: (boardId: string) => Promise<BoardView>
   setRosterCapacity?: (request: SetRosterCapacityRequest) => Promise<BoardSnapshot>
   restoreMember?: (request: RestoreMemberRequest) => Promise<BoardSnapshot>
+  releaseReview?: (request: ReleaseReviewRequest) => Promise<TicketView>
 }
 
 /**
@@ -121,7 +123,7 @@ function propsOf({
   board, boards = [], boardId = 'default', workspaceId = '', scope, ownerSessionId,
   masterAgentId, masterClaimedAt, masterExpiresAt,
   selectedId = null, create, move, selectBoard, createBoard, archiveBoard,
-  members, capacity, setRosterCapacity, restoreMember,
+  members, capacity, setRosterCapacity, restoreMember, releaseReview,
 }: StubProps): TaskboardViewProps {
   const active = boards.find(item => item.boardId === boardId)
   const state = {
@@ -156,6 +158,7 @@ function propsOf({
     archiveBoard: archiveBoard ?? (async () => boardRow('default', 'default')),
     setRosterCapacity: setRosterCapacity ?? (async () => state.snapshot),
     restoreMember: restoreMember ?? (async () => state.snapshot),
+    releaseReview: releaseReview ?? (async () => ticket()),
     hooks: { board: { getSnapshot: () => state, subscribe: () => () => {} } },
     t,
   } as unknown as TaskboardViewProps
@@ -693,6 +696,14 @@ describe('TaskboardView', () => {
     expect(setRosterCapacity).not.toHaveBeenCalled()
     fireEvent.click(screen.getByTestId('roster-archive-W2'))
     expect(setRosterCapacity).toHaveBeenCalledWith({ boardId: 'default', role: 'worker', count: 1, archiveMemberId: 'W2' })
+  })
+
+  it('frees a stuck review seat from the detail panel (V6-12)', () => {
+    const stuck = ticket({ column: 'in_testing', reviewer: { agentId: 'reviewer-1', label: 'R1' } })
+    const releaseReview = vi.fn(async (_request: ReleaseReviewRequest) => stuck)
+    render(createElement(TaskboardView, propsOf({ board: [stuck], selectedId: stuck.id, releaseReview })))
+    fireEvent.click(screen.getByTestId('detail-release-review'))
+    expect(releaseReview).toHaveBeenCalledWith({ ticketId: stuck.id, boardId: 'default' })
   })
 
   it('labels the CONFIGURED cap, never the created pair count, and names the census (V6-3 i)', () => {
