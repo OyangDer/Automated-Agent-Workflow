@@ -31,13 +31,34 @@ Backlog → Not started → In progress → In testing → Done
 - **按角色分配模型**：主控用强模型，执行和审核用快模型，可以按看板单独配置。
 - **控制 Token 成本**：用事件通知代替轮询；限制审核 Agent 的输出长度和步数；看板列表默认只返回精简信息。
 
+## 支持的版本
 
+当前发布版 `0.1.5-alpha.1` 只支持 **DeepSeek Harness 0.1.x**。安装前先运行 `dsh --version` 确认版本。
+
+| DeepSeek Harness（`dsh`）版本 | 能否使用 |
+| --- | --- |
+| 0.1.5-rc.2 及之后的 0.1.x | 支持（插件声明的依赖范围） |
+| 0.2.0 及以上，包括桌面版 0.2.2-rc.1 | **不支持**：安装时会被拒绝；强行放行后插件注册失败，Taskboard 页签打不开 |
+
+0.2.2-rc.1 不兼容已经实测确认。0.1.x 的支持范围来自插件声明的依赖，没有在每个版本上逐一测试。适配 0.2.x 的新版本还没有发布。
 
 ---
 
 The Taskboard plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness),
-packaged as a standalone release: install them into **any** released `dsh` with
+packaged as a standalone release: install them into a compatible released `dsh` with
 one command each. No DSH source tree, no workspace checkout, no pnpm workspace protocol.
+
+## Compatibility
+
+Release `0.1.5-alpha.1` supports **DeepSeek Harness 0.1.x only**. Check yours with `dsh --version`.
+
+| `dsh` version | Status |
+| --- | --- |
+| 0.1.5-rc.2 and later 0.1.x | Supported (the plugin's declared peer range `^0.1.5-rc.2`) |
+| 0.2.0 and later, including desktop 0.2.2-rc.1 | **Not supported**: `dsh plugin add` rejects it; with `allow-version` the host plugin fails to register and the Taskboard tab never mounts |
+
+The 0.2.2-rc.1 failure was observed directly. The 0.1.x range comes from the declared peer
+dependencies and is not tested on every release. A build for 0.2.x has not been published yet.
 
 | Package | Role |
 | --- | --- |
