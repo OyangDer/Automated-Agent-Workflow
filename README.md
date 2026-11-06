@@ -31,14 +31,7 @@ Backlog → Not started → In progress → In testing → Done
 - **按角色分配模型**：主控用强模型，执行和审核用快模型，可以按看板单独配置。
 - **控制 Token 成本**：用事件通知代替轮询；限制审核 Agent 的输出长度和步数；看板列表默认只返回精简信息。
 
-## 开发记录
 
-2026 年 8 月至 9 月，共 104 次提交，从 V1 迭代到 V6。
-
-- 开发历史在 [`taskboard-plugin`](https://github.com/OyangDer/Automated-Agent-Workflow/commits/taskboard-plugin) 分支。这个分支包含整个 DSH 代码库的上游历史，插件代码在 `packages/taskboard/` 和 `packages/client/ui-taskboard/` 下。
-- 本分支（main）只放打包好的发布版 `0.1.5-alpha.1`。V6 新增的固定编制、开发阶段等功能还在 `taskboard-plugin` 分支上，尚未发布。
-
-下面是英文安装说明。
 
 ---
 
