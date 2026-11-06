@@ -1,4 +1,46 @@
-# DSH Taskboard plugins
+# DSH Taskboard：多 Agent 协作看板插件
+
+为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）开发的看板插件：一个**主控 Agent** 和用户一起把需求拆成卡片，派给**执行 Agent** 开发，交付后自动派出一个**独立审核 Agent** 验收。整个过程在浏览器里的 Taskboard 页签上实时可见。
+
+> 由 [OyangDer](https://github.com/OyangDer) 个人开发维护，不是 DeepSeek 官方项目。包名沿用 `@deepseek-ai/` 前缀，是因为插件在 DSH 的代码库里开发，按它的命名规则发布。
+
+## 解决什么问题
+
+- **任务分散、进度难追踪**：多个 Agent 并行开发时，谁在做什么、做到哪一步，只能翻对话记录。
+- **主控 Agent 会忘记需求**：会话一换、上下文一压缩，用户早先提过的需求就可能丢掉。
+- **交付没人把关**：Agent 说"做完了"，没有独立的一方去检查。
+
+## 工作流
+
+```
+Backlog → Not started → In progress → In testing → Done
+ 需求池     下一步队列      开发中         审核中       完成
+```
+
+| 角色 | 能做什么 |
+| --- | --- |
+| 主控 Agent | 和用户一起规划需求、派单、重派被阻塞的工作、裁决审核结果、交接席位 |
+| 执行 Agent | 只做派给自己的卡片，完成后上报，失败时说明原因；不能自己领卡 |
+| 审核 Agent | 只能**通过**或**打回**；打回时附具体反馈，卡片回到执行者手里返修 |
+
+## 主要设计
+
+- **可视化卡片**：每条和用户确认过的需求都落成一张卡片，开发进度一目了然。用户也可以直接拖动卡片排期，主控 Agent 会收到通知。
+- **需求不丢失**：卡片和看板持久保存，不依赖对话上下文。主控换人时写结构化交接笔记（各卡状态、谁在做、待办摘要），接手的会话认领席位时直接拿到。
+- **席位自愈**：执行或审核 Agent 卡住、失联时，看板自动派新的接手，并从原来的工作区继续、不回滚。每张卡自动重派有上限，超过就标记为阻塞并通知主控，不会无限重试。
+- **按角色分配模型**：主控用强模型，执行和审核用快模型，可以按看板单独配置。
+- **控制 Token 成本**：用事件通知代替轮询；限制审核 Agent 的输出长度和步数；看板列表默认只返回精简信息。
+
+## 开发记录
+
+2026 年 8 月至 9 月，共 104 次提交，从 V1 迭代到 V6。
+
+- 开发历史在 [`taskboard-plugin`](https://github.com/OyangDer/Automated-Agent-Workflow/commits/taskboard-plugin) 分支。这个分支包含整个 DSH 代码库的上游历史，插件代码在 `packages/taskboard/` 和 `packages/client/ui-taskboard/` 下。
+- 本分支（main）只放打包好的发布版 `0.1.5-alpha.1`。V6 新增的固定编制、开发阶段等功能还在 `taskboard-plugin` 分支上，尚未发布。
+
+下面是英文安装说明。
+
+---
 
 The Taskboard plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness),
 packaged as a standalone release: install them into **any** released `dsh` with
